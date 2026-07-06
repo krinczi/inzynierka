@@ -10,16 +10,14 @@
 
 #include "main.h"
 #include "lwip.h"
-
+#include "debug_logger.h"
 #include <string.h>
-#include <stdio.h>
 
 #include "lwip/netif.h"
 #include "lwip/ip4_addr.h"
 #include "lwip/dhcp.h"
 #include "lwip/tcp.h"
 
-extern UART_HandleTypeDef huart3;
 extern struct netif gnetif;
 
 static uint32_t last_net_ms = 0;
@@ -29,34 +27,26 @@ static uint8_t tcp_server_started = 0;
 static uint8_t prev_link_up = 0xFF;
 static uint8_t prev_netif_up = 0xFF;
 static uint8_t prev_dhcp_ok = 0xFF;
-
-static void uart_print(const char *s)
-{
-    HAL_UART_Transmit(&huart3, (uint8_t *)s, strlen(s), HAL_MAX_DELAY);
-}
-
-static void uart_println(const char *s)
-{
-    uart_print(s);
-    uart_print("\r\n");
-}
-
+#define NETDBG_LOG(text)      Debug_LogLine(DEBUG_SRC_NET, (text))
+#define NETDBG_LOGF(...)      Debug_Logf(DEBUG_SRC_NET, __VA_ARGS__)
+#define TCPDBG_LOG(text)      Debug_LogLine(DEBUG_SRC_TCP, (text))
+#define TCPDBG_LOGF(...)      Debug_Logf(DEBUG_SRC_TCP, __VA_ARGS__)
 static err_t tcp_server_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err)
 {
-    char logbuf[96];
     char rx[128];
     const char *reply;
     err_t wr_err;
     u16_t copy_len;
 
-    snprintf(logbuf, sizeof(logbuf), "TCP: recv p=%p len=%d err=%d",
-             (void *)p, (p ? p->tot_len : 0), (int)err);
-    uart_println(logbuf);
+    (void)arg;
+
+    TCPDBG_LOGF("TCP: recv p=%p len=%d err=%d",
+                (void *)p, (p ? p->tot_len : 0), (int)err);
 
     if (p == NULL)
     {
-        uart_println("TCP: client closed");
-        tcp_close(tpcb);
+    	TCPDBG_LOG("TCP: client closed");
+    	tcp_close(tpcb);
         return ERR_OK;
     }
 
@@ -66,8 +56,7 @@ static err_t tcp_server_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, er
     pbuf_copy_partial(p, rx, copy_len, 0);
     rx[copy_len] = '\0';
 
-    snprintf(logbuf, sizeof(logbuf), "TCP: payload='%s'", rx);
-    uart_println(logbuf);
+    TCPDBG_LOGF("TCP: payload='%s'", rx);
 
     if ((strcmp(rx, "meow") == 0) ||
         (strcmp(rx, "meow\r\n") == 0) ||
@@ -84,12 +73,11 @@ static err_t tcp_server_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, er
     if (wr_err == ERR_OK)
     {
         tcp_output(tpcb);
-        uart_println("TCP: reply sent");
+        TCPDBG_LOG("TCP: reply sent");
     }
     else
     {
-        snprintf(logbuf, sizeof(logbuf), "TCP: tcp_write failed err=%d", (int)wr_err);
-        uart_println(logbuf);
+    	TCPDBG_LOGF("TCP: tcp_write failed err=%d", (int)wr_err);
     }
 
     pbuf_free(p);
@@ -98,12 +86,12 @@ static err_t tcp_server_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, er
 
 static err_t tcp_server_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
 {
-    char buf[64];
     err_t wr_err;
     const char hello[] = "CONNECTED\r\n";
 
-    snprintf(buf, sizeof(buf), "TCP: client accepted err=%d", (int)err);
-    uart_println(buf);
+    (void)arg;
+
+    TCPDBG_LOGF("TCP: client accepted err=%d", (int)err);
 
     tcp_recv(newpcb, tcp_server_recv);
 
@@ -111,12 +99,11 @@ static err_t tcp_server_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
     if (wr_err == ERR_OK)
     {
         tcp_output(newpcb);
-        uart_println("TCP: welcome sent");
+        TCPDBG_LOG("TCP: welcome sent");
     }
     else
     {
-        snprintf(buf, sizeof(buf), "TCP: welcome write failed err=%d", (int)wr_err);
-        uart_println(buf);
+    	TCPDBG_LOGF("TCP: welcome write failed err=%d", (int)wr_err);
     }
 
     return ERR_OK;
@@ -128,31 +115,30 @@ static void tcp_server_init(void)
 
     if (pcb == NULL)
     {
-        uart_println("TCP: tcp_new failed");
-        return;
+    	TCPDBG_LOG("TCP: tcp_new failed");
+    	return;
     }
 
     if (tcp_bind(pcb, IP_ADDR_ANY, 5000) != ERR_OK)
     {
-        uart_println("TCP: bind failed");
-        tcp_close(pcb);
+    	TCPDBG_LOG("TCP: bind failed");
+    	tcp_close(pcb);
         return;
     }
 
     pcb = tcp_listen(pcb);
     if (pcb == NULL)
     {
-        uart_println("TCP: listen failed");
-        return;
+    	TCPDBG_LOG("TCP: bind failed");
+    	return;
     }
 
     tcp_accept(pcb, tcp_server_accept);
-    uart_println("TCP: server listening on port 5000");
+    TCPDBG_LOG("TCP: server listening on port 5000");
 }
 
 static void net_log_status(void)
 {
-    char buf[256];
     char ip_buf[16];
     char mask_buf[16];
     char gw_buf[16];
@@ -169,16 +155,13 @@ static void net_log_status(void)
     ip4addr_ntoa_r(netif_ip4_netmask(&gnetif), mask_buf, sizeof(mask_buf));
     ip4addr_ntoa_r(netif_ip4_gw(&gnetif), gw_buf, sizeof(gw_buf));
 
-    snprintf(buf, sizeof(buf),
-             "NET: link=%s netif=%s dhcp=%s ip=%s mask=%s gw=%s",
-             link_up ? "UP" : "DOWN",
-             netif_up ? "UP" : "DOWN",
-             dhcp_ok ? "YES" : "NO",
-             ip_buf,
-             mask_buf,
-             gw_buf);
-
-    uart_println(buf);
+    NETDBG_LOGF("NET: link=%s netif=%s dhcp=%s ip=%s mask=%s gw=%s",
+                link_up ? "UP" : "DOWN",
+                netif_up ? "UP" : "DOWN",
+                dhcp_ok ? "YES" : "NO",
+                ip_buf,
+                mask_buf,
+                gw_buf);
 }
 
 static void net_log_on_change(void)
@@ -205,15 +188,13 @@ static void net_log_on_change(void)
 static void dhcp_try_start(void)
 {
 #if LWIP_DHCP
-    char buf[64];
     uint8_t link_up = netif_is_link_up(&gnetif) ? 1U : 0U;
     uint8_t netif_up = netif_is_up(&gnetif) ? 1U : 0U;
 
     if (link_up && netif_up && !dhcp_started)
     {
         err_t err = dhcp_start(&gnetif);
-        snprintf(buf, sizeof(buf), "DHCP: start err=%d", (int)err);
-        uart_println(buf);
+        NETDBG_LOGF("DHCP: start err=%d", (int)err);
 
         if (err == ERR_OK)
         {
@@ -225,14 +206,14 @@ static void dhcp_try_start(void)
     {
         dhcp_stop(&gnetif);
         dhcp_started = 0U;
-        uart_println("DHCP: stopped");
+        NETDBG_LOG("DHCP: stopped");
     }
 #endif
 }
 
 void NetDebugServer_Init(void)
 {
-    uart_println("NETDBG: init");
+    NETDBG_LOG("NETDBG: init");
     dhcp_try_start();
     net_log_status();
 }

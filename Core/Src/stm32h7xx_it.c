@@ -60,7 +60,7 @@
 
 /* USER CODE BEGIN EV */
 extern ETH_HandleTypeDef heth;
-
+extern UART_HandleTypeDef huart3;
 /* USER CODE END EV */
 
 /******************************************************************************/
@@ -187,5 +187,9 @@ void SysTick_Handler(void)
 void ETH_IRQHandler(void)
 {
   HAL_ETH_IRQHandler(&heth);
+}
+void USART3_IRQHandler(void)
+{
+  HAL_UART_IRQHandler(&huart3);
 }
 /* USER CODE END 1 */

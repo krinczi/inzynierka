@@ -1,11 +1,14 @@
 #include "tls_client.h"
 #include "aws_iot_config.h"
 #include "aws_certs.h"
+#include "debug_logger.h"
 #include "main.h"
 
 #include <string.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <errno.h>
+
 #include "mbedtls/net_sockets.h"
 #include "mbedtls/ssl.h"
 #include "mbedtls/ctr_drbg.h"
@@ -14,27 +17,51 @@
 #include "mbedtls/pk.h"
 #include "mbedtls/error.h"
 #include "mbedtls/version.h"
+
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
-#include <errno.h>
 #include "lwip/ip_addr.h"
 #include "lwip/api.h"
 #include "lwip/err.h"
+#include "lwip/dns.h"
+#include "lwip/tcpip.h"
+
 #include "FreeRTOS.h"
 #include "task.h"
 #include "cmsis_os.h"
-#include "FreeRTOS.h"
-#include "task.h"
+
 #ifndef MSG_DONTWAIT
 #define MSG_DONTWAIT 0
 #endif
-extern UART_HandleTypeDef huart3;
+
+#ifndef ECONNRESET
+#define ECONNRESET 104
+#endif
+
+#ifndef AWS_IOT_STATIC_IP
+#define AWS_IOT_STATIC_IP ""
+#endif
+
+#ifndef TLS_VERBOSE_IO_LOGS
+#define TLS_VERBOSE_IO_LOGS 0
+#endif
+
+#ifndef TLS_VERBOSE_DIAG_LOGS
+#define TLS_VERBOSE_DIAG_LOGS 0
+#endif
+
+#define TLS_TCP_CONNECT_TIMEOUT_MS     10000U
+#define TLS_HANDSHAKE_TIMEOUT_MS       60000U
+#define TLS_WAIT_LOG_INTERVAL_MS       5000U
+#define TLS_SOCKET_IO_TIMEOUT_US       10000L
+#define TLS_SOCKET_IO_MAX_CHUNK        1024U
 
 extern volatile uint32_t eth_rx_irq_count;
 extern volatile uint32_t eth_input_pbuf_count;
 extern volatile uint32_t eth_err_irq_count;
 extern volatile uint32_t eth_last_dma_error;
 extern volatile uint32_t eth_last_hal_error;
+
 static mbedtls_net_context tls_net;
 static mbedtls_ssl_context tls_ssl;
 static mbedtls_ssl_config tls_conf;
@@ -48,9 +75,17 @@ static int tls_connected = 0;
 static int tls_ctx_ready = 0;
 static volatile uint32_t tls_send_calls = 0;
 static volatile uint32_t tls_recv_calls = 0;
+static volatile int tls_last_send_ret = 0;
+static volatile int tls_last_send_errno = 0;
+static volatile int tls_last_recv_ret = 0;
+static volatile int tls_last_recv_errno = 0;
+static volatile int tls_last_socket_error = 0;
 static volatile int tls_dns_done = 0;
 static volatile err_t tls_dns_err = ERR_INPROGRESS;
+static volatile int tls_dns_start_done = 0;
+static volatile err_t tls_dns_start_err = ERR_INPROGRESS;
 static ip_addr_t tls_dns_addr;
+static char tls_dns_hostname[256];
 
 static void Tls_DnsFound(const char *name, const ip_addr_t *ipaddr, void *arg)
 {
@@ -69,25 +104,116 @@ static void Tls_DnsFound(const char *name, const ip_addr_t *ipaddr, void *arg)
 
     tls_dns_done = 1;
 }
-//static const int aws_ciphersuites[] = {
-//    MBEDTLS_TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-//    MBEDTLS_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-//    0
-//};
+
+static void Tls_DnsStartOnTcpipThread(void *arg)
+{
+    ip_addr_t addr;
+    err_t err;
+
+    (void)arg;
+
+    err = dns_gethostbyname(tls_dns_hostname, &addr, Tls_DnsFound, NULL);
+    tls_dns_start_err = err;
+
+    if (err == ERR_OK)
+    {
+        tls_dns_addr = addr;
+        tls_dns_err = ERR_OK;
+        tls_dns_done = 1;
+    }
+    else if (err != ERR_INPROGRESS)
+    {
+        tls_dns_err = err;
+        tls_dns_done = 1;
+    }
+
+    tls_dns_start_done = 1;
+}
+
+static const int aws_ciphersuites[] = {
+    MBEDTLS_TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+    0
+};
+
 static void tls_log(const char *msg)
 {
-    HAL_UART_Transmit(&huart3, (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);
-    HAL_UART_Transmit(&huart3, (uint8_t *)"\r\n", 2, HAL_MAX_DELAY);
+    Debug_LogLine(DEBUG_SRC_TLS, msg);
 }
 
 static void tls_logf(const char *fmt, ...)
 {
-    char buf[256];
+    char buf[160];
     va_list ap;
+
     va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
+    (void)vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
+
+    buf[sizeof(buf) - 1U] = '\0';
     tls_log(buf);
+}
+
+#if TLS_VERBOSE_IO_LOGS
+#define tls_log_io(text)     tls_log(text)
+#define tls_log_iof(...)     tls_logf(__VA_ARGS__)
+#else
+#define tls_log_io(text)     ((void)0)
+#define tls_log_iof(...)     ((void)0)
+#endif
+
+#if TLS_VERBOSE_DIAG_LOGS
+#define tls_log_diag(text)   tls_log(text)
+#define tls_log_diagf(...)   tls_logf(__VA_ARGS__)
+#else
+#define tls_log_diag(text)   ((void)0)
+#define tls_log_diagf(...)   ((void)0)
+#endif
+
+static const char *tls_state_name(int state)
+{
+    switch (state)
+    {
+    case MBEDTLS_SSL_HELLO_REQUEST:
+        return "HELLO_REQUEST";
+    case MBEDTLS_SSL_CLIENT_HELLO:
+        return "CLIENT_HELLO";
+    case MBEDTLS_SSL_SERVER_HELLO:
+        return "SERVER_HELLO";
+    case MBEDTLS_SSL_SERVER_CERTIFICATE:
+        return "SERVER_CERTIFICATE";
+    case MBEDTLS_SSL_SERVER_KEY_EXCHANGE:
+        return "SERVER_KEY_EXCHANGE";
+    case MBEDTLS_SSL_CERTIFICATE_REQUEST:
+        return "CERTIFICATE_REQUEST";
+    case MBEDTLS_SSL_SERVER_HELLO_DONE:
+        return "SERVER_HELLO_DONE";
+    case MBEDTLS_SSL_CLIENT_CERTIFICATE:
+        return "CLIENT_CERTIFICATE";
+    case MBEDTLS_SSL_CLIENT_KEY_EXCHANGE:
+        return "CLIENT_KEY_EXCHANGE";
+    case MBEDTLS_SSL_CERTIFICATE_VERIFY:
+        return "CERTIFICATE_VERIFY";
+    case MBEDTLS_SSL_CLIENT_CHANGE_CIPHER_SPEC:
+        return "CLIENT_CHANGE_CIPHER_SPEC";
+    case MBEDTLS_SSL_CLIENT_FINISHED:
+        return "CLIENT_FINISHED";
+    case MBEDTLS_SSL_SERVER_CHANGE_CIPHER_SPEC:
+        return "SERVER_CHANGE_CIPHER_SPEC";
+    case MBEDTLS_SSL_SERVER_FINISHED:
+        return "SERVER_FINISHED";
+    case MBEDTLS_SSL_FLUSH_BUFFERS:
+        return "FLUSH_BUFFERS";
+    case MBEDTLS_SSL_HANDSHAKE_WRAPUP:
+        return "HANDSHAKE_WRAPUP";
+    case MBEDTLS_SSL_HANDSHAKE_OVER:
+        return "HANDSHAKE_OVER";
+    case MBEDTLS_SSL_SERVER_NEW_SESSION_TICKET:
+        return "SERVER_NEW_SESSION_TICKET";
+    case MBEDTLS_SSL_SERVER_HELLO_VERIFY_REQUEST_SENT:
+        return "SERVER_HELLO_VERIFY_REQUEST_SENT";
+    default:
+        return "UNKNOWN";
+    }
 }
 
 static void tls_log_mbedtls_error(const char *what, int ret)
@@ -103,6 +229,7 @@ static void tls_log_mbedtls_error(const char *what, int ret)
              errbuf);
     tls_log(logbuf);
 }
+
 static void tls_log_verify_result_now(void)
 {
     uint32_t flags = mbedtls_ssl_get_verify_result(&tls_ssl);
@@ -124,33 +251,35 @@ static void tls_log_verify_result_now(void)
         tls_log("TLS: verify_flags empty/no X509 detail available");
     }
 }
+
 static void tls_ctx_init_all(void)
 {
-	tls_log("CTX: manual net init");
-	tls_net.fd = -1;
-	tls_log("CTX: manual net init OK");
+    tls_log_diag("CTX: manual net init");
+    tls_net.fd = -1;
+    tls_log_diag("CTX: manual net init OK");
 
-	tls_log("CTX: ssl init");
-	mbedtls_ssl_init(&tls_ssl);
-    tls_log("CTX: ssl config init");
+    tls_log_diag("CTX: ssl init");
+    mbedtls_ssl_init(&tls_ssl);
+
+    tls_log_diag("CTX: ssl config init");
     mbedtls_ssl_config_init(&tls_conf);
 
-    tls_log("CTX: ca cert init");
+    tls_log_diag("CTX: ca cert init");
     mbedtls_x509_crt_init(&tls_ca_cert);
 
-    tls_log("CTX: client cert init");
+    tls_log_diag("CTX: client cert init");
     mbedtls_x509_crt_init(&tls_client_cert);
 
-    tls_log("CTX: pk init");
+    tls_log_diag("CTX: pk init");
     mbedtls_pk_init(&tls_pkey);
 
-    tls_log("CTX: ctr drbg init");
+    tls_log_diag("CTX: ctr drbg init");
     mbedtls_ctr_drbg_init(&tls_ctr_drbg);
 
-    tls_log("CTX: entropy init");
+    tls_log_diag("CTX: entropy init");
     mbedtls_entropy_init(&tls_entropy);
 
-    tls_log("CTX: all init OK");
+    tls_log_diag("CTX: all init OK");
 
     tls_ctx_ready = 1;
 }
@@ -183,44 +312,56 @@ static void tls_ctx_free_all(void)
 int TlsClient_Init(void)
 {
     tls_log("TLS: init");
+    tls_log("TLS BUILD: pkcheck recv_select short_io_timeout no_sig_hash");
     tls_connected = 0;
     tls_ctx_ready = 0;
     return 0;
 }
+
 static int Tls_ResolveHost(const char *host,
                            char *ipbuf,
                            size_t ipbuf_len,
                            uint32_t timeout_ms)
 {
-    ip_addr_t addr;
+    err_t err;
+    uint32_t start;
 
     tls_logf("TLS DNS: resolve %s", host);
-    tls_logf("TLS DNS: server0=%s", ipaddr_ntoa(dns_getserver(0)));
+    tls_log_diagf("TLS DNS: server0=%s", ipaddr_ntoa(dns_getserver(0)));
 
     tls_dns_done = 0;
     tls_dns_err = ERR_INPROGRESS;
+    tls_dns_start_done = 0;
+    tls_dns_start_err = ERR_INPROGRESS;
     memset(&tls_dns_addr, 0, sizeof(tls_dns_addr));
+    snprintf(tls_dns_hostname, sizeof(tls_dns_hostname), "%s", host);
+    tls_dns_hostname[sizeof(tls_dns_hostname) - 1U] = '\0';
 
-    tls_log("TLS DNS: before dns_gethostbyname");
+    tls_log_diag("TLS DNS: before tcpip_callback dns_gethostbyname");
 
-    err_t err = dns_gethostbyname(host, &addr, Tls_DnsFound, NULL);
+    err = tcpip_callback(Tls_DnsStartOnTcpipThread, NULL);
 
-    tls_logf("TLS DNS: dns_gethostbyname start err=%d", (int)err);
+    tls_log_diagf("TLS DNS: tcpip_callback err=%d", (int)err);
 
-    if (err == ERR_OK)
+    if (err != ERR_OK)
     {
-        ipaddr_ntoa_r(&addr, ipbuf, ipbuf_len);
-        tls_logf("TLS DNS: resolved cached -> %s", ipbuf);
-        return 0;
-    }
-
-    if (err != ERR_INPROGRESS)
-    {
-        tls_logf("TLS DNS: start failed err=%d", (int)err);
         return -1;
     }
 
-    uint32_t start = HAL_GetTick();
+    start = HAL_GetTick();
+
+    while (!tls_dns_start_done)
+    {
+        if ((HAL_GetTick() - start) > 2000U)
+        {
+            tls_log("TLS DNS: tcpip_callback start TIMEOUT");
+            return -1;
+        }
+
+        osDelay(10);
+    }
+
+    tls_log_diagf("TLS DNS: start err=%d", (int)tls_dns_start_err);
 
     while (!tls_dns_done)
     {
@@ -233,7 +374,7 @@ static int Tls_ResolveHost(const char *host,
         osDelay(100);
     }
 
-    tls_logf("TLS DNS: callback err=%d", (int)tls_dns_err);
+    tls_log_diagf("TLS DNS: callback err=%d", (int)tls_dns_err);
 
     if (tls_dns_err != ERR_OK)
     {
@@ -246,25 +387,7 @@ static int Tls_ResolveHost(const char *host,
 
     return 0;
 }
-static int Tls_LwipConnectIp(mbedtls_net_context *ctx,
-                             const char *ip,
-                             uint16_t port,
-                             uint32_t timeout_ms);
-static int Tls_LwipConnectHost(mbedtls_net_context *ctx,
-                               const char *host,
-                               uint16_t port,
-                               uint32_t timeout_ms)
-{
-    char ipbuf[48];
 
-    if (Tls_ResolveHost(host, ipbuf, sizeof(ipbuf), 15000) != 0)
-    {
-        tls_log("TLS: hostname resolve failed");
-        return -10;
-    }
-
-    return Tls_LwipConnectIp(ctx, ipbuf, port, timeout_ms);
-}
 static int Tls_LwipConnectIp(mbedtls_net_context *ctx,
                              const char *ip,
                              uint16_t port,
@@ -276,9 +399,9 @@ static int Tls_LwipConnectIp(mbedtls_net_context *ctx,
 
     tls_logf("TLS: lwip socket connect %s:%u", ip, port);
 
-    tls_log("TLS CONN: before lwip_socket()");
+    tls_log_diag("TLS CONN: before lwip_socket()");
     sock = lwip_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    tls_logf("TLS CONN: after lwip_socket() sock=%d errno=%d", sock, errno);
+    tls_log_diagf("TLS CONN: after lwip_socket() sock=%d errno=%d", sock, errno);
 
     if (sock < 0)
     {
@@ -288,9 +411,9 @@ static int Tls_LwipConnectIp(mbedtls_net_context *ctx,
 
     int nonblock = 1;
 
-    tls_log("TLS CONN: before ioctl nonblock");
+    tls_log_diag("TLS CONN: before ioctl nonblock");
     ret = lwip_ioctl(sock, FIONBIO, &nonblock);
-    tls_logf("TLS CONN: after ioctl ret=%d errno=%d", ret, errno);
+    tls_log_diagf("TLS CONN: after ioctl ret=%d errno=%d", ret, errno);
 
     if (ret < 0)
     {
@@ -305,57 +428,110 @@ static int Tls_LwipConnectIp(mbedtls_net_context *ctx,
     addr.sin_addr.s_addr = inet_addr(ip);
 
     errno = 0;
-    tls_log("TLS CONN: before lwip_connect()");
+    tls_log_diag("TLS CONN: before lwip_connect()");
     ret = lwip_connect(sock, (struct sockaddr *)&addr, sizeof(addr));
-    tls_logf("TLS CONN: after lwip_connect ret=%d errno=%d", ret, errno);
+    tls_log_diagf("TLS CONN: after lwip_connect ret=%d errno=%d", ret, errno);
 
     if (ret != 0)
     {
-        fd_set wfds;
-        FD_ZERO(&wfds);
-        FD_SET(sock, &wfds);
+        uint32_t start = HAL_GetTick();
+        int connect_errno = errno;
 
-        struct timeval tv;
-        tv.tv_sec = timeout_ms / 1000;
-        tv.tv_usec = (timeout_ms % 1000) * 1000;
-
-        errno = 0;
-        tls_logf("TLS CONN: before lwip_select timeout=%lu ms", timeout_ms);
-        ret = lwip_select(sock + 1, NULL, &wfds, NULL, &tv);
-        tls_logf("TLS CONN: after lwip_select ret=%d errno=%d", ret, errno);
-
-        if (ret <= 0)
+        if ((connect_errno != EINPROGRESS) &&
+            (connect_errno != EALREADY) &&
+            (connect_errno != EWOULDBLOCK) &&
+            (connect_errno != EAGAIN))
         {
-            tls_logf("TLS: connect timeout/select ret=%d errno=%d", ret, errno);
-            lwip_close(sock);
-            return -3;
-        }
-
-        int err = 0;
-        socklen_t len = sizeof(err);
-
-        errno = 0;
-        tls_log("TLS CONN: before lwip_getsockopt");
-        ret = lwip_getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &len);
-        tls_logf("TLS CONN: after lwip_getsockopt ret=%d err=%d errno=%d", ret, err, errno);
-
-        if (ret != 0 || err != 0)
-        {
-            tls_logf("TLS: connect socket error ret=%d err=%d errno=%d", ret, err, errno);
+            tls_logf("TLS: connect immediate error errno=%d", connect_errno);
             lwip_close(sock);
             return -4;
+        }
+
+        for (;;)
+        {
+            fd_set write_fds;
+            int err = 0;
+            socklen_t len = sizeof(err);
+            struct timeval tv;
+            uint32_t elapsed = HAL_GetTick() - start;
+            int sel_ret;
+
+            if (elapsed > timeout_ms)
+            {
+                tls_logf("TLS: connect timeout after %lu ms", (unsigned long)elapsed);
+                lwip_close(sock);
+                return -3;
+            }
+
+            FD_ZERO(&write_fds);
+            FD_SET(sock, &write_fds);
+            tv.tv_sec = 0;
+            tv.tv_usec = 100000;
+
+            errno = 0;
+            sel_ret = lwip_select(sock + 1, NULL, &write_fds, NULL, &tv);
+
+            if (sel_ret == 0)
+            {
+                osDelay(10);
+                continue;
+            }
+
+            if (sel_ret < 0)
+            {
+                tls_logf("TLS: connect select failed ret=%d errno=%d", sel_ret, errno);
+                lwip_close(sock);
+                return -4;
+            }
+
+            if (!FD_ISSET(sock, &write_fds))
+            {
+                osDelay(10);
+                continue;
+            }
+
+            errno = 0;
+            ret = lwip_getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &len);
+            tls_log_iof("TLS CONN: writable ret=%d err=%d errno=%d t=%lu",
+                        ret,
+                        err,
+                        errno,
+                        (unsigned long)elapsed);
+
+            if ((ret == 0) && (err == 0))
+            {
+                break;
+            }
+
+            if ((ret != 0) ||
+                ((err != 0) &&
+                 (err != EINPROGRESS) &&
+                 (err != EALREADY) &&
+                 (err != EWOULDBLOCK) &&
+                 (err != EAGAIN)))
+            {
+                tls_logf("TLS: connect socket error ret=%d err=%d errno=%d", ret, err, errno);
+                lwip_close(sock);
+                return -4;
+            }
+
+            osDelay(50);
         }
     }
 
     ctx->fd = sock;
 
     struct timeval rcv_to;
-    rcv_to.tv_sec = 5;
-    rcv_to.tv_usec = 0;
+    /*
+     * Socket jest ustawiony jako nieblokujacy, ale krotki timeout jest
+     * dodatkowym zabezpieczeniem, gdyby LwIP zignorowal MSG_DONTWAIT.
+     */
+    rcv_to.tv_sec = 0;
+    rcv_to.tv_usec = TLS_SOCKET_IO_TIMEOUT_US;
 
     struct timeval snd_to;
-    snd_to.tv_sec = 5;
-    snd_to.tv_usec = 0;
+    snd_to.tv_sec = 0;
+    snd_to.tv_usec = TLS_SOCKET_IO_TIMEOUT_US;
 
     lwip_setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &rcv_to, sizeof(rcv_to));
     lwip_setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &snd_to, sizeof(snd_to));
@@ -363,138 +539,125 @@ static int Tls_LwipConnectIp(mbedtls_net_context *ctx,
     tls_logf("TLS: lwip socket connected fd=%d nonblock+timeout OK", sock);
     return 0;
 }
+
 static int Tls_LwipSend(void *ctx, const unsigned char *buf, size_t len)
 {
     int fd = ((mbedtls_net_context *)ctx)->fd;
+    size_t to_send = len;
+    int ret;
 
     tls_send_calls++;
-
-    tls_logf("TLS IO: send enter call=%lu len=%lu fd=%d",
-             tls_send_calls,
-             (uint32_t)len,
-             fd);
-
-    fd_set wfds;
-    FD_ZERO(&wfds);
-    FD_SET(fd, &wfds);
-
-    struct timeval tv;
-    tv.tv_sec = 0;
-    tv.tv_usec = 0;
-
-    errno = 0;
-    int sel = lwip_select(fd + 1, NULL, &wfds, NULL, &tv);
-
-    tls_logf("TLS IO: send select ret=%d errno=%d", sel, errno);
-
-    if (sel == 0)
-    {
-        return MBEDTLS_ERR_SSL_WANT_WRITE;
-    }
-
-    if (sel < 0)
-    {
-        tls_logf("TLS SEND: select failed errno=%d", errno);
-        return MBEDTLS_ERR_NET_SEND_FAILED;
-    }
-
-    size_t to_send = len;
 
     if (to_send > 1024)
     {
         to_send = 1024;
     }
 
-    tls_logf("TLS IO: before lwip_send to_send=%lu", (uint32_t)to_send);
-
     errno = 0;
-    int ret = lwip_send(fd, buf, to_send, 0);
-
-    tls_logf("TLS IO: after lwip_send ret=%d errno=%d", ret, errno);
+    ret = lwip_send(fd, buf, to_send, MSG_DONTWAIT);
+    tls_last_send_ret = ret;
+    tls_last_send_errno = errno;
 
     if (ret > 0)
     {
-        tls_logf("TLS IO: send OK ret=%d rx_irq=%lu pbuf=%lu err_irq=%lu",
-                 ret,
-                 eth_rx_irq_count,
-                 eth_input_pbuf_count,
-                 eth_err_irq_count);
-
         return ret;
     }
 
     if (ret == 0)
     {
-        tls_log("TLS SEND: ret=0");
         return MBEDTLS_ERR_SSL_WANT_WRITE;
     }
 
     if (errno == EWOULDBLOCK || errno == EAGAIN || errno == EINPROGRESS)
     {
-        tls_logf("TLS SEND: wouldblock errno=%d", errno);
         return MBEDTLS_ERR_SSL_WANT_WRITE;
     }
 
     tls_logf("TLS SEND: failed ret=%d errno=%d", ret, errno);
     return MBEDTLS_ERR_NET_SEND_FAILED;
 }
+
 static int Tls_LwipRecv(void *ctx, unsigned char *buf, size_t len)
 {
     int fd = ((mbedtls_net_context *)ctx)->fd;
+    int ret;
+    size_t to_recv = len;
+    fd_set read_fds;
+    struct timeval tv;
+    int sel_ret;
 
     tls_recv_calls++;
 
-    if (tls_recv_calls <= 10 || (tls_recv_calls % 50) == 0)
+    /*
+     * Najpierw sprawdzamy gotowosc socketu. To chroni handshake przed
+     * ukrytym blokowaniem w lwip_recv(), gdy czekamy na kolejny rekord TLS.
+     */
+    FD_ZERO(&read_fds);
+    FD_SET(fd, &read_fds);
+    tv.tv_sec = 0;
+    tv.tv_usec = 0;
+
+    errno = 0;
+    sel_ret = lwip_select(fd + 1, &read_fds, NULL, NULL, &tv);
+
+    if (sel_ret == 0)
     {
-        tls_logf("TLS IO: recv enter call=%lu len=%lu",
-                 tls_recv_calls,
-                 (uint32_t)len);
+        tls_last_recv_ret = -1;
+        tls_last_recv_errno = EWOULDBLOCK;
+        return MBEDTLS_ERR_SSL_WANT_READ;
+    }
+
+    if (sel_ret < 0)
+    {
+        tls_last_recv_ret = sel_ret;
+        tls_last_recv_errno = errno;
+        tls_logf("TLS RECV: select failed ret=%d errno=%d", sel_ret, errno);
+        return MBEDTLS_ERR_NET_RECV_FAILED;
+    }
+
+    if (!FD_ISSET(fd, &read_fds))
+    {
+        tls_last_recv_ret = -1;
+        tls_last_recv_errno = EWOULDBLOCK;
+        return MBEDTLS_ERR_SSL_WANT_READ;
+    }
+
+    if (to_recv > TLS_SOCKET_IO_MAX_CHUNK)
+    {
+        to_recv = TLS_SOCKET_IO_MAX_CHUNK;
     }
 
     errno = 0;
-
-    /*
-     * Socket jest już ustawiony jako non-blocking przez FIONBIO
-     * w Tls_LwipConnectIp(), więc recv nie powinien wisieć.
-     */
-    int ret = lwip_recv(fd, buf, len, 0);
+    ret = lwip_recv(fd, buf, to_recv, MSG_DONTWAIT);
+    tls_last_recv_ret = ret;
+    tls_last_recv_errno = errno;
 
     if (ret > 0)
     {
-        if (tls_recv_calls <= 10 || (tls_recv_calls % 50) == 0)
-        {
-            tls_logf("TLS IO: recv exit call=%lu ret=%d errno=%d",
-                     tls_recv_calls,
-                     ret,
-                     errno);
-        }
-
         return ret;
     }
 
     if (ret == 0)
     {
-        tls_log("TLS RECV: connection closed");
+        tls_logf("TLS RECV: connection closed ret=0 errno=%d", errno);
         return MBEDTLS_ERR_NET_CONN_RESET;
     }
 
     if (errno == EWOULDBLOCK || errno == EAGAIN || errno == EINPROGRESS)
     {
-        if (tls_recv_calls <= 10 || (tls_recv_calls % 50) == 0)
-        {
-        	tls_logf("TLS RECV: wb call=%lu err=%d rx=%lu pbuf=%lu",
-        	         tls_recv_calls,
-        	         errno,
-        	         eth_rx_irq_count,
-        	         eth_input_pbuf_count);
-        }
-
         return MBEDTLS_ERR_SSL_WANT_READ;
+    }
+
+    if (errno == ECONNRESET)
+    {
+        tls_logf("TLS RECV: reset ret=%d errno=%d", ret, errno);
+        return MBEDTLS_ERR_NET_CONN_RESET;
     }
 
     tls_logf("TLS RECV: failed ret=%d errno=%d", ret, errno);
     return MBEDTLS_ERR_NET_RECV_FAILED;
 }
+
 int TlsClient_Connect(void)
 {
     int ret;
@@ -507,12 +670,17 @@ int TlsClient_Connect(void)
     tls_logf("TLS: mbedTLS version=%s", MBEDTLS_VERSION_STRING);
     tls_send_calls = 0;
     tls_recv_calls = 0;
+    tls_last_send_ret = 0;
+    tls_last_send_errno = 0;
+    tls_last_recv_ret = 0;
+    tls_last_recv_errno = 0;
+    tls_last_socket_error = 0;
 
-    tls_log("TLS: free ctx...");
+    tls_log_diag("TLS: free ctx...");
     tls_ctx_free_all();
-    tls_log("TLS: free ctx OK");
+    tls_log_diag("TLS: free ctx OK");
 
-    tls_log("TLS: init ctx...");
+    tls_log_diag("TLS: init ctx...");
     tls_ctx_init_all();
     tls_log("TLS: init ctx OK");
 
@@ -522,7 +690,7 @@ int TlsClient_Connect(void)
                                 &tls_entropy,
                                 (const unsigned char *)pers,
                                 strlen(pers));
-    tls_log("TLS: seed returned");
+    tls_log_diag("TLS: seed returned");
 
     if (ret != 0)
     {
@@ -534,16 +702,24 @@ int TlsClient_Connect(void)
 
     snprintf(port_str, sizeof(port_str), "%u", (unsigned int)AWS_IOT_PORT);
 
-    tls_logf("TLS: resolve AWS HOST %s", AWS_IOT_ENDPOINT);
-
-    ret = Tls_ResolveHost(AWS_IOT_ENDPOINT, aws_ip, sizeof(aws_ip), 15000);
-    if (ret != 0)
+    if (AWS_IOT_STATIC_IP[0] != '\0')
     {
-        tls_logf("TLS: host resolve failed ret=%d", ret);
-        goto fail;
+        (void)snprintf(aws_ip, sizeof(aws_ip), "%s", AWS_IOT_STATIC_IP);
+        tls_logf("TLS: using static AWS IP=%s", aws_ip);
     }
+    else
+    {
+        tls_logf("TLS: resolve AWS HOST %s", AWS_IOT_ENDPOINT);
 
-    tls_logf("TLS: AWS resolved cached IP=%s", aws_ip);
+        ret = Tls_ResolveHost(AWS_IOT_ENDPOINT, aws_ip, sizeof(aws_ip), 15000);
+        if (ret != 0)
+        {
+            tls_logf("TLS: host resolve failed ret=%d", ret);
+            goto fail;
+        }
+
+        tls_logf("TLS: AWS resolved IP=%s", aws_ip);
+    }
 
     ret = mbedtls_x509_crt_parse(&tls_ca_cert,
                                  (const unsigned char *)AWS_ROOT_CA_PEM,
@@ -554,7 +730,7 @@ int TlsClient_Connect(void)
         goto fail;
     }
 
-    tls_log("TLS: Root CA parsed");
+    tls_log_diag("TLS: Root CA parsed");
 
     ret = mbedtls_x509_crt_parse(&tls_client_cert,
                                  (const unsigned char *)AWS_DEVICE_CERT_PEM,
@@ -565,7 +741,7 @@ int TlsClient_Connect(void)
         goto fail;
     }
 
-    tls_log("TLS: device cert parsed");
+    tls_log_diag("TLS: device cert parsed");
 
 #if MBEDTLS_VERSION_NUMBER >= 0x03000000
     ret = mbedtls_pk_parse_key(&tls_pkey,
@@ -589,7 +765,16 @@ int TlsClient_Connect(void)
         goto fail;
     }
 
-    tls_log("TLS: private key parsed");
+    tls_log_diag("TLS: private key parsed");
+
+    ret = mbedtls_pk_check_pair(&tls_client_cert.pk, &tls_pkey);
+    if (ret != 0)
+    {
+        tls_log_mbedtls_error("mbedtls_pk_check_pair(cert,key)", ret);
+        goto fail;
+    }
+
+    tls_log("TLS: cert/key pair OK");
     tls_logf("TLS: TCP connect AWS IP %s:%s", aws_ip, port_str);
 
     ret = -1;
@@ -598,7 +783,10 @@ int TlsClient_Connect(void)
     {
         tls_logf("TLS: TCP connect attempt %d/3", attempt);
 
-        ret = Tls_LwipConnectIp(&tls_net, aws_ip, AWS_IOT_PORT, 60000);
+        ret = Tls_LwipConnectIp(&tls_net,
+                                aws_ip,
+                                AWS_IOT_PORT,
+                                TLS_TCP_CONNECT_TIMEOUT_MS);
 
         if (ret == 0)
         {
@@ -617,6 +805,7 @@ int TlsClient_Connect(void)
     }
 
     tls_log("TLS: TCP connected");
+
     ret = mbedtls_ssl_config_defaults(&tls_conf,
                                       MBEDTLS_SSL_IS_CLIENT,
                                       MBEDTLS_SSL_TRANSPORT_STREAM,
@@ -626,6 +815,7 @@ int TlsClient_Connect(void)
         tls_log_mbedtls_error("mbedtls_ssl_config_defaults", ret);
         goto fail;
     }
+
     mbedtls_ssl_conf_min_version(&tls_conf,
                                  MBEDTLS_SSL_MAJOR_VERSION_3,
                                  MBEDTLS_SSL_MINOR_VERSION_3);
@@ -634,7 +824,11 @@ int TlsClient_Connect(void)
                                  MBEDTLS_SSL_MAJOR_VERSION_3,
                                  MBEDTLS_SSL_MINOR_VERSION_3);
 
-//    mbedtls_ssl_conf_ciphersuites(&tls_conf, aws_ciphersuites);
+    /*
+     * Wymuszamy sprawdzony zestaw TLS 1.2 dla AWS IoT i certyfikatu RSA.
+     * Dzieki temu handshake nie wybiera przypadkowo innego cipher suite.
+     */
+    mbedtls_ssl_conf_ciphersuites(&tls_conf, aws_ciphersuites);
 
     mbedtls_ssl_conf_authmode(&tls_conf, MBEDTLS_SSL_VERIFY_OPTIONAL);
     mbedtls_ssl_conf_ca_chain(&tls_conf, &tls_ca_cert, NULL);
@@ -660,60 +854,173 @@ int TlsClient_Connect(void)
         tls_log_mbedtls_error("mbedtls_ssl_set_hostname", ret);
         goto fail;
     }
-    tls_logf("TLS: hostname/SNI set to %s", AWS_IOT_ENDPOINT);
-    tls_log("TLS: set bio custom lwip");
+
+    tls_log_diagf("TLS: hostname/SNI set to %s", AWS_IOT_ENDPOINT);
+
+    tls_log_diag("TLS: set bio custom lwip");
     mbedtls_ssl_set_bio(&tls_ssl, &tls_net, Tls_LwipSend, Tls_LwipRecv, NULL);
 
     tls_log("TLS: handshake...");
 
     uint32_t hs_start = HAL_GetTick();
     uint32_t hs_last_log = HAL_GetTick();
+    uint32_t hs_last_mem_log = HAL_GetTick();
     int hs_try = 0;
+    int hs_last_state = -1;
+    int hs_last_after_state = -1;
+    int hs_last_public_state = -1;
+    int hs_server_hello_before_logged = 0;
+    int hs_server_hello_after_logged = 0;
 
-    do
+    ret = 0;
+
+    while (tls_ssl.state != MBEDTLS_SSL_HANDSHAKE_OVER)
     {
-        uint32_t call_start = HAL_GetTick();
+        uint32_t step_start;
+        uint32_t now;
+        int state_before;
 
         hs_try++;
-        tls_logf("TLS: handshake call try=%d", hs_try);
+        state_before = tls_ssl.state;
+        step_start = HAL_GetTick();
 
-        ret = mbedtls_ssl_handshake(&tls_ssl);
+        if ((state_before == MBEDTLS_SSL_SERVER_HELLO) &&
+            (hs_server_hello_before_logged == 0))
+        {
+            hs_server_hello_before_logged = 1;
+            tls_logf("TLS: before SERVER_HELLO step tr=%d rc=%lu rr=%d re=%d rx=%lu pb=%lu",
+                     hs_try,
+                     (unsigned long)tls_recv_calls,
+                     tls_last_recv_ret,
+                     tls_last_recv_errno,
+                     (unsigned long)eth_rx_irq_count,
+                     (unsigned long)eth_input_pbuf_count);
+        }
 
-        uint32_t call_time = HAL_GetTick() - call_start;
+        if ((hs_try <= 20) || (state_before != hs_last_state))
+        {
+            hs_last_state = state_before;
+            tls_log_diagf("TLS STEP: before tr=%d state=%s(%d)",
+                          hs_try,
+                          tls_state_name(state_before),
+                          state_before);
+        }
 
-        tls_logf("TLS: handshake returned try=%d ret=%d ret_hex=-0x%04X time=%lu ms",
-                 hs_try,
-                 ret,
-                 (ret < 0) ? (unsigned int)(-ret) : 0,
-                 (unsigned long)call_time);
+        ret = mbedtls_ssl_handshake_step(&tls_ssl);
+        now = HAL_GetTick();
+
+        if ((state_before == MBEDTLS_SSL_SERVER_HELLO) &&
+            (hs_server_hello_after_logged == 0))
+        {
+            hs_server_hello_after_logged = 1;
+            tls_logf("TLS: after SERVER_HELLO step ret=%d state=%s(%d) dt=%lu rr=%d re=%d rx=%lu pb=%lu",
+                     ret,
+                     tls_state_name(tls_ssl.state),
+                     tls_ssl.state,
+                     (unsigned long)(now - step_start),
+                     tls_last_recv_ret,
+                     tls_last_recv_errno,
+                     (unsigned long)eth_rx_irq_count,
+                     (unsigned long)eth_input_pbuf_count);
+        }
+#if !TLS_VERBOSE_DIAG_LOGS
+        (void)step_start;
+#endif
+
+        if ((hs_try <= 20) ||
+            (tls_ssl.state != hs_last_after_state) ||
+            ((ret != 0) &&
+             (ret != MBEDTLS_ERR_SSL_WANT_READ) &&
+             (ret != MBEDTLS_ERR_SSL_WANT_WRITE)))
+        {
+            hs_last_after_state = tls_ssl.state;
+            tls_log_diagf("TLS STEP: after tr=%d state=%s(%d) ret=%d dt=%lu",
+                          hs_try,
+                          tls_state_name(tls_ssl.state),
+                          tls_ssl.state,
+                          ret,
+                          (unsigned long)(now - step_start));
+        }
+
+        if (tls_ssl.state != hs_last_public_state)
+        {
+            hs_last_public_state = tls_ssl.state;
+            tls_logf("TLS: state=%s(%d)", tls_state_name(tls_ssl.state), tls_ssl.state);
+        }
 
         if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE)
         {
-            uint32_t now = HAL_GetTick();
+            if ((now - hs_last_log) >= TLS_WAIT_LOG_INTERVAL_MS)
+            {
+                int so_err = -1;
+                int so_ret;
+                int so_errno;
+                socklen_t so_len = sizeof(so_err);
 
-            tls_logf("TLS WAIT: t=%lu rx=%lu pbuf=%lu err=%lu",
-                     (unsigned long)(now - hs_start),
-                     eth_rx_irq_count,
-                     eth_input_pbuf_count,
-                     eth_err_irq_count);
+                hs_last_log = now;
+                errno = 0;
+                so_ret = lwip_getsockopt(tls_net.fd,
+                                         SOL_SOCKET,
+                                         SO_ERROR,
+                                         &so_err,
+                                         &so_len);
+                so_errno = errno;
 
-            tls_logf("TLS WAIT: stack free words=%lu",
-                     (unsigned long)uxTaskGetStackHighWaterMark(NULL));
-            tls_logf("TLS WAIT: heap free=%lu min_ever=%lu",
-                     (unsigned long)xPortGetFreeHeapSize(),
-                     (unsigned long)xPortGetMinimumEverFreeHeapSize());
-            if ((now - hs_start) >= 60000)
+                if (so_ret == 0)
+                {
+                    tls_last_socket_error = so_err;
+                }
+                else
+                {
+                    tls_last_socket_error = -so_errno;
+                }
+
+                tls_logf("TLS WAIT: t=%lu tr=%d sc=%lu rc=%lu sr=%d se=%d rr=%d re=%d so=%d rx=%lu pb=%lu er=%lu",
+                         (unsigned long)(now - hs_start),
+                         hs_try,
+                         (unsigned long)tls_send_calls,
+                         (unsigned long)tls_recv_calls,
+                         tls_last_send_ret,
+                         tls_last_send_errno,
+                         tls_last_recv_ret,
+                         tls_last_recv_errno,
+                         tls_last_socket_error,
+                         eth_rx_irq_count,
+                         eth_input_pbuf_count,
+                         eth_err_irq_count);
+            }
+
+            if ((now - hs_last_mem_log) >= 10000U)
+            {
+                hs_last_mem_log = now;
+
+                tls_log_diagf("TLS MEM: stack=%lu heap=%lu min=%lu",
+                              (unsigned long)uxTaskGetStackHighWaterMark(NULL),
+                              (unsigned long)xPortGetFreeHeapSize(),
+                              (unsigned long)xPortGetMinimumEverFreeHeapSize());
+            }
+
+            if ((now - hs_start) >= TLS_HANDSHAKE_TIMEOUT_MS)
             {
                 tls_log("TLS: handshake TIMEOUT");
                 goto fail;
             }
 
-            tls_log("TLS WAIT: before vTaskDelay");
             vTaskDelay(pdMS_TO_TICKS(100));
-            tls_log("TLS WAIT: after vTaskDelay");
+        }
+        else if (ret != 0)
+        {
+            break;
+        }
+        else
+        {
+            if ((now - hs_start) >= TLS_HANDSHAKE_TIMEOUT_MS)
+            {
+                tls_log("TLS: handshake TIMEOUT");
+                goto fail;
+            }
         }
     }
-    while (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE);
 
     if (ret != 0)
     {
@@ -738,9 +1045,9 @@ int TlsClient_Connect(void)
         tls_log(vrfy_buf);
 
         /*
-         * Na czas diagnostyki NIE robimy goto fail,
-         * żeby zobaczyć, czy handshake technicznie przeszedł.
-         * Potem wrócimy do twardej weryfikacji.
+         * Na czas diagnostyki nie robimy goto fail,
+         * zeby sprawdzic, czy handshake technicznie przeszedl.
+         * Potem mozna wrocic do twardej weryfikacji.
          */
     }
     else
@@ -757,6 +1064,7 @@ fail:
     tls_ctx_free_all();
     return -1;
 }
+
 int TlsClient_Write(const uint8_t *data, size_t len)
 {
     int ret;
@@ -798,6 +1106,329 @@ int TlsClient_Read(uint8_t *data, size_t len, uint32_t timeout_ms)
     }
 
     return ret;
+}
+
+static size_t mqtt_encode_remaining_length(uint8_t *out, size_t len)
+{
+    size_t written = 0U;
+
+    do
+    {
+        uint8_t encoded = (uint8_t)(len % 128U);
+        len /= 128U;
+
+        if (len > 0U)
+        {
+            encoded |= 0x80U;
+        }
+
+        out[written++] = encoded;
+    }
+    while (len > 0U);
+
+    return written;
+}
+
+static int mqtt_put_string(uint8_t *buf,
+                           size_t buf_len,
+                           size_t *pos,
+                           const char *text)
+{
+    size_t len = strlen(text);
+
+    if ((len > 65535U) || ((*pos + 2U + len) > buf_len))
+    {
+        return -1;
+    }
+
+    buf[(*pos)++] = (uint8_t)((len >> 8) & 0xFFU);
+    buf[(*pos)++] = (uint8_t)(len & 0xFFU);
+    memcpy(&buf[*pos], text, len);
+    *pos += len;
+
+    return 0;
+}
+
+static int tls_write_all(const uint8_t *data, size_t len, uint32_t timeout_ms)
+{
+    size_t sent = 0U;
+    uint32_t start = HAL_GetTick();
+
+    while (sent < len)
+    {
+        int ret;
+
+        ret = mbedtls_ssl_write(&tls_ssl, &data[sent], len - sent);
+
+        if (ret > 0)
+        {
+            sent += (size_t)ret;
+            continue;
+        }
+
+        if ((ret == MBEDTLS_ERR_SSL_WANT_READ) ||
+            (ret == MBEDTLS_ERR_SSL_WANT_WRITE))
+        {
+            if ((HAL_GetTick() - start) >= timeout_ms)
+            {
+                tls_log("MQTT/TLS: write timeout");
+                return -1;
+            }
+
+            osDelay(10);
+            continue;
+        }
+
+        tls_log_mbedtls_error("mbedtls_ssl_write", ret);
+        return -1;
+    }
+
+    return 0;
+}
+
+static int tls_read_exact(uint8_t *data, size_t len, uint32_t timeout_ms)
+{
+    size_t got = 0U;
+    uint32_t start = HAL_GetTick();
+
+    while (got < len)
+    {
+        int ret;
+
+        ret = mbedtls_ssl_read(&tls_ssl, &data[got], len - got);
+
+        if (ret > 0)
+        {
+            got += (size_t)ret;
+            continue;
+        }
+
+        if ((ret == MBEDTLS_ERR_SSL_WANT_READ) ||
+            (ret == MBEDTLS_ERR_SSL_WANT_WRITE))
+        {
+            if ((HAL_GetTick() - start) >= timeout_ms)
+            {
+                tls_log("MQTT/TLS: read timeout");
+                return -1;
+            }
+
+            osDelay(10);
+            continue;
+        }
+
+        tls_log_mbedtls_error("mbedtls_ssl_read", ret);
+        return -1;
+    }
+
+    return 0;
+}
+
+static int mqtt_send_connect(void)
+{
+    uint8_t pkt[256];
+    uint8_t connack[4];
+    size_t client_id_len = strlen(AWS_CLIENT_ID);
+    size_t remaining = 10U + 2U + client_id_len;
+    size_t rem_len;
+    size_t pos;
+
+    if (remaining > 127U)
+    {
+        tls_log("MQTT: CONNECT too large");
+        return -1;
+    }
+
+    pkt[0] = 0x10U;
+    rem_len = mqtt_encode_remaining_length(&pkt[1], remaining);
+    pos = 1U + rem_len;
+
+    if (mqtt_put_string(pkt, sizeof(pkt), &pos, "MQTT") != 0)
+    {
+        return -1;
+    }
+
+    pkt[pos++] = 4U;      /* MQTT 3.1.1 */
+    pkt[pos++] = 0x02U;   /* clean session */
+    pkt[pos++] = 0U;
+    pkt[pos++] = 60U;     /* keep alive seconds */
+
+    if (mqtt_put_string(pkt, sizeof(pkt), &pos, AWS_CLIENT_ID) != 0)
+    {
+        return -1;
+    }
+
+    tls_logf("MQTT: CONNECT client=%s", AWS_CLIENT_ID);
+
+    if (tls_write_all(pkt, pos, 5000U) != 0)
+    {
+        return -1;
+    }
+
+    if (tls_read_exact(connack, sizeof(connack), 5000U) != 0)
+    {
+        tls_log("MQTT: CONNACK read failed");
+        return -1;
+    }
+
+    tls_logf("MQTT: CONNACK %02X %02X %02X %02X",
+             connack[0],
+             connack[1],
+             connack[2],
+             connack[3]);
+
+    if ((connack[0] != 0x20U) || (connack[1] != 0x02U) || (connack[3] != 0x00U))
+    {
+        tls_log("MQTT: CONNECT refused");
+        return -1;
+    }
+
+    tls_log("MQTT: CONNECT OK");
+    return 0;
+}
+
+static int mqtt_subscribe_cmd(void)
+{
+    uint8_t pkt[256];
+    uint8_t suback[5];
+    size_t topic_len = strlen(AWS_TOPIC_CMD);
+    size_t remaining = 2U + 2U + topic_len + 1U;
+    size_t rem_len;
+    size_t pos;
+
+    if (remaining > 127U)
+    {
+        tls_log("MQTT: SUBSCRIBE too large");
+        return -1;
+    }
+
+    pkt[0] = 0x82U;
+    rem_len = mqtt_encode_remaining_length(&pkt[1], remaining);
+    pos = 1U + rem_len;
+    pkt[pos++] = 0U;
+    pkt[pos++] = 1U;
+
+    if (mqtt_put_string(pkt, sizeof(pkt), &pos, AWS_TOPIC_CMD) != 0)
+    {
+        return -1;
+    }
+
+    pkt[pos++] = 0U; /* QoS 0 */
+
+    tls_logf("MQTT: SUBSCRIBE %s", AWS_TOPIC_CMD);
+
+    if (tls_write_all(pkt, pos, 5000U) != 0)
+    {
+        return -1;
+    }
+
+    if (tls_read_exact(suback, sizeof(suback), 5000U) != 0)
+    {
+        tls_log("MQTT: SUBACK read failed");
+        return -1;
+    }
+
+    tls_logf("MQTT: SUBACK %02X %02X %02X %02X %02X",
+             suback[0],
+             suback[1],
+             suback[2],
+             suback[3],
+             suback[4]);
+
+    if ((suback[0] != 0x90U) || (suback[1] != 0x03U) || (suback[4] == 0x80U))
+    {
+        tls_log("MQTT: SUBSCRIBE refused");
+        return -1;
+    }
+
+    tls_log("MQTT: SUBSCRIBE OK");
+    return 0;
+}
+
+static int mqtt_publish_status(void)
+{
+    uint8_t pkt[384];
+    char payload[160];
+    size_t topic_len = strlen(AWS_TOPIC_STATUS);
+    size_t payload_len;
+    size_t remaining;
+    size_t rem_len;
+    size_t pos;
+
+    snprintf(payload,
+             sizeof(payload),
+             "{\"thing\":\"%s\",\"event\":\"mqtt_test\",\"tick\":%lu}",
+             AWS_THING_NAME,
+             (unsigned long)HAL_GetTick());
+
+    payload[sizeof(payload) - 1U] = '\0';
+    payload_len = strlen(payload);
+    remaining = 2U + topic_len + payload_len;
+
+    if (remaining > 268435455U)
+    {
+        tls_log("MQTT: PUBLISH too large");
+        return -1;
+    }
+
+    pkt[0] = 0x30U; /* PUBLISH QoS 0 */
+    rem_len = mqtt_encode_remaining_length(&pkt[1], remaining);
+    pos = 1U + rem_len;
+
+    if (mqtt_put_string(pkt, sizeof(pkt), &pos, AWS_TOPIC_STATUS) != 0)
+    {
+        return -1;
+    }
+
+    if ((pos + payload_len) > sizeof(pkt))
+    {
+        tls_log("MQTT: PUBLISH buffer too small");
+        return -1;
+    }
+
+    memcpy(&pkt[pos], payload, payload_len);
+    pos += payload_len;
+
+    tls_logf("MQTT: PUBLISH %s", AWS_TOPIC_STATUS);
+
+    if (tls_write_all(pkt, pos, 5000U) != 0)
+    {
+        return -1;
+    }
+
+    tls_log("MQTT: PUBLISH OK");
+    return 0;
+}
+
+int TlsClient_MqttTest(void)
+{
+    if (!tls_connected)
+    {
+        tls_log("MQTT: refused, TLS not connected");
+        return -1;
+    }
+
+    tls_log("MQTT: test start");
+
+    if (mqtt_send_connect() != 0)
+    {
+        tls_log("MQTT: CONNECT failed");
+        return -1;
+    }
+
+    if (mqtt_subscribe_cmd() != 0)
+    {
+        tls_log("MQTT: SUBSCRIBE failed");
+        return -1;
+    }
+
+    if (mqtt_publish_status() != 0)
+    {
+        tls_log("MQTT: PUBLISH failed");
+        return -1;
+    }
+
+    tls_log("MQTT: test OK");
+    return 0;
 }
 
 void TlsClient_Disconnect(void)

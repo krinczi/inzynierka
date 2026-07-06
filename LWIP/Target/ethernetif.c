@@ -34,11 +34,12 @@
 
 /* Within 'USER CODE' section, code will be kept by default at each generation */
 /* USER CODE BEGIN 0 */
-extern UART_HandleTypeDef huart3;
+#include "debug_logger.h"
 
+static void EthLog(const char *s) __attribute__((unused));
 static void EthLog(const char *s)
 {
-  HAL_UART_Transmit(&huart3, (uint8_t *)s, strlen(s), HAL_MAX_DELAY);
+  Debug_LogLine(DEBUG_SRC_ETH, s);
 }
 volatile uint32_t eth_rx_irq_count = 0;
 volatile uint32_t eth_tx_irq_count = 0;

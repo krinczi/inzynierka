@@ -26,6 +26,7 @@
 #include "lwip.h"
 #include "net_debug_server.h"
 #include "tls_client.h"
+#include "debug_logger.h"
 #include "lwip/netif.h"
 #include "lwip/dhcp.h"
 #include "lwip/ip4_addr.h"
@@ -34,6 +35,7 @@
 #include "lwip/err.h"
 #include "lwip/dns.h"
 #include "lwip/ip_addr.h"
+#include "lwip/tcpip.h"
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
 #include <errno.h>
@@ -51,6 +53,9 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#ifndef NET_ENABLE_DNS_SELF_TEST
+#define NET_ENABLE_DNS_SELF_TEST 0
+#endif
 
 /* USER CODE END PD */
 
@@ -83,6 +88,14 @@ extern volatile uint32_t eth_err_irq_count;
 extern volatile uint32_t eth_input_pbuf_count;
 extern volatile uint32_t eth_last_dma_error;
 extern volatile uint32_t eth_last_hal_error;
+#if NET_ENABLE_DNS_SELF_TEST
+static volatile uint8_t net_dns_done = 0U;
+static volatile err_t net_dns_err = ERR_INPROGRESS;
+static volatile uint8_t net_dns_start_done = 0U;
+static volatile err_t net_dns_start_err = ERR_INPROGRESS;
+static ip_addr_t net_dns_addr;
+static char net_dns_hostname[256];
+#endif
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -93,12 +106,15 @@ static void MX_RNG_Init(void);
 void StartDefaultTask(void *argument);
 
 /* USER CODE BEGIN PFP */
-static void UartPuts(const char *s);
 static void Print_ResetReason(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+#define SYS_LOG(text)      Debug_LogLine(DEBUG_SRC_SYSTEM, (text))
+#define SYS_LOGF(...)      Debug_Logf(DEBUG_SRC_SYSTEM, __VA_ARGS__)
+#define NET_LOG(text)      Debug_LogLine(DEBUG_SRC_NET, (text))
+#define NET_LOGF(...)      Debug_Logf(DEBUG_SRC_NET, __VA_ARGS__)
 
 /* USER CODE END 0 */
 
@@ -132,16 +148,10 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_USART3_UART_Init();
-  Print_ResetReason();
   MX_RNG_Init();
   /* Call PreOsInit function */
   MX_MBEDTLS_Init();
   /* USER CODE BEGIN 2 */
-  HAL_UART_Transmit(&huart3, (uint8_t *)"BOOT: program start\r\n", 21, HAL_MAX_DELAY);
-  HAL_UART_Transmit(&huart3, (uint8_t *)"BOOT: GPIO init OK\r\n", 20, HAL_MAX_DELAY);
-  HAL_UART_Transmit(&huart3, (uint8_t *)"BOOT: UART3 init OK\r\n", 21, HAL_MAX_DELAY);
-  HAL_UART_Transmit(&huart3, (uint8_t *)"BOOT: before RTOS\r\n", 19, HAL_MAX_DELAY);
-
 //  NetDebugServer_Init();
 //  TlsClient_Init();
   HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_SET);
@@ -149,6 +159,15 @@ int main(void)
 
   /* Init scheduler */
   osKernelInitialize();
+
+  /* USER CODE BEGIN RTOS_DEBUG */
+  DebugLogger_Init(&huart3);
+  SYS_LOG("BOOT: program start");
+  SYS_LOG("BOOT: GPIO init OK");
+  SYS_LOG("BOOT: UART3 init OK");
+  SYS_LOG("BOOT: before RTOS");
+  Print_ResetReason();
+  /* USER CODE END RTOS_DEBUG */
 
   /* USER CODE BEGIN RTOS_MUTEX */
   /* add mutexes, ... */
@@ -172,23 +191,11 @@ int main(void)
 
   if (defaultTaskHandle == NULL)
   {
-      HAL_UART_Transmit(&huart3,
-                        (uint8_t *)"RTOS: defaultTask create FAILED\r\n",
-                        33,
-                        HAL_MAX_DELAY);
-
-      while (1)
-      {
-          HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
-          HAL_Delay(200);
-      }
+      SYS_LOG("RTOS: defaultTask create FAILED");
   }
   else
   {
-      HAL_UART_Transmit(&huart3,
-                        (uint8_t *)"RTOS: defaultTask create OK\r\n",
-                        29,
-                        HAL_MAX_DELAY);
+      SYS_LOG("RTOS: defaultTask create OK");
   }
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
@@ -207,26 +214,27 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  //to zakomentowałam to check that
-	  //	  MX_LWIP_Process();
+      //to zakomentowalam to check that
+      //    MX_LWIP_Process();
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
 
-	  uint32_t now = HAL_GetTick();
+      uint32_t now = HAL_GetTick();
 
-	  if ((now - last_blink_ms) >= 500)
-	  {
-	      last_blink_ms = now;
-	      HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
-	  }
+      if ((now - last_blink_ms) >= 500)
+      {
+          last_blink_ms = now;
+          HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
+      }
 
-	  if ((now - last_log_ms) >= 5000)
-	  {
-	      last_log_ms = now;
-	      HAL_UART_Transmit(&huart3, (uint8_t *)"LOOP: lwip alive\r\n", 18, HAL_MAX_DELAY);	  }
+      if ((now - last_log_ms) >= 5000)
+      {
+          last_log_ms = now;
+          SYS_LOG("LOOP: lwip alive");
+      }
 
-	  NetDebugServer_Process();
+      NetDebugServer_Process();
   }
 
   /* USER CODE END 3 */
@@ -283,10 +291,10 @@ void SystemClock_Config(void)
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.SYSCLKDivider = RCC_SYSCLK_DIV1;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_HCLK_DIV1;
-  RCC_ClkInitStruct.APB3CLKDivider = RCC_APB3_DIV1;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_APB1_DIV1;
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_APB2_DIV1;
-  RCC_ClkInitStruct.APB4CLKDivider = RCC_APB4_DIV1;
+  RCC_ClkInitStruct.APB3CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB4CLKDivider = RCC_HCLK_DIV1;
 
   if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_1) != HAL_OK)
   {
@@ -453,7 +461,7 @@ void vAssertCalled(const char *file, int line)
              file ? file : "unknown",
              line);
 
-    UartPuts(buf);
+    SYS_LOG(buf);
 
     taskDISABLE_INTERRUPTS();
 
@@ -467,24 +475,22 @@ void vAssertCalled(const char *file, int line)
         }
     }
 }
+
 static void Print_ResetReason(void)
 {
-    if (__HAL_RCC_GET_FLAG(RCC_FLAG_IWDG1RST)) UartPuts("RESET: IWDG\r\n");
-    if (__HAL_RCC_GET_FLAG(RCC_FLAG_WWDG1RST)) UartPuts("RESET: WWDG\r\n");
-    if (__HAL_RCC_GET_FLAG(RCC_FLAG_SFTRST))   UartPuts("RESET: SOFTWARE\r\n");
-    if (__HAL_RCC_GET_FLAG(RCC_FLAG_PORRST))   UartPuts("RESET: POWER ON\r\n");
-    if (__HAL_RCC_GET_FLAG(RCC_FLAG_PINRST))   UartPuts("RESET: NRST PIN\r\n");
-    if (__HAL_RCC_GET_FLAG(RCC_FLAG_BORRST))   UartPuts("RESET: BROWNOUT\r\n");
+    if (__HAL_RCC_GET_FLAG(RCC_FLAG_IWDG1RST)) SYS_LOG("RESET: IWDG");
+    if (__HAL_RCC_GET_FLAG(RCC_FLAG_WWDG1RST)) SYS_LOG("RESET: WWDG");
+    if (__HAL_RCC_GET_FLAG(RCC_FLAG_SFTRST))   SYS_LOG("RESET: SOFTWARE");
+    if (__HAL_RCC_GET_FLAG(RCC_FLAG_PORRST))   SYS_LOG("RESET: POWER ON");
+    if (__HAL_RCC_GET_FLAG(RCC_FLAG_PINRST))   SYS_LOG("RESET: NRST PIN");
+    if (__HAL_RCC_GET_FLAG(RCC_FLAG_BORRST))   SYS_LOG("RESET: BROWNOUT");
 
     __HAL_RCC_CLEAR_RESET_FLAGS();
 }
-static void UartPuts(const char *s)
-{
-    HAL_UART_Transmit(&huart3, (uint8_t *)s, strlen(s), HAL_MAX_DELAY);
-}
+
 void vApplicationMallocFailedHook(void)
 {
-    UartPuts("\r\nFREERTOS: MALLOC FAILED\r\n");
+    SYS_LOG("FREERTOS: MALLOC FAILED");
 
     taskDISABLE_INTERRUPTS();
 
@@ -503,9 +509,8 @@ void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
 {
     (void)xTask;
 
-    UartPuts("\r\nFREERTOS: STACK OVERFLOW in task: ");
-    UartPuts(pcTaskName ? pcTaskName : "unknown");
-    UartPuts("\r\n");
+    SYS_LOGF("FREERTOS: STACK OVERFLOW in task: %s",
+             pcTaskName ? pcTaskName : "unknown");
 
     taskDISABLE_INTERRUPTS();
 
@@ -519,6 +524,7 @@ void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
         }
     }
 }
+
 static void Net_PrintIp(void)
 {
     char ip[16];
@@ -531,19 +537,20 @@ static void Net_PrintIp(void)
     ip4addr_ntoa_r(netif_ip4_gw(&gnetif), gw, sizeof(gw));
 
     snprintf(buf, sizeof(buf), "NET: IP=%s MASK=%s GW=%s\r\n", ip, mask, gw);
-    UartPuts(buf);
+    NET_LOG(buf);
 }
+
 static int Net_WaitForLink(void)
 {
     uint32_t start = HAL_GetTick();
 
-    UartPuts("NET: waiting for Ethernet link...\r\n");
+    NET_LOG("NET: waiting for Ethernet link...");
 
     while (!netif_is_link_up(&gnetif))
     {
         if ((HAL_GetTick() - start) > 15000)
         {
-            UartPuts("NET: Ethernet link TIMEOUT\r\n");
+            NET_LOG("NET: Ethernet link TIMEOUT");
             Net_PrintIp();
             return -1;
         }
@@ -551,65 +558,149 @@ static int Net_WaitForLink(void)
         osDelay(100);
     }
 
-    UartPuts("NET: Ethernet link UP\r\n");
+    NET_LOG("NET: Ethernet link UP");
 
-    UartPuts("NET: before post-link delay\r\n");
+    NET_LOG("NET: before post-link delay");
     osDelay(1500);
-    UartPuts("NET: after post-link delay\r\n");
+    NET_LOG("NET: after post-link delay");
 
-    UartPuts("NET: before netif_is_up\r\n");
+    NET_LOG("NET: before netif_is_up");
 
     if (!netif_is_up(&gnetif))
     {
-        UartPuts("NET: before netif_set_up\r\n");
+        NET_LOG("NET: before netif_set_up");
         netif_set_up(&gnetif);
-        UartPuts("NET: netif set UP\r\n");
+        NET_LOG("NET: netif set UP");
     }
 
-    UartPuts("NET: Net_WaitForLink return OK\r\n");
+    NET_LOG("NET: Net_WaitForLink return OK");
 
     return 0;
 }
 
-static int Net_TestDns(const char *hostname)
+#if NET_ENABLE_DNS_SELF_TEST
+static void Net_DnsFound(const char *name, const ip_addr_t *ipaddr, void *arg)
+{
+    (void)name;
+    (void)arg;
+
+    if (ipaddr != NULL)
+    {
+        net_dns_addr = *ipaddr;
+        net_dns_err = ERR_OK;
+    }
+    else
+    {
+        net_dns_err = ERR_VAL;
+    }
+
+    net_dns_done = 1U;
+}
+
+static void Net_DnsStartOnTcpipThread(void *arg)
 {
     ip_addr_t addr;
-    char buf[200];
-    char ipbuf[48];
+    err_t err;
 
-    UartPuts("DNS: test start\r\n");
+    (void)arg;
 
-    snprintf(buf, sizeof(buf), "DNS: host=%s\r\n", hostname);
-    UartPuts(buf);
-
-    snprintf(buf, sizeof(buf), "DNS: server0=%s\r\n", ipaddr_ntoa(dns_getserver(0)));
-    UartPuts(buf);
-
-    uint32_t t0 = HAL_GetTick();
-
-    UartPuts("DNS: before netconn_gethostbyname\r\n");
-
-    err_t err = netconn_gethostbyname(hostname, &addr);
-
-    uint32_t dt = HAL_GetTick() - t0;
-
-    snprintf(buf, sizeof(buf),
-             "DNS: after netconn_gethostbyname err=%d dt=%lu ms\r\n",
-             (int)err,
-             (unsigned long)dt);
-    UartPuts(buf);
+    err = dns_gethostbyname(net_dns_hostname, &addr, Net_DnsFound, NULL);
+    net_dns_start_err = err;
 
     if (err == ERR_OK)
     {
-        ipaddr_ntoa_r(&addr, ipbuf, sizeof(ipbuf));
-        snprintf(buf, sizeof(buf), "DNS: resolved -> %s\r\n", ipbuf);
-        UartPuts(buf);
-        return 0;
+        net_dns_addr = addr;
+        net_dns_err = ERR_OK;
+        net_dns_done = 1U;
+    }
+    else if (err != ERR_INPROGRESS)
+    {
+        net_dns_err = err;
+        net_dns_done = 1U;
     }
 
-    UartPuts("DNS: resolve failed\r\n");
-    return -1;
+    net_dns_start_done = 1U;
 }
+
+static int Net_TestDns(const char *hostname)
+{
+    char buf[200];
+    char ipbuf[48];
+    uint32_t t0;
+    err_t err;
+
+    NET_LOG("DNS: test start");
+
+    snprintf(buf, sizeof(buf), "DNS: host=%s\r\n", hostname);
+    NET_LOG(buf);
+
+    snprintf(buf, sizeof(buf), "DNS: server0=%s\r\n", ipaddr_ntoa(dns_getserver(0)));
+    NET_LOG(buf);
+
+    net_dns_done = 0U;
+    net_dns_err = ERR_INPROGRESS;
+    net_dns_start_done = 0U;
+    net_dns_start_err = ERR_INPROGRESS;
+    memset(&net_dns_addr, 0, sizeof(net_dns_addr));
+    snprintf(net_dns_hostname, sizeof(net_dns_hostname), "%s", hostname);
+    net_dns_hostname[sizeof(net_dns_hostname) - 1U] = '\0';
+
+    t0 = HAL_GetTick();
+
+    NET_LOG("DNS: before tcpip_callback dns_gethostbyname");
+
+    err = tcpip_callback(Net_DnsStartOnTcpipThread, NULL);
+
+    snprintf(buf, sizeof(buf), "DNS: tcpip_callback err=%d\r\n", (int)err);
+    NET_LOG(buf);
+
+    if (err != ERR_OK)
+    {
+        return -1;
+    }
+
+    while (net_dns_start_done == 0U)
+    {
+        if ((HAL_GetTick() - t0) > 2000U)
+        {
+            NET_LOG("DNS: tcpip_callback start TIMEOUT");
+            return -1;
+        }
+
+        osDelay(10);
+    }
+
+    snprintf(buf, sizeof(buf), "DNS: start err=%d\r\n", (int)net_dns_start_err);
+    NET_LOG(buf);
+
+    while (net_dns_done == 0U)
+    {
+        if ((HAL_GetTick() - t0) > 8000U)
+        {
+            NET_LOG("DNS: async resolve TIMEOUT");
+            return -1;
+        }
+
+        osDelay(100);
+    }
+
+    if (net_dns_err != ERR_OK)
+    {
+        snprintf(buf, sizeof(buf), "DNS: async resolve failed err=%d\r\n", (int)net_dns_err);
+        NET_LOG(buf);
+        return -1;
+    }
+
+    ipaddr_ntoa_r(&net_dns_addr, ipbuf, sizeof(ipbuf));
+    snprintf(buf, sizeof(buf),
+             "DNS: resolved async -> %s dt=%lu ms\r\n",
+             ipbuf,
+             (unsigned long)(HAL_GetTick() - t0));
+    NET_LOG(buf);
+    return 0;
+}
+#endif
+
 static int Net_TestTcpIp(const char *ip, uint16_t port)
 {
     int sock;
@@ -617,35 +708,35 @@ static int Net_TestTcpIp(const char *ip, uint16_t port)
     char buf[192];
 
     snprintf(buf, sizeof(buf), "TCPIP: connect %s:%u\r\n", ip, port);
-    UartPuts(buf);
+    NET_LOG(buf);
 
     errno = 0;
-    UartPuts("TCPIP: before socket\r\n");
+    NET_LOG("TCPIP: before socket");
 
     sock = lwip_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 
     snprintf(buf, sizeof(buf), "TCPIP: after socket sock=%d errno=%d\r\n", sock, errno);
-    UartPuts(buf);
+    NET_LOG(buf);
 
     if (sock < 0)
     {
-        UartPuts("TCPIP: socket failed\r\n");
+        NET_LOG("TCPIP: socket failed");
         return -1;
     }
 
     int nonblock = 1;
 
     errno = 0;
-    UartPuts("TCPIP: before nonblock ioctl\r\n");
+    NET_LOG("TCPIP: before nonblock ioctl");
 
     int io_ret = lwip_ioctl(sock, FIONBIO, &nonblock);
 
     snprintf(buf, sizeof(buf), "TCPIP: after nonblock ioctl ret=%d errno=%d\r\n", io_ret, errno);
-    UartPuts(buf);
+    NET_LOG(buf);
 
     if (io_ret < 0)
     {
-        UartPuts("TCPIP: nonblock ioctl failed\r\n");
+        NET_LOG("TCPIP: nonblock ioctl failed");
         lwip_close(sock);
         return -1;
     }
@@ -656,23 +747,23 @@ static int Net_TestTcpIp(const char *ip, uint16_t port)
     addr.sin_addr.s_addr = inet_addr(ip);
 
     errno = 0;
-    UartPuts("TCPIP: before connect\r\n");
+    NET_LOG("TCPIP: before connect");
 
     int ret = lwip_connect(sock, (struct sockaddr *)&addr, sizeof(addr));
 
     snprintf(buf, sizeof(buf), "TCPIP: after connect ret=%d errno=%d\r\n", ret, errno);
-    UartPuts(buf);
+    NET_LOG(buf);
 
     if (ret == 0)
     {
-        UartPuts("TCPIP: connect OK immediate\r\n");
+        NET_LOG("TCPIP: connect OK immediate");
         lwip_close(sock);
         return 0;
     }
 
     /*
-     * NIE używamy lwip_select(), bo u Ciebie potrafi wisieć.
-     * Pollujemy SO_ERROR ręcznie przez max 30 sekund.
+     * Nie uzywamy blokujacego oczekiwania na socket, bo u Ciebie potrafi wisiec.
+     * Pollujemy SO_ERROR recznie przez max 30 sekund.
      */
     uint32_t start = HAL_GetTick();
 
@@ -690,7 +781,7 @@ static int Net_TestTcpIp(const char *ip, uint16_t port)
                  err,
                  errno,
                  (unsigned long)(HAL_GetTick() - start));
-        UartPuts(buf);
+        NET_LOG(buf);
 
         if (gs_ret == 0 && err == 0)
         {
@@ -698,15 +789,16 @@ static int Net_TestTcpIp(const char *ip, uint16_t port)
 
             if (elapsed >= 1000)
             {
-                UartPuts("TCPIP: connect probably OK after delay by SO_ERROR=0\r\n");
+                NET_LOG("TCPIP: connect probably OK after delay by SO_ERROR=0");
                 lwip_close(sock);
                 return 0;
             }
         }
+
         if (err != 0 && err != EINPROGRESS && err != EALREADY && err != EWOULDBLOCK && err != EAGAIN)
         {
             snprintf(buf, sizeof(buf), "TCPIP: connect failed sockerr=%d\r\n", err);
-            UartPuts(buf);
+            NET_LOG(buf);
             lwip_close(sock);
             return -1;
         }
@@ -714,13 +806,14 @@ static int Net_TestTcpIp(const char *ip, uint16_t port)
         osDelay(1000);
     }
 
-    UartPuts("TCPIP: connect TIMEOUT manual poll\r\n");
+    NET_LOG("TCPIP: connect TIMEOUT manual poll");
     lwip_close(sock);
     return -1;
 }
+
 static void Net_SetStaticIp(void)
 {
-    UartPuts("STATIC: enter\r\n");
+    NET_LOG("STATIC: enter");
 
     ip4_addr_t ipaddr;
     ip4_addr_t netmask;
@@ -743,21 +836,21 @@ static void Net_SetStaticIp(void)
     dns_setserver(0, &dns1);
     dns_setserver(1, &dns2);
 
-
-    UartPuts("NET: static IP set\r\n");
+    NET_LOG("NET: static IP set");
 
     char buf[96];
 
     snprintf(buf, sizeof(buf), "NET: DNS0=%s\r\n", ipaddr_ntoa(dns_getserver(0)));
-    UartPuts(buf);
+    NET_LOG(buf);
 
     snprintf(buf, sizeof(buf), "NET: DNS1=%s\r\n", ipaddr_ntoa(dns_getserver(1)));
-    UartPuts(buf);
+    NET_LOG(buf);
 
     Net_PrintIp();
 
-    UartPuts("NET: static config done\r\n");
+    NET_LOG("NET: static config done");
 }
+
 static void Net_RestartDhcp(void)
 {
     char buf[80];
@@ -766,7 +859,7 @@ static void Net_RestartDhcp(void)
 
     IP4_ADDR(&zero, 0, 0, 0, 0);
 
-    UartPuts("NET: DHCP restart\r\n");
+    NET_LOG("NET: DHCP restart");
 
     dhcp_stop(&gnetif);
     netif_set_addr(&gnetif, &zero, &zero, &zero);
@@ -783,7 +876,7 @@ static void Net_RestartDhcp(void)
     err = dhcp_start(&gnetif);
 
     snprintf(buf, sizeof(buf), "NET: dhcp_start err=%d\r\n", (int)err);
-    UartPuts(buf);
+    NET_LOG(buf);
 }
 
 static void Net_WaitForLinkAndDhcp(void)
@@ -791,21 +884,21 @@ static void Net_WaitForLinkAndDhcp(void)
     uint32_t last_log;
     uint32_t last_retry;
 
-    UartPuts("NET: waiting for Ethernet link...\r\n");
+    NET_LOG("NET: waiting for Ethernet link...");
 
     while (!netif_is_link_up(&gnetif))
     {
         osDelay(100);
     }
 
-    UartPuts("NET: Ethernet link UP\r\n");
+    NET_LOG("NET: Ethernet link UP");
 
     osDelay(1500);
 
     if (!netif_is_up(&gnetif))
     {
         netif_set_up(&gnetif);
-        UartPuts("NET: netif set UP\r\n");
+        NET_LOG("NET: netif set UP");
     }
 
     Net_RestartDhcp();
@@ -813,7 +906,7 @@ static void Net_WaitForLinkAndDhcp(void)
     last_log = HAL_GetTick();
     last_retry = HAL_GetTick();
 
-    UartPuts("NET: waiting for DHCP...\r\n");
+    NET_LOG("NET: waiting for DHCP...");
 
     while (!dhcp_supplied_address(&gnetif))
     {
@@ -835,7 +928,7 @@ static void Net_WaitForLinkAndDhcp(void)
                      dhcp_supplied_address(&gnetif),
                      ip);
 
-            UartPuts(buf);
+            NET_LOG(buf);
         }
 
         if ((now - last_retry) >= 10000)
@@ -847,7 +940,7 @@ static void Net_WaitForLinkAndDhcp(void)
         osDelay(100);
     }
 
-    UartPuts("NET: DHCP OK\r\n");
+    NET_LOG("NET: DHCP OK");
     Net_PrintIp();
 }
 /* USER CODE END 4 */
@@ -862,93 +955,88 @@ static void Net_WaitForLinkAndDhcp(void)
 void StartDefaultTask(void *argument)
 {
   /* USER CODE BEGIN 5 */
-    UartPuts("RTOS: defaultTask start\r\n");
+    SYS_LOG("RTOS: defaultTask start");
 
     HAL_NVIC_SetPriority(ETH_IRQn, 7, 0);
     HAL_NVIC_EnableIRQ(ETH_IRQn);
 
     MX_LWIP_Init();
 
-    UartPuts("RTOS: LWIP init OK\r\n");
+    SYS_LOG("RTOS: LWIP init OK");
 
     int network_ready = 0;
     int tls_initialized = 0;
 
     if (Net_WaitForLink() == 0)
     {
-        UartPuts("STEP: before Net_SetStaticIp\r\n");
+        NET_LOG("STEP: before Net_SetStaticIp");
         Net_SetStaticIp();
-        UartPuts("STEP: after Net_SetStaticIp\r\n");
+        NET_LOG("STEP: after Net_SetStaticIp");
 
-        osDelay(3000);
+#if NET_ENABLE_DNS_SELF_TEST
+        NET_LOG("NET: ready for DNS-only test");
 
-        {
-            char buf[180];
-            snprintf(buf, sizeof(buf),
-                     "NET: pre-DNS link=%d netif=%d ip=0x%08lx rx_irq=%lu tx_irq=%lu err=%lu pbuf=%lu dma=0x%08lx hal=0x%08lx\r\n",
-                     netif_is_link_up(&gnetif),
-                     netif_is_up(&gnetif),
-                     (unsigned long)netif_ip4_addr(&gnetif)->addr,
-                     eth_rx_irq_count,
-                     eth_tx_irq_count,
-                     eth_err_irq_count,
-                     eth_input_pbuf_count,
-                     eth_last_dma_error,
-                     eth_last_hal_error);
-            UartPuts(buf);
-        }
-
-        UartPuts("NET: ready for DNS-only test\r\n");
-
-        UartPuts("STEP: DNS example.com\r\n");
+        NET_LOG("STEP: DNS example.com");
         int dns_example_ok = Net_TestDns("example.com");
 
         if (dns_example_ok == 0)
         {
-            UartPuts("DNS TEST: example.com OK\r\n");
+            NET_LOG("DNS TEST: example.com OK");
 
-            UartPuts("STEP: DNS AWS\r\n");
+            NET_LOG("STEP: DNS AWS");
             int dns_aws_ok = Net_TestDns(AWS_IOT_ENDPOINT);
 
             if (dns_aws_ok == 0)
             {
-                UartPuts("DNS TEST: AWS OK\r\n");
+                NET_LOG("DNS TEST: AWS OK");
                 network_ready = 1;
             }
             else
             {
-                UartPuts("DNS TEST: AWS FAILED\r\n");
+                NET_LOG("DNS TEST: AWS FAILED");
                 network_ready = 0;
             }
         }
         else
         {
-            UartPuts("DNS TEST: example.com FAILED\r\n");
+            NET_LOG("DNS TEST: example.com FAILED");
             network_ready = 0;
+        }
+#else
+        NET_LOG("NET: DNS self-test disabled");
+        NET_LOG("NET: TLS task will resolve AWS host");
+        network_ready = 1;
+#endif
+    }
+    else
+    {
+        NET_LOG("NET: no link, skipping DNS/TCP/TLS");
+        network_ready = 0;
+    }
+
+    if (network_ready)
+    {
+        SYS_LOG("RTOS: DNS OK, TLS init start");
+
+        if (TlsClient_Init() == 0)
+        {
+            tls_initialized = 1;
+            SYS_LOG("RTOS: TLS init OK, handshake test enabled");
+        }
+        else
+        {
+            tls_initialized = 0;
+            SYS_LOG("RTOS: TLS init FAILED");
         }
     }
     else
     {
-        UartPuts("NET: no link, skipping DNS/TCP/TLS\r\n");
-        network_ready = 0;
+        tls_initialized = 0;
+        SYS_LOG("RTOS: DNS failed, TLS skipped");
     }
 
-    /*
-     * Na czas debugowania NIE odpalamy TCP ani TLS.
-     * Najpierw DNS musi działać stabilnie.
-     */
-    tls_initialized = 0;
+    SYS_LOG("RTOS: network services init OK");
 
-    if (network_ready)
-    {
-        UartPuts("RTOS: DNS OK, but TLS disabled for debug\r\n");
-    }
-    else
-    {
-        UartPuts("RTOS: DNS failed, TLS skipped\r\n");
-    }
-
-    UartPuts("RTOS: network services init OK\r\n");
     for (;;)
     {
         uint32_t now = HAL_GetTick();
@@ -976,45 +1064,60 @@ void StartDefaultTask(void *argument)
                      eth_last_dma_error,
                      eth_last_hal_error);
 
-            UartPuts(buf);
+            NET_LOG(buf);
         }
 
         if (!netif_is_link_up(&gnetif))
         {
-            UartPuts("NET: link DOWN, waiting again...\r\n");
+            NET_LOG("NET: link DOWN, waiting again...");
 
             if (Net_WaitForLink() == 0)
             {
                 Net_SetStaticIp();
                 osDelay(1000);
-                UartPuts("NET: ready for ping test after reconnect\r\n");
+                NET_LOG("NET: ready for ping test after reconnect");
             }
         }
-//        if (!tls_test_done &&
-//            network_ready &&
-//            tls_initialized &&
-//            netif_is_link_up(&gnetif) &&
-//            netif_is_up(&gnetif) &&
-//            netif_ip4_addr(&gnetif)->addr != 0)
-//        {
-//            tls_test_done = 1;
-//
-//            HAL_UART_Transmit(&huart3, (uint8_t *)"TLS TEST: start\r\n", 17, HAL_MAX_DELAY);
-//
-//            if (TlsClient_Connect() == 0)
-//            {
-//                HAL_UART_Transmit(&huart3, (uint8_t *)"TLS TEST: HANDSHAKE OK\r\n", 25, HAL_MAX_DELAY);
-//                TlsClient_Disconnect();
-//            }
-//            else
-//            {
-//                HAL_UART_Transmit(&huart3, (uint8_t *)"TLS TEST: HANDSHAKE FAIL\r\n", 27, HAL_MAX_DELAY);
-//            }
-//        }
+
+        if (!tls_test_done &&
+            network_ready &&
+            tls_initialized &&
+            netif_is_link_up(&gnetif) &&
+            netif_is_up(&gnetif) &&
+            netif_ip4_addr(&gnetif)->addr != 0)
+        {
+            tls_test_done = 1;
+
+            SYS_LOG("TLS TEST: start");
+
+            if (TlsClient_Connect() == 0)
+            {
+                SYS_LOG("TLS TEST: HANDSHAKE OK");
+
+                SYS_LOG("MQTT TEST: start");
+
+                if (TlsClient_MqttTest() == 0)
+                {
+                    SYS_LOG("MQTT TEST: OK");
+                }
+                else
+                {
+                    SYS_LOG("MQTT TEST: FAIL");
+                }
+
+                TlsClient_Disconnect();
+            }
+            else
+            {
+                SYS_LOG("TLS TEST: HANDSHAKE FAIL");
+            }
+        }
+
         osDelay(10);
     }
   /* USER CODE END 5 */
 }
+
 /**
   * @brief  This function is executed in case of error occurrence.
   * @retval None
@@ -1041,8 +1144,7 @@ void Error_Handler(void)
 void assert_failed(uint8_t *file, uint32_t line)
 {
   /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* User can add his own implementation to report the file name and line number. */
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
