@@ -143,6 +143,11 @@ int main(void)
 
   /* USER CODE BEGIN SysInit */
 
+  /* Ethernet DMA descriptors, RX pool and the LwIP heap live in D2 SRAM. */
+  __HAL_RCC_D2SRAM1_CLK_ENABLE();
+  __HAL_RCC_D2SRAM2_CLK_ENABLE();
+  __HAL_RCC_D2SRAM3_CLK_ENABLE();
+
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
@@ -966,6 +971,8 @@ void StartDefaultTask(void *argument)
 
     int network_ready = 0;
     int tls_initialized = 0;
+    int mqtt_ready = 0;
+    uint32_t mqtt_retry_after_ms = 0U;
 
     if (Net_WaitForLink() == 0)
     {
@@ -1041,7 +1048,7 @@ void StartDefaultTask(void *argument)
     {
         uint32_t now = HAL_GetTick();
 
-        if ((now - last_blink_ms) >= 500)
+        if (!mqtt_ready && ((now - last_blink_ms) >= 500U))
         {
             last_blink_ms = now;
             HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
@@ -1079,7 +1086,8 @@ void StartDefaultTask(void *argument)
             }
         }
 
-        if (!tls_test_done &&
+        if (!mqtt_ready &&
+            ((int32_t)(now - mqtt_retry_after_ms) >= 0) &&
             network_ready &&
             tls_initialized &&
             netif_is_link_up(&gnetif) &&
@@ -1087,6 +1095,7 @@ void StartDefaultTask(void *argument)
             netif_ip4_addr(&gnetif)->addr != 0)
         {
             tls_test_done = 1;
+            mqtt_retry_after_ms = now + 5000U;
 
             SYS_LOG("TLS TEST: start");
 
@@ -1099,17 +1108,30 @@ void StartDefaultTask(void *argument)
                 if (TlsClient_MqttTest() == 0)
                 {
                     SYS_LOG("MQTT TEST: OK");
+                    mqtt_ready = 1;
                 }
                 else
                 {
                     SYS_LOG("MQTT TEST: FAIL");
+                    TlsClient_Disconnect();
                 }
-
-                TlsClient_Disconnect();
             }
             else
             {
                 SYS_LOG("TLS TEST: HANDSHAKE FAIL");
+            }
+        }
+
+        if (mqtt_ready)
+        {
+            if (!netif_is_link_up(&gnetif) ||
+                !netif_is_up(&gnetif) ||
+                (TlsClient_MqttProcess() != 0))
+            {
+                SYS_LOG("MQTT: session lost, reconnect scheduled");
+                TlsClient_Disconnect();
+                mqtt_ready = 0;
+                mqtt_retry_after_ms = HAL_GetTick() + 5000U;
             }
         }
 

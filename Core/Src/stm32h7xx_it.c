@@ -54,6 +54,64 @@
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
+static void Fault_UartWriteChar(char value)
+{
+  uint32_t guard = 1000000U;
+
+  while ((USART3->ISR & USART_ISR_TXE_TXFNF) == 0U)
+  {
+    if (--guard == 0U)
+    {
+      return;
+    }
+  }
+
+  USART3->TDR = (uint8_t)value;
+}
+
+static void Fault_UartWrite(const char *text)
+{
+  while (*text != '\0')
+  {
+    Fault_UartWriteChar(*text++);
+  }
+}
+
+static void Fault_UartWriteHex(uint32_t value)
+{
+  static const char digits[] = "0123456789ABCDEF";
+  int32_t shift;
+
+  for (shift = 28; shift >= 0; shift -= 4)
+  {
+    Fault_UartWriteChar(digits[(value >> (uint32_t)shift) & 0x0FU]);
+  }
+}
+
+static void Fault_Report(const char *name)
+{
+  __disable_irq();
+
+  /* Bez HAL i bez RTOS: ten zapis dziala takze, gdy logger lub scheduler stoi. */
+  Fault_UartWrite("\r\n[FATAL] ");
+  Fault_UartWrite(name);
+  Fault_UartWrite(" CFSR=0x");
+  Fault_UartWriteHex(SCB->CFSR);
+  Fault_UartWrite(" HFSR=0x");
+  Fault_UartWriteHex(SCB->HFSR);
+  Fault_UartWrite(" ABFSR=0x");
+  Fault_UartWriteHex(SCB->ABFSR);
+  Fault_UartWrite(" MMFAR=0x");
+  Fault_UartWriteHex(SCB->MMFAR);
+  Fault_UartWrite(" BFAR=0x");
+  Fault_UartWriteHex(SCB->BFAR);
+  Fault_UartWrite("\r\n");
+
+  while (1)
+  {
+  }
+}
+
 /* USER CODE END 0 */
 
 /* External variables --------------------------------------------------------*/
@@ -87,7 +145,7 @@ void NMI_Handler(void)
 void HardFault_Handler(void)
 {
   /* USER CODE BEGIN HardFault_IRQn 0 */
-
+  Fault_Report("HardFault");
   /* USER CODE END HardFault_IRQn 0 */
   while (1)
   {
@@ -102,7 +160,7 @@ void HardFault_Handler(void)
 void MemManage_Handler(void)
 {
   /* USER CODE BEGIN MemoryManagement_IRQn 0 */
-
+  Fault_Report("MemManage");
   /* USER CODE END MemoryManagement_IRQn 0 */
   while (1)
   {
@@ -117,7 +175,7 @@ void MemManage_Handler(void)
 void BusFault_Handler(void)
 {
   /* USER CODE BEGIN BusFault_IRQn 0 */
-
+  Fault_Report("BusFault");
   /* USER CODE END BusFault_IRQn 0 */
   while (1)
   {
@@ -132,7 +190,7 @@ void BusFault_Handler(void)
 void UsageFault_Handler(void)
 {
   /* USER CODE BEGIN UsageFault_IRQn 0 */
-
+  Fault_Report("UsageFault");
   /* USER CODE END UsageFault_IRQn 0 */
   while (1)
   {

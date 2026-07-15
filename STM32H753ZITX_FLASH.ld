@@ -139,6 +139,29 @@ SECTIONS
     _edata = .;        /* define a global symbol at data end */
   } >RAM_D1 AT> FLASH
 
+  /* Ethernet DMA descriptors and RX buffers must be placed in D2 SRAM.
+     These fixed addresses match the layout expected by ethernetif.c. */
+  .RxDecripSection 0x30000000 (NOLOAD) :
+  {
+    . = ALIGN(32);
+    KEEP(*(.RxDecripSection))
+    . = ALIGN(32);
+  } >RAM_D2
+
+  .TxDecripSection 0x30000080 (NOLOAD) :
+  {
+    . = ALIGN(32);
+    KEEP(*(.TxDecripSection))
+    . = ALIGN(32);
+  } >RAM_D2
+
+  .Rx_PoolSection 0x30000100 (NOLOAD) :
+  {
+    . = ALIGN(32);
+    KEEP(*(.Rx_PoolSection))
+    . = ALIGN(32);
+  } >RAM_D2
+
   /* Uninitialized data section */
   . = ALIGN(4);
   .bss :
@@ -176,5 +199,4 @@ SECTIONS
 
   .ARM.attributes 0 : { *(.ARM.attributes) }
 }
-
 

@@ -47,6 +47,9 @@ volatile uint32_t eth_err_irq_count = 0;
 volatile uint32_t eth_input_pbuf_count = 0;
 volatile uint32_t eth_last_dma_error = 0;
 volatile uint32_t eth_last_hal_error = 0;
+volatile uint32_t eth_rx_alloc_count = 0;
+volatile uint32_t eth_rx_free_count = 0;
+volatile uint32_t eth_rx_alloc_fail_count = 0;
 /* USER CODE END 0 */
 
 /* Private define ------------------------------------------------------------*/
@@ -108,11 +111,11 @@ typedef struct
 } RxBuff_t;
 
 /* Memory Pool Declaration */
-#define ETH_RX_BUFFER_CNT             12U
+#define ETH_RX_BUFFER_CNT             32U
 LWIP_MEMPOOL_DECLARE(RX_POOL, ETH_RX_BUFFER_CNT, sizeof(RxBuff_t), "Zero-copy RX PBUF pool");
 
 /* Variable Definitions */
-static uint8_t RxAllocStatus;
+static volatile uint8_t RxAllocStatus;
 
 #if defined ( __ICCARM__ ) /*!< IAR Compiler */
 
@@ -429,7 +432,15 @@ static err_t low_level_output(struct netif *netif, struct pbuf *p)
     uint32_t aligned_addr = addr & ~0x1FU;
     uint32_t aligned_len = ((q->len + (addr - aligned_addr) + 31U) & ~31U);
 
-    SCB_CleanDCache_by_Addr((uint32_t *)aligned_addr, aligned_len);
+    /*
+     * CubeMX ma obecnie D-cache wylaczony. Wywolanie operacji maintenance
+     * na wylaczonym cache powodowalo na STM32H753 AXI SLVERR/HardFault.
+     * Warunek zachowuje poprawnosc takze po ewentualnym wlaczeniu D-cache.
+     */
+    if ((SCB->CCR & SCB_CCR_DC_Msk) != 0U)
+    {
+      SCB_CleanDCache_by_Addr((uint32_t *)aligned_addr, (int32_t)aligned_len);
+    }
 
     Txbuffer[i].buffer = q->payload;
     Txbuffer[i].len = q->len;
@@ -698,6 +709,7 @@ void pbuf_free_custom(struct pbuf *p)
 {
   struct pbuf_custom* custom_pbuf = (struct pbuf_custom*)p;
   LWIP_MEMPOOL_FREE(RX_POOL, custom_pbuf);
+  eth_rx_free_count++;
 
   /* If the Rx Buffer Pool was exhausted, signal the ethernetif_input task to
    * call HAL_ETH_GetRxDataBuffer to rebuild the Rx descriptors. */
@@ -986,6 +998,7 @@ void HAL_ETH_RxAllocateCallback(uint8_t **buff)
   if (p)
   {
     RxAllocStatus = RX_ALLOC_OK;
+    eth_rx_alloc_count++;
 
     *buff = (uint8_t *)p + offsetof(RxBuff_t, buff);
     p->custom_free_function = pbuf_free_custom;
@@ -995,6 +1008,7 @@ void HAL_ETH_RxAllocateCallback(uint8_t **buff)
   else
   {
     RxAllocStatus = RX_ALLOC_ERROR;
+    eth_rx_alloc_fail_count++;
     *buff = NULL;
   }
 
@@ -1016,8 +1030,12 @@ void HAL_ETH_RxLinkCallback(void **pStart, void **pEnd, uint8_t *buff, uint16_t 
   uint32_t aligned_addr = addr & ~0x1FU;
   uint32_t aligned_len = ((Length + (addr - aligned_addr) + 31U) & ~31U);
 
-  SCB_InvalidateDCache_by_Addr((uint32_t *)aligned_addr, aligned_len);
-  __DSB();
+  /* Nie dotykaj rejestrow maintenance, gdy D-cache jest wylaczony. */
+  if ((SCB->CCR & SCB_CCR_DC_Msk) != 0U)
+  {
+    SCB_InvalidateDCache_by_Addr((uint32_t *)aligned_addr, (int32_t)aligned_len);
+    __DSB();
+  }
 
   /* Get the struct pbuf from the buff address. */
   p = (struct pbuf *)(buff - offsetof(RxBuff_t, buff));

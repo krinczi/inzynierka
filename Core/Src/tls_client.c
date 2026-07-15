@@ -1,5 +1,6 @@
 #include "tls_client.h"
 #include "aws_iot_config.h"
+#include "mqtt_topics.h"
 #include "aws_certs.h"
 #include "debug_logger.h"
 #include "main.h"
@@ -56,11 +57,23 @@
 #define TLS_SOCKET_IO_TIMEOUT_US       10000L
 #define TLS_SOCKET_IO_MAX_CHUNK        1024U
 
+#define MQTT_TELEMETRY_INTERVAL_MS     30000U
+#define MQTT_PING_INTERVAL_MS          30000U
+#define MQTT_RX_BUFFER_SIZE            768U
+#define MQTT_JSON_BUFFER_SIZE          384U
+
+#ifndef STM32_APP_FIRMWARE_VERSION
+#define STM32_APP_FIRMWARE_VERSION     "0.1.0"
+#endif
+
 extern volatile uint32_t eth_rx_irq_count;
 extern volatile uint32_t eth_input_pbuf_count;
 extern volatile uint32_t eth_err_irq_count;
 extern volatile uint32_t eth_last_dma_error;
 extern volatile uint32_t eth_last_hal_error;
+extern volatile uint32_t eth_rx_alloc_count;
+extern volatile uint32_t eth_rx_free_count;
+extern volatile uint32_t eth_rx_alloc_fail_count;
 
 static mbedtls_net_context tls_net;
 static mbedtls_ssl_context tls_ssl;
@@ -79,13 +92,17 @@ static volatile int tls_last_send_ret = 0;
 static volatile int tls_last_send_errno = 0;
 static volatile int tls_last_recv_ret = 0;
 static volatile int tls_last_recv_errno = 0;
-static volatile int tls_last_socket_error = 0;
 static volatile int tls_dns_done = 0;
 static volatile err_t tls_dns_err = ERR_INPROGRESS;
 static volatile int tls_dns_start_done = 0;
 static volatile err_t tls_dns_start_err = ERR_INPROGRESS;
 static ip_addr_t tls_dns_addr;
 static char tls_dns_hostname[256];
+static int mqtt_ready = 0;
+static uint32_t mqtt_last_telemetry_ms = 0U;
+static uint32_t mqtt_last_ping_ms = 0U;
+static uint8_t mqtt_rx_buffer[MQTT_RX_BUFFER_SIZE];
+static size_t mqtt_rx_length = 0U;
 
 static void Tls_DnsFound(const char *name, const ip_addr_t *ipaddr, void *arg)
 {
@@ -312,7 +329,7 @@ static void tls_ctx_free_all(void)
 int TlsClient_Init(void)
 {
     tls_log("TLS: init");
-    tls_log("TLS BUILD: pkcheck recv_select short_io_timeout no_sig_hash");
+    tls_log("TLS BUILD: recv_dontwait_v3 dcache_guard fault_uart");
     tls_connected = 0;
     tls_ctx_ready = 0;
     return 0;
@@ -582,46 +599,15 @@ static int Tls_LwipRecv(void *ctx, unsigned char *buf, size_t len)
     int fd = ((mbedtls_net_context *)ctx)->fd;
     int ret;
     size_t to_recv = len;
-    fd_set read_fds;
-    struct timeval tv;
-    int sel_ret;
 
     tls_recv_calls++;
 
     /*
-     * Najpierw sprawdzamy gotowosc socketu. To chroni handshake przed
-     * ukrytym blokowaniem w lwip_recv(), gdy czekamy na kolejny rekord TLS.
+     * MSG_DONTWAIT jest obslugiwane bezposrednio przez lwIP jako
+     * NETCONN_DONTBLOCK (sys_arch_mbox_tryfetch). Nie uzywamy tu select(),
+     * poniewaz jego obsluga deskryptorow potrafila zatrzymac kolejne kroki
+     * handshake po pierwszym MBEDTLS_ERR_SSL_WANT_READ.
      */
-    FD_ZERO(&read_fds);
-    FD_SET(fd, &read_fds);
-    tv.tv_sec = 0;
-    tv.tv_usec = 0;
-
-    errno = 0;
-    sel_ret = lwip_select(fd + 1, &read_fds, NULL, NULL, &tv);
-
-    if (sel_ret == 0)
-    {
-        tls_last_recv_ret = -1;
-        tls_last_recv_errno = EWOULDBLOCK;
-        return MBEDTLS_ERR_SSL_WANT_READ;
-    }
-
-    if (sel_ret < 0)
-    {
-        tls_last_recv_ret = sel_ret;
-        tls_last_recv_errno = errno;
-        tls_logf("TLS RECV: select failed ret=%d errno=%d", sel_ret, errno);
-        return MBEDTLS_ERR_NET_RECV_FAILED;
-    }
-
-    if (!FD_ISSET(fd, &read_fds))
-    {
-        tls_last_recv_ret = -1;
-        tls_last_recv_errno = EWOULDBLOCK;
-        return MBEDTLS_ERR_SSL_WANT_READ;
-    }
-
     if (to_recv > TLS_SOCKET_IO_MAX_CHUNK)
     {
         to_recv = TLS_SOCKET_IO_MAX_CHUNK;
@@ -674,7 +660,6 @@ int TlsClient_Connect(void)
     tls_last_send_errno = 0;
     tls_last_recv_ret = 0;
     tls_last_recv_errno = 0;
-    tls_last_socket_error = 0;
 
     tls_log_diag("TLS: free ctx...");
     tls_ctx_free_all();
@@ -830,7 +815,7 @@ int TlsClient_Connect(void)
      */
     mbedtls_ssl_conf_ciphersuites(&tls_conf, aws_ciphersuites);
 
-    mbedtls_ssl_conf_authmode(&tls_conf, MBEDTLS_SSL_VERIFY_OPTIONAL);
+    mbedtls_ssl_conf_authmode(&tls_conf, MBEDTLS_SSL_VERIFY_REQUIRED);
     mbedtls_ssl_conf_ca_chain(&tls_conf, &tls_ca_cert, NULL);
     mbedtls_ssl_conf_rng(&tls_conf, mbedtls_ctr_drbg_random, &tls_ctr_drbg);
 
@@ -888,13 +873,16 @@ int TlsClient_Connect(void)
             (hs_server_hello_before_logged == 0))
         {
             hs_server_hello_before_logged = 1;
-            tls_logf("TLS: before SERVER_HELLO step tr=%d rc=%lu rr=%d re=%d rx=%lu pb=%lu",
+            tls_logf("TLS: before SERVER_HELLO tr=%d rc=%lu rr=%d re=%d rx=%lu pb=%lu al=%lu fr=%lu af=%lu",
                      hs_try,
                      (unsigned long)tls_recv_calls,
                      tls_last_recv_ret,
                      tls_last_recv_errno,
                      (unsigned long)eth_rx_irq_count,
-                     (unsigned long)eth_input_pbuf_count);
+                     (unsigned long)eth_input_pbuf_count,
+                     (unsigned long)eth_rx_alloc_count,
+                     (unsigned long)eth_rx_free_count,
+                     (unsigned long)eth_rx_alloc_fail_count);
         }
 
         if ((hs_try <= 20) || (state_before != hs_last_state))
@@ -913,7 +901,7 @@ int TlsClient_Connect(void)
             (hs_server_hello_after_logged == 0))
         {
             hs_server_hello_after_logged = 1;
-            tls_logf("TLS: after SERVER_HELLO step ret=%d state=%s(%d) dt=%lu rr=%d re=%d rx=%lu pb=%lu",
+            tls_logf("TLS: after SERVER_HELLO ret=%d state=%s(%d) dt=%lu rr=%d re=%d rx=%lu pb=%lu al=%lu fr=%lu af=%lu",
                      ret,
                      tls_state_name(tls_ssl.state),
                      tls_ssl.state,
@@ -921,7 +909,10 @@ int TlsClient_Connect(void)
                      tls_last_recv_ret,
                      tls_last_recv_errno,
                      (unsigned long)eth_rx_irq_count,
-                     (unsigned long)eth_input_pbuf_count);
+                     (unsigned long)eth_input_pbuf_count,
+                     (unsigned long)eth_rx_alloc_count,
+                     (unsigned long)eth_rx_free_count,
+                     (unsigned long)eth_rx_alloc_fail_count);
         }
 #if !TLS_VERBOSE_DIAG_LOGS
         (void)step_start;
@@ -952,30 +943,12 @@ int TlsClient_Connect(void)
         {
             if ((now - hs_last_log) >= TLS_WAIT_LOG_INTERVAL_MS)
             {
-                int so_err = -1;
-                int so_ret;
-                int so_errno;
-                socklen_t so_len = sizeof(so_err);
-
                 hs_last_log = now;
-                errno = 0;
-                so_ret = lwip_getsockopt(tls_net.fd,
-                                         SOL_SOCKET,
-                                         SO_ERROR,
-                                         &so_err,
-                                         &so_len);
-                so_errno = errno;
 
-                if (so_ret == 0)
-                {
-                    tls_last_socket_error = so_err;
-                }
-                else
-                {
-                    tls_last_socket_error = -so_errno;
-                }
-
-                tls_logf("TLS WAIT: t=%lu tr=%d sc=%lu rc=%lu sr=%d se=%d rr=%d re=%d so=%d rx=%lu pb=%lu er=%lu",
+                /* Do not call synchronous getsockopt() here. If the tcpip
+                 * mailbox is busy, it can block this diagnostic path and
+                 * prevent the handshake timeout from being evaluated. */
+                tls_logf("TLS WAIT: t=%lu tr=%d sc=%lu rc=%lu sr=%d se=%d rr=%d re=%d rx=%lu pb=%lu er=%lu al=%lu fr=%lu af=%lu",
                          (unsigned long)(now - hs_start),
                          hs_try,
                          (unsigned long)tls_send_calls,
@@ -984,10 +957,12 @@ int TlsClient_Connect(void)
                          tls_last_send_errno,
                          tls_last_recv_ret,
                          tls_last_recv_errno,
-                         tls_last_socket_error,
                          eth_rx_irq_count,
                          eth_input_pbuf_count,
-                         eth_err_irq_count);
+                         eth_err_irq_count,
+                         eth_rx_alloc_count,
+                         eth_rx_free_count,
+                         eth_rx_alloc_fail_count);
             }
 
             if ((now - hs_last_mem_log) >= 10000U)
@@ -1044,11 +1019,7 @@ int TlsClient_Connect(void)
         tls_log("TLS: verify info:");
         tls_log(vrfy_buf);
 
-        /*
-         * Na czas diagnostyki nie robimy goto fail,
-         * zeby sprawdzic, czy handshake technicznie przeszedl.
-         * Potem mozna wrocic do twardej weryfikacji.
-         */
+        goto fail;
     }
     else
     {
@@ -1290,7 +1261,7 @@ static int mqtt_subscribe_cmd(void)
 {
     uint8_t pkt[256];
     uint8_t suback[5];
-    size_t topic_len = strlen(AWS_TOPIC_CMD);
+    size_t topic_len = strlen(MQTT_TOPIC_CMD);
     size_t remaining = 2U + 2U + topic_len + 1U;
     size_t rem_len;
     size_t pos;
@@ -1307,14 +1278,14 @@ static int mqtt_subscribe_cmd(void)
     pkt[pos++] = 0U;
     pkt[pos++] = 1U;
 
-    if (mqtt_put_string(pkt, sizeof(pkt), &pos, AWS_TOPIC_CMD) != 0)
+    if (mqtt_put_string(pkt, sizeof(pkt), &pos, MQTT_TOPIC_CMD) != 0)
     {
         return -1;
     }
 
-    pkt[pos++] = 0U; /* QoS 0 */
+    pkt[pos++] = 1U; /* QoS 1 */
 
-    tls_logf("MQTT: SUBSCRIBE %s", AWS_TOPIC_CMD);
+    tls_logf("MQTT: SUBSCRIBE %s", MQTT_TOPIC_CMD);
 
     if (tls_write_all(pkt, pos, 5000U) != 0)
     {
@@ -1344,24 +1315,15 @@ static int mqtt_subscribe_cmd(void)
     return 0;
 }
 
-static int mqtt_publish_status(void)
+static int mqtt_publish_json(const char *topic, const char *payload)
 {
-    uint8_t pkt[384];
-    char payload[160];
-    size_t topic_len = strlen(AWS_TOPIC_STATUS);
-    size_t payload_len;
+    uint8_t pkt[640];
+    size_t topic_len = strlen(topic);
+    size_t payload_len = strlen(payload);
     size_t remaining;
     size_t rem_len;
     size_t pos;
 
-    snprintf(payload,
-             sizeof(payload),
-             "{\"thing\":\"%s\",\"event\":\"mqtt_test\",\"tick\":%lu}",
-             AWS_THING_NAME,
-             (unsigned long)HAL_GetTick());
-
-    payload[sizeof(payload) - 1U] = '\0';
-    payload_len = strlen(payload);
     remaining = 2U + topic_len + payload_len;
 
     if (remaining > 268435455U)
@@ -1374,7 +1336,7 @@ static int mqtt_publish_status(void)
     rem_len = mqtt_encode_remaining_length(&pkt[1], remaining);
     pos = 1U + rem_len;
 
-    if (mqtt_put_string(pkt, sizeof(pkt), &pos, AWS_TOPIC_STATUS) != 0)
+    if (mqtt_put_string(pkt, sizeof(pkt), &pos, topic) != 0)
     {
         return -1;
     }
@@ -1388,7 +1350,7 @@ static int mqtt_publish_status(void)
     memcpy(&pkt[pos], payload, payload_len);
     pos += payload_len;
 
-    tls_logf("MQTT: PUBLISH %s", AWS_TOPIC_STATUS);
+    tls_logf("MQTT: PUBLISH %s", topic);
 
     if (tls_write_all(pkt, pos, 5000U) != 0)
     {
@@ -1397,6 +1359,422 @@ static int mqtt_publish_status(void)
 
     tls_log("MQTT: PUBLISH OK");
     return 0;
+}
+
+static int mqtt_publish_status(void)
+{
+    char payload[256];
+    int written;
+
+    written = snprintf(payload,
+                       sizeof(payload),
+                       "{\"deviceId\":\"%s\",\"schemaVersion\":1,"
+                       "\"state\":\"online\",\"uptimeMs\":%lu,"
+                       "\"firmwareVersion\":\"%s\"}",
+                       MQTT_DEVICE_ID,
+                       (unsigned long)HAL_GetTick(),
+                       STM32_APP_FIRMWARE_VERSION);
+
+    if ((written < 0) || ((size_t)written >= sizeof(payload)))
+    {
+        tls_log("MQTT: status JSON too large");
+        return -1;
+    }
+
+    return mqtt_publish_json(MQTT_TOPIC_STATUS, payload);
+}
+
+static int mqtt_publish_telemetry(void)
+{
+    char payload[256];
+    uint32_t uptime_ms = HAL_GetTick();
+    unsigned long simulated_temperature = 25UL + ((uptime_ms / 30000U) % 5U);
+    int written;
+
+    /*
+     * MVP: wartosci sa diagnostyczne/symulowane. Pozniej temperature i
+     * napiecie nalezy podmienic na odczyty z rzeczywistych peryferiow.
+     */
+    written = snprintf(payload,
+                       sizeof(payload),
+                       "{\"deviceId\":\"%s\",\"schemaVersion\":1,"
+                       "\"uptimeMs\":%lu,\"temperature\":%lu,"
+                       "\"voltage\":3.30,\"signal\":100}",
+                       MQTT_DEVICE_ID,
+                       (unsigned long)uptime_ms,
+                       simulated_temperature);
+
+    if ((written < 0) || ((size_t)written >= sizeof(payload)))
+    {
+        tls_log("MQTT: telemetry JSON too large");
+        return -1;
+    }
+
+    return mqtt_publish_json(MQTT_TOPIC_TELEMETRY, payload);
+}
+
+static const char *json_value_start(const char *json, const char *key)
+{
+    char pattern[48];
+    const char *value;
+    int written = snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+
+    if ((written < 0) || ((size_t)written >= sizeof(pattern)))
+    {
+        return NULL;
+    }
+
+    value = strstr(json, pattern);
+    if (value == NULL)
+    {
+        return NULL;
+    }
+
+    value += strlen(pattern);
+    while ((*value == ' ') || (*value == '\t') || (*value == '\r') || (*value == '\n'))
+    {
+        value++;
+    }
+
+    if (*value != ':')
+    {
+        return NULL;
+    }
+
+    value++;
+    while ((*value == ' ') || (*value == '\t') || (*value == '\r') || (*value == '\n'))
+    {
+        value++;
+    }
+
+    return value;
+}
+
+static int json_get_string(const char *json, const char *key, char *out, size_t out_len)
+{
+    const char *value = json_value_start(json, key);
+    size_t length = 0U;
+
+    if ((value == NULL) || (*value != '\"') || (out_len == 0U))
+    {
+        return -1;
+    }
+
+    value++;
+    while ((value[length] != '\0') && (value[length] != '\"'))
+    {
+        if ((value[length] == '\\') || ((length + 1U) >= out_len))
+        {
+            return -1;
+        }
+        length++;
+    }
+
+    if (value[length] != '\"')
+    {
+        return -1;
+    }
+
+    memcpy(out, value, length);
+    out[length] = '\0';
+    return 0;
+}
+
+static int json_get_bool(const char *json, const char *key, int *out)
+{
+    const char *value = json_value_start(json, key);
+
+    if ((value != NULL) && (strncmp(value, "true", 4U) == 0))
+    {
+        *out = 1;
+        return 0;
+    }
+
+    if ((value != NULL) && (strncmp(value, "false", 5U) == 0))
+    {
+        *out = 0;
+        return 0;
+    }
+
+    return -1;
+}
+
+static int mqtt_publish_command_result(const char *command_id,
+                                       const char *status,
+                                       const char *message)
+{
+    char payload[MQTT_JSON_BUFFER_SIZE];
+    int written = snprintf(payload,
+                           sizeof(payload),
+                           "{\"deviceId\":\"%s\",\"schemaVersion\":1,"
+                           "\"commandId\":\"%s\",\"status\":\"%s\","
+                           "\"message\":\"%s\",\"uptimeMs\":%lu}",
+                           MQTT_DEVICE_ID,
+                           command_id,
+                           status,
+                           message,
+                           (unsigned long)HAL_GetTick());
+
+    if ((written < 0) || ((size_t)written >= sizeof(payload)))
+    {
+        tls_log("MQTT: command result JSON too large");
+        return -1;
+    }
+
+    return mqtt_publish_json(MQTT_TOPIC_CMD_RESULT, payload);
+}
+
+static int mqtt_handle_command(const char *payload)
+{
+    char command_id[96];
+    char command_type[48];
+    int led_on;
+
+    if (json_get_string(payload, "commandId", command_id, sizeof(command_id)) != 0)
+    {
+        tls_log("MQTT CMD: missing/invalid commandId");
+        return mqtt_publish_command_result("unknown", "FAILED", "Invalid commandId");
+    }
+
+    if (json_get_string(payload, "type", command_type, sizeof(command_type)) != 0)
+    {
+        tls_log("MQTT CMD: missing/invalid type");
+        return mqtt_publish_command_result(command_id, "FAILED", "Invalid command type");
+    }
+
+    if (strcmp(command_type, "set_led") != 0)
+    {
+        tls_logf("MQTT CMD: unsupported type=%s", command_type);
+        return mqtt_publish_command_result(command_id, "FAILED", "Unsupported command");
+    }
+
+    if (json_get_bool(payload, "value", &led_on) != 0)
+    {
+        tls_log("MQTT CMD: set_led requires boolean value");
+        return mqtt_publish_command_result(command_id, "FAILED", "Value must be boolean");
+    }
+
+    HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, led_on ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    tls_logf("MQTT CMD: set_led=%d commandId=%s", led_on, command_id);
+
+    return mqtt_publish_command_result(command_id,
+                                       "ACKED",
+                                       led_on ? "LED switched on" : "LED switched off");
+}
+
+static int mqtt_decode_remaining_length(const uint8_t *packet,
+                                        size_t available,
+                                        size_t *remaining,
+                                        size_t *header_length)
+{
+    size_t value = 0U;
+    size_t multiplier = 1U;
+    size_t index;
+
+    for (index = 1U; (index < available) && (index <= 4U); index++)
+    {
+        uint8_t encoded = packet[index];
+        value += (size_t)(encoded & 0x7FU) * multiplier;
+
+        if ((encoded & 0x80U) == 0U)
+        {
+            *remaining = value;
+            *header_length = index + 1U;
+            return 1;
+        }
+
+        multiplier *= 128U;
+    }
+
+    return (index > 4U) ? -1 : 0;
+}
+
+static int mqtt_handle_publish_packet(const uint8_t *packet,
+                                      size_t packet_length,
+                                      size_t header_length)
+{
+    size_t pos = header_length;
+    size_t topic_length;
+    size_t payload_length;
+    uint8_t qos = (uint8_t)((packet[0] >> 1U) & 0x03U);
+    uint16_t packet_id = 0U;
+    char topic[160];
+    char payload[MQTT_JSON_BUFFER_SIZE];
+
+    if ((pos + 2U) > packet_length)
+    {
+        return -1;
+    }
+
+    topic_length = ((size_t)packet[pos] << 8U) | packet[pos + 1U];
+    pos += 2U;
+
+    if ((topic_length == 0U) || (topic_length >= sizeof(topic)) ||
+        ((pos + topic_length) > packet_length))
+    {
+        return -1;
+    }
+
+    memcpy(topic, &packet[pos], topic_length);
+    topic[topic_length] = '\0';
+    pos += topic_length;
+
+    if (qos > 1U)
+    {
+        return -1;
+    }
+
+    if (qos > 0U)
+    {
+        if ((pos + 2U) > packet_length)
+        {
+            return -1;
+        }
+        packet_id = ((uint16_t)packet[pos] << 8U) | packet[pos + 1U];
+        pos += 2U;
+    }
+
+    payload_length = packet_length - pos;
+    if (payload_length >= sizeof(payload))
+    {
+        tls_log("MQTT: incoming payload too large");
+        return -1;
+    }
+
+    memcpy(payload, &packet[pos], payload_length);
+    payload[payload_length] = '\0';
+    tls_logf("MQTT: received PUBLISH %s", topic);
+
+    if (strcmp(topic, MQTT_TOPIC_CMD) == 0)
+    {
+        if (mqtt_handle_command(payload) != 0)
+        {
+            return -1;
+        }
+    }
+
+    if (qos == 1U)
+    {
+        uint8_t puback[4] = {
+            0x40U,
+            0x02U,
+            (uint8_t)((packet_id >> 8U) & 0xFFU),
+            (uint8_t)(packet_id & 0xFFU)
+        };
+
+        if (tls_write_all(puback, sizeof(puback), 5000U) != 0)
+        {
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+static int mqtt_process_rx_buffer(void)
+{
+    while (mqtt_rx_length > 0U)
+    {
+        size_t remaining = 0U;
+        size_t header_length = 0U;
+        size_t packet_length;
+        int decoded = mqtt_decode_remaining_length(mqtt_rx_buffer,
+                                                   mqtt_rx_length,
+                                                   &remaining,
+                                                   &header_length);
+
+        if (decoded == 0)
+        {
+            return 0;
+        }
+
+        if (decoded < 0)
+        {
+            tls_log("MQTT: invalid remaining length");
+            return -1;
+        }
+
+        packet_length = header_length + remaining;
+        if (packet_length > sizeof(mqtt_rx_buffer))
+        {
+            tls_log("MQTT: packet exceeds RX buffer");
+            return -1;
+        }
+
+        if (mqtt_rx_length < packet_length)
+        {
+            return 0;
+        }
+
+        if ((mqtt_rx_buffer[0] & 0xF0U) == 0x30U)
+        {
+            if (mqtt_handle_publish_packet(mqtt_rx_buffer,
+                                           packet_length,
+                                           header_length) != 0)
+            {
+                return -1;
+            }
+        }
+
+        mqtt_rx_length -= packet_length;
+        if (mqtt_rx_length > 0U)
+        {
+            memmove(mqtt_rx_buffer,
+                    &mqtt_rx_buffer[packet_length],
+                    mqtt_rx_length);
+        }
+    }
+
+    return 0;
+}
+
+static int mqtt_read_available(void)
+{
+    for (;;)
+    {
+        int ret;
+
+        if (mqtt_rx_length == sizeof(mqtt_rx_buffer))
+        {
+            tls_log("MQTT: RX buffer full");
+            return -1;
+        }
+
+        ret = mbedtls_ssl_read(&tls_ssl,
+                               &mqtt_rx_buffer[mqtt_rx_length],
+                               sizeof(mqtt_rx_buffer) - mqtt_rx_length);
+
+        if (ret > 0)
+        {
+            mqtt_rx_length += (size_t)ret;
+            if (mqtt_process_rx_buffer() != 0)
+            {
+                return -1;
+            }
+            continue;
+        }
+
+        if ((ret == MBEDTLS_ERR_SSL_WANT_READ) ||
+            (ret == MBEDTLS_ERR_SSL_WANT_WRITE))
+        {
+            return 0;
+        }
+
+        if (ret == 0)
+        {
+            tls_log("MQTT: broker closed connection");
+            return -1;
+        }
+
+        tls_log_mbedtls_error("MQTT read", ret);
+        return -1;
+    }
+}
+
+static int mqtt_send_ping(void)
+{
+    static const uint8_t pingreq[2] = { 0xC0U, 0x00U };
+    return tls_write_all(pingreq, sizeof(pingreq), 5000U);
 }
 
 int TlsClient_MqttTest(void)
@@ -1427,12 +1805,70 @@ int TlsClient_MqttTest(void)
         return -1;
     }
 
+    if (mqtt_publish_telemetry() != 0)
+    {
+        tls_log("MQTT: initial telemetry failed");
+        return -1;
+    }
+
+    mqtt_ready = 1;
+    mqtt_rx_length = 0U;
+    mqtt_last_telemetry_ms = HAL_GetTick();
+    mqtt_last_ping_ms = HAL_GetTick();
+    HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
+
     tls_log("MQTT: test OK");
     return 0;
+}
+
+int TlsClient_MqttProcess(void)
+{
+    uint32_t now;
+
+    if (!tls_connected || !mqtt_ready)
+    {
+        return -1;
+    }
+
+    if (mqtt_read_available() != 0)
+    {
+        mqtt_ready = 0;
+        return -1;
+    }
+
+    now = HAL_GetTick();
+    if ((now - mqtt_last_telemetry_ms) >= MQTT_TELEMETRY_INTERVAL_MS)
+    {
+        mqtt_last_telemetry_ms = now;
+        if (mqtt_publish_telemetry() != 0)
+        {
+            mqtt_ready = 0;
+            return -1;
+        }
+    }
+
+    if ((now - mqtt_last_ping_ms) >= MQTT_PING_INTERVAL_MS)
+    {
+        mqtt_last_ping_ms = now;
+        if (mqtt_send_ping() != 0)
+        {
+            mqtt_ready = 0;
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+int TlsClient_MqttIsReady(void)
+{
+    return mqtt_ready;
 }
 
 void TlsClient_Disconnect(void)
 {
     tls_log("TLS: disconnect");
+    mqtt_ready = 0;
+    mqtt_rx_length = 0U;
     tls_ctx_free_all();
 }
