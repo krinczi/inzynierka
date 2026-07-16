@@ -3,11 +3,13 @@
 #include "mqtt_topics.h"
 #include "aws_certs.h"
 #include "debug_logger.h"
+#include "device_config.h"
 #include "main.h"
 
 #include <string.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <stdlib.h>
 #include <errno.h>
 
 #include "mbedtls/net_sockets.h"
@@ -57,10 +59,8 @@
 #define TLS_SOCKET_IO_TIMEOUT_US       10000L
 #define TLS_SOCKET_IO_MAX_CHUNK        1024U
 
-#define MQTT_TELEMETRY_INTERVAL_MS     30000U
-#define MQTT_PING_INTERVAL_MS          30000U
-#define MQTT_RX_BUFFER_SIZE            768U
-#define MQTT_JSON_BUFFER_SIZE          384U
+#define MQTT_RX_BUFFER_SIZE            1024U
+#define MQTT_JSON_BUFFER_SIZE          768U
 
 #ifndef STM32_APP_FIRMWARE_VERSION
 #define STM32_APP_FIRMWARE_VERSION     "0.1.0"
@@ -101,8 +101,23 @@ static char tls_dns_hostname[256];
 static int mqtt_ready = 0;
 static uint32_t mqtt_last_telemetry_ms = 0U;
 static uint32_t mqtt_last_ping_ms = 0U;
+static uint16_t mqtt_negotiated_keep_alive_seconds = 60U;
 static uint8_t mqtt_rx_buffer[MQTT_RX_BUFFER_SIZE];
 static size_t mqtt_rx_length = 0U;
+
+typedef struct
+{
+    const char *name;
+    uint8_t mask;
+} MqttMetricDefinition;
+
+static const MqttMetricDefinition mqtt_metric_definitions[] = {
+    { "temperature", DEVICE_METRIC_TEMPERATURE },
+    { "voltage", DEVICE_METRIC_VOLTAGE },
+    { "current", DEVICE_METRIC_CURRENT },
+    { "signal", DEVICE_METRIC_SIGNAL },
+    { "humidity", DEVICE_METRIC_HUMIDITY }
+};
 
 static void Tls_DnsFound(const char *name, const ip_addr_t *ipaddr, void *arg)
 {
@@ -328,10 +343,18 @@ static void tls_ctx_free_all(void)
 
 int TlsClient_Init(void)
 {
+    const DeviceConfig *config;
+
     tls_log("TLS: init");
-    tls_log("TLS BUILD: recv_dontwait_v3 dcache_guard fault_uart");
+    tls_log("TLS BUILD: mqtt_config_v1 dual_slot_flash");
     tls_connected = 0;
     tls_ctx_ready = 0;
+    DeviceConfig_Init();
+    config = DeviceConfig_Get();
+    tls_logf("CONFIG: loaded version=%lu telemetry=%lus keepalive=%lus",
+             (unsigned long)config->config_version,
+             (unsigned long)config->telemetry_frequency_seconds,
+             (unsigned long)config->mqtt_keep_alive_seconds);
     return 0;
 }
 
@@ -1198,6 +1221,7 @@ static int mqtt_send_connect(void)
 {
     uint8_t pkt[256];
     uint8_t connack[4];
+    const DeviceConfig *config = DeviceConfig_Get();
     size_t client_id_len = strlen(AWS_CLIENT_ID);
     size_t remaining = 10U + 2U + client_id_len;
     size_t rem_len;
@@ -1220,8 +1244,8 @@ static int mqtt_send_connect(void)
 
     pkt[pos++] = 4U;      /* MQTT 3.1.1 */
     pkt[pos++] = 0x02U;   /* clean session */
-    pkt[pos++] = 0U;
-    pkt[pos++] = 60U;     /* keep alive seconds */
+    pkt[pos++] = (uint8_t)((config->mqtt_keep_alive_seconds >> 8U) & 0xFFU);
+    pkt[pos++] = (uint8_t)(config->mqtt_keep_alive_seconds & 0xFFU);
 
     if (mqtt_put_string(pkt, sizeof(pkt), &pos, AWS_CLIENT_ID) != 0)
     {
@@ -1254,14 +1278,15 @@ static int mqtt_send_connect(void)
     }
 
     tls_log("MQTT: CONNECT OK");
+    mqtt_negotiated_keep_alive_seconds = config->mqtt_keep_alive_seconds;
     return 0;
 }
 
-static int mqtt_subscribe_cmd(void)
+static int mqtt_subscribe_topic(const char *topic, uint16_t packet_id)
 {
     uint8_t pkt[256];
     uint8_t suback[5];
-    size_t topic_len = strlen(MQTT_TOPIC_CMD);
+    size_t topic_len = strlen(topic);
     size_t remaining = 2U + 2U + topic_len + 1U;
     size_t rem_len;
     size_t pos;
@@ -1275,17 +1300,17 @@ static int mqtt_subscribe_cmd(void)
     pkt[0] = 0x82U;
     rem_len = mqtt_encode_remaining_length(&pkt[1], remaining);
     pos = 1U + rem_len;
-    pkt[pos++] = 0U;
-    pkt[pos++] = 1U;
+    pkt[pos++] = (uint8_t)((packet_id >> 8U) & 0xFFU);
+    pkt[pos++] = (uint8_t)(packet_id & 0xFFU);
 
-    if (mqtt_put_string(pkt, sizeof(pkt), &pos, MQTT_TOPIC_CMD) != 0)
+    if (mqtt_put_string(pkt, sizeof(pkt), &pos, topic) != 0)
     {
         return -1;
     }
 
     pkt[pos++] = 1U; /* QoS 1 */
 
-    tls_logf("MQTT: SUBSCRIBE %s", MQTT_TOPIC_CMD);
+    tls_logf("MQTT: SUBSCRIBE %s", topic);
 
     if (tls_write_all(pkt, pos, 5000U) != 0)
     {
@@ -1305,7 +1330,11 @@ static int mqtt_subscribe_cmd(void)
              suback[3],
              suback[4]);
 
-    if ((suback[0] != 0x90U) || (suback[1] != 0x03U) || (suback[4] == 0x80U))
+    if ((suback[0] != 0x90U) ||
+        (suback[1] != 0x03U) ||
+        (suback[2] != (uint8_t)((packet_id >> 8U) & 0xFFU)) ||
+        (suback[3] != (uint8_t)(packet_id & 0xFFU)) ||
+        (suback[4] == 0x80U))
     {
         tls_log("MQTT: SUBSCRIBE refused");
         return -1;
@@ -1317,7 +1346,7 @@ static int mqtt_subscribe_cmd(void)
 
 static int mqtt_publish_json(const char *topic, const char *payload)
 {
-    uint8_t pkt[640];
+    uint8_t pkt[1024];
     size_t topic_len = strlen(topic);
     size_t payload_len = strlen(payload);
     size_t remaining;
@@ -1384,29 +1413,125 @@ static int mqtt_publish_status(void)
     return mqtt_publish_json(MQTT_TOPIC_STATUS, payload);
 }
 
+static int mqtt_json_append(char *buffer, size_t buffer_size, size_t *length,
+                            const char *format, ...)
+{
+    va_list args;
+    int written;
+
+    if (*length >= buffer_size)
+    {
+        return -1;
+    }
+
+    va_start(args, format);
+    written = vsnprintf(&buffer[*length], buffer_size - *length, format, args);
+    va_end(args);
+
+    if ((written < 0) || ((size_t)written >= (buffer_size - *length)))
+    {
+        return -1;
+    }
+
+    *length += (size_t)written;
+    return 0;
+}
+
+static int mqtt_metrics_json(uint8_t enabled_metrics, char *output, size_t output_size)
+{
+    size_t length = 0U;
+    size_t index;
+    int first = 1;
+
+    if (mqtt_json_append(output, output_size, &length, "[") != 0)
+    {
+        return -1;
+    }
+
+    for (index = 0U;
+         index < (sizeof(mqtt_metric_definitions) / sizeof(mqtt_metric_definitions[0]));
+         index++)
+    {
+        if ((enabled_metrics & mqtt_metric_definitions[index].mask) == 0U)
+        {
+            continue;
+        }
+
+        if (mqtt_json_append(output,
+                             output_size,
+                             &length,
+                             "%s\"%s\"",
+                             first ? "" : ",",
+                             mqtt_metric_definitions[index].name) != 0)
+        {
+            return -1;
+        }
+        first = 0;
+    }
+
+    return mqtt_json_append(output, output_size, &length, "]");
+}
+
 static int mqtt_publish_telemetry(void)
 {
-    char payload[256];
+    char payload[MQTT_JSON_BUFFER_SIZE];
+    const DeviceConfig *config = DeviceConfig_Get();
     uint32_t uptime_ms = HAL_GetTick();
     unsigned long simulated_temperature = 25UL + ((uptime_ms / 30000U) % 5U);
-    int written;
+    unsigned long simulated_humidity = 45UL + ((uptime_ms / 60000U) % 10U);
+    size_t length = 0U;
 
     /*
      * MVP: wartosci sa diagnostyczne/symulowane. Pozniej temperature i
      * napiecie nalezy podmienic na odczyty z rzeczywistych peryferiow.
      */
-    written = snprintf(payload,
-                       sizeof(payload),
-                       "{\"deviceId\":\"%s\",\"schemaVersion\":1,"
-                       "\"uptimeMs\":%lu,\"temperature\":%lu,"
-                       "\"voltage\":3.30,\"signal\":100}",
-                       MQTT_DEVICE_ID,
-                       (unsigned long)uptime_ms,
-                       simulated_temperature);
-
-    if ((written < 0) || ((size_t)written >= sizeof(payload)))
+    if (mqtt_json_append(payload,
+                         sizeof(payload),
+                         &length,
+                         "{\"deviceId\":\"%s\",\"schemaVersion\":1,"
+                         "\"configVersion\":%lu,\"uptimeMs\":%lu",
+                         MQTT_DEVICE_ID,
+                         (unsigned long)config->config_version,
+                         (unsigned long)uptime_ms) != 0)
     {
         tls_log("MQTT: telemetry JSON too large");
+        return -1;
+    }
+
+    if (((config->enabled_metrics & DEVICE_METRIC_TEMPERATURE) != 0U) &&
+        (mqtt_json_append(payload, sizeof(payload), &length,
+                          ",\"temperature\":%lu", simulated_temperature) != 0))
+    {
+        return -1;
+    }
+
+    if (((config->enabled_metrics & DEVICE_METRIC_VOLTAGE) != 0U) &&
+        (mqtt_json_append(payload, sizeof(payload), &length, ",\"voltage\":3.30") != 0))
+    {
+        return -1;
+    }
+
+    if (((config->enabled_metrics & DEVICE_METRIC_CURRENT) != 0U) &&
+        (mqtt_json_append(payload, sizeof(payload), &length, ",\"current\":0.12") != 0))
+    {
+        return -1;
+    }
+
+    if (((config->enabled_metrics & DEVICE_METRIC_SIGNAL) != 0U) &&
+        (mqtt_json_append(payload, sizeof(payload), &length, ",\"signal\":100") != 0))
+    {
+        return -1;
+    }
+
+    if (((config->enabled_metrics & DEVICE_METRIC_HUMIDITY) != 0U) &&
+        (mqtt_json_append(payload, sizeof(payload), &length,
+                          ",\"humidity\":%lu", simulated_humidity) != 0))
+    {
+        return -1;
+    }
+
+    if (mqtt_json_append(payload, sizeof(payload), &length, "}") != 0)
+    {
         return -1;
     }
 
@@ -1499,6 +1624,152 @@ static int json_get_bool(const char *json, const char *key, int *out)
     return -1;
 }
 
+static int json_get_uint32(const char *json, const char *key, uint32_t *out)
+{
+    const char *value = json_value_start(json, key);
+    char *end;
+    unsigned long parsed;
+
+    if ((value == NULL) || (*value == '-') || (*value == '+'))
+    {
+        return -1;
+    }
+
+    errno = 0;
+    parsed = strtoul(value, &end, 10);
+    if ((end == value) || (errno != 0) || (parsed > 0xFFFFFFFFUL))
+    {
+        return -1;
+    }
+
+    while ((*end == ' ') || (*end == '\t') || (*end == '\r') || (*end == '\n'))
+    {
+        end++;
+    }
+
+    if ((*end != ',') && (*end != '}') && (*end != ']'))
+    {
+        return -1;
+    }
+
+    *out = (uint32_t)parsed;
+    return 0;
+}
+
+static uint8_t mqtt_metric_mask_for_name(const char *name)
+{
+    size_t index;
+
+    for (index = 0U;
+         index < (sizeof(mqtt_metric_definitions) / sizeof(mqtt_metric_definitions[0]));
+         index++)
+    {
+        if (strcmp(name, mqtt_metric_definitions[index].name) == 0)
+        {
+            return mqtt_metric_definitions[index].mask;
+        }
+    }
+
+    return 0U;
+}
+
+static int json_get_metric_mask(const char *json, const char *key, uint8_t *out)
+{
+    const char *value = json_value_start(json, key);
+    uint8_t mask = 0U;
+
+    if ((value == NULL) || (*value != '['))
+    {
+        return -1;
+    }
+
+    value++;
+    for (;;)
+    {
+        char metric[32];
+        size_t length = 0U;
+        uint8_t metric_mask;
+
+        while ((*value == ' ') || (*value == '\t') || (*value == '\r') || (*value == '\n'))
+        {
+            value++;
+        }
+
+        if (*value == ']')
+        {
+            if (mask == 0U)
+            {
+                return -1;
+            }
+            *out = mask;
+            return 0;
+        }
+
+        if (*value != '"')
+        {
+            return -1;
+        }
+        value++;
+
+        while ((*value != '\0') && (*value != '"'))
+        {
+            if ((*value == '\\') || ((length + 1U) >= sizeof(metric)))
+            {
+                return -1;
+            }
+            metric[length++] = *value++;
+        }
+
+        if (*value != '"')
+        {
+            return -1;
+        }
+        value++;
+        metric[length] = '\0';
+
+        metric_mask = mqtt_metric_mask_for_name(metric);
+        if ((metric_mask == 0U) || ((mask & metric_mask) != 0U))
+        {
+            return -1;
+        }
+        mask |= metric_mask;
+
+        while ((*value == ' ') || (*value == '\t') || (*value == '\r') || (*value == '\n'))
+        {
+            value++;
+        }
+
+        if (*value == ',')
+        {
+            value++;
+            continue;
+        }
+
+        if (*value != ']')
+        {
+            return -1;
+        }
+    }
+}
+
+static int device_log_level_from_name(const char *name, uint8_t *level)
+{
+    uint8_t candidate;
+
+    for (candidate = DEVICE_LOG_LEVEL_ERROR;
+         candidate <= DEVICE_LOG_LEVEL_TRACE;
+         candidate++)
+    {
+        if (strcmp(name, DeviceConfig_LogLevelName(candidate)) == 0)
+        {
+            *level = candidate;
+            return 0;
+        }
+    }
+
+    return -1;
+}
+
 static int mqtt_publish_command_result(const char *command_id,
                                        const char *status,
                                        const char *message)
@@ -1522,6 +1793,163 @@ static int mqtt_publish_command_result(const char *command_id,
     }
 
     return mqtt_publish_json(MQTT_TOPIC_CMD_RESULT, payload);
+}
+
+static int mqtt_publish_reported_config(uint32_t request_version,
+                                        const char *status,
+                                        const char *message)
+{
+    char payload[MQTT_JSON_BUFFER_SIZE];
+    char metrics[128];
+    const DeviceConfig *config = DeviceConfig_Get();
+    int written;
+
+    if (mqtt_metrics_json(config->enabled_metrics, metrics, sizeof(metrics)) != 0)
+    {
+        tls_log("MQTT CONFIG: metrics JSON too large");
+        return -1;
+    }
+
+    written = snprintf(payload,
+                       sizeof(payload),
+                       "{\"deviceId\":\"%s\",\"schemaVersion\":%u,"
+                       "\"requestVersion\":%lu,\"configVersion\":%lu,"
+                       "\"status\":\"%s\",\"message\":\"%s\","
+                       "\"uptimeMs\":%lu,\"configuration\":{"
+                       "\"telemetry\":{\"frequencySeconds\":%lu,"
+                       "\"enabledMetrics\":%s},"
+                       "\"diagnostics\":{\"logLevel\":\"%s\","
+                       "\"maxMessageBytes\":%u},"
+                       "\"network\":{\"mqttKeepAliveSeconds\":%u},"
+                       "\"firmware\":{\"allowRollback\":%s}}}",
+                       MQTT_DEVICE_ID,
+                       DEVICE_CONFIG_SCHEMA_VERSION,
+                       (unsigned long)request_version,
+                       (unsigned long)config->config_version,
+                       status,
+                       message,
+                       (unsigned long)HAL_GetTick(),
+                       (unsigned long)config->telemetry_frequency_seconds,
+                       metrics,
+                       DeviceConfig_LogLevelName(config->log_level),
+                       (unsigned int)config->diagnostics_max_message_bytes,
+                       (unsigned int)config->mqtt_keep_alive_seconds,
+                       config->allow_rollback ? "true" : "false");
+
+    if ((written < 0) || ((size_t)written >= sizeof(payload)))
+    {
+        tls_log("MQTT CONFIG: reported JSON too large");
+        return -1;
+    }
+
+    return mqtt_publish_json(MQTT_TOPIC_CONFIG_REPORTED, payload);
+}
+
+static int mqtt_reject_config(uint32_t request_version, const char *reason)
+{
+    tls_logf("MQTT CONFIG: rejected request=%lu reason=%s",
+             (unsigned long)request_version,
+             reason);
+    return mqtt_publish_reported_config(request_version, "REJECTED", reason);
+}
+
+static int mqtt_handle_desired_config(const char *payload)
+{
+    DeviceConfig candidate = *DeviceConfig_Get();
+    DeviceConfigApplyResult result;
+    uint32_t schema_version;
+    uint32_t request_version = candidate.config_version;
+    uint32_t number;
+    char device_id[96];
+    char log_level[16];
+    int allow_rollback;
+
+    if (json_get_uint32(payload, "configVersion", &request_version) != 0)
+    {
+        return mqtt_reject_config(request_version, "Invalid configVersion");
+    }
+
+    if ((json_get_uint32(payload, "schemaVersion", &schema_version) != 0) ||
+        (schema_version != DEVICE_CONFIG_SCHEMA_VERSION))
+    {
+        return mqtt_reject_config(request_version, "Unsupported schemaVersion");
+    }
+
+    if ((json_get_string(payload, "deviceId", device_id, sizeof(device_id)) != 0) ||
+        (strcmp(device_id, MQTT_DEVICE_ID) != 0))
+    {
+        return mqtt_reject_config(request_version, "deviceId mismatch");
+    }
+
+    candidate.config_version = request_version;
+
+    if (json_get_uint32(payload, "frequencySeconds", &number) != 0)
+    {
+        return mqtt_reject_config(request_version, "Invalid telemetry frequency");
+    }
+    candidate.telemetry_frequency_seconds = number;
+
+    if (json_get_metric_mask(payload, "enabledMetrics", &candidate.enabled_metrics) != 0)
+    {
+        return mqtt_reject_config(request_version, "Invalid enabledMetrics");
+    }
+
+    if ((json_get_string(payload, "logLevel", log_level, sizeof(log_level)) != 0) ||
+        (device_log_level_from_name(log_level, &candidate.log_level) != 0))
+    {
+        return mqtt_reject_config(request_version, "Invalid logLevel");
+    }
+
+    if ((json_get_uint32(payload, "maxMessageBytes", &number) != 0) ||
+        (number > 0xFFFFU))
+    {
+        return mqtt_reject_config(request_version, "Invalid maxMessageBytes");
+    }
+    candidate.diagnostics_max_message_bytes = (uint16_t)number;
+
+    if ((json_get_uint32(payload, "mqttKeepAliveSeconds", &number) != 0) ||
+        (number > 0xFFFFU))
+    {
+        return mqtt_reject_config(request_version, "Invalid MQTT keep alive");
+    }
+    candidate.mqtt_keep_alive_seconds = (uint16_t)number;
+
+    if (json_get_bool(payload, "allowRollback", &allow_rollback) != 0)
+    {
+        return mqtt_reject_config(request_version, "Invalid allowRollback");
+    }
+    candidate.allow_rollback = allow_rollback ? 1U : 0U;
+
+    result = DeviceConfig_Apply(&candidate);
+    switch (result)
+    {
+        case DEVICE_CONFIG_APPLIED:
+            mqtt_last_telemetry_ms = HAL_GetTick();
+            tls_logf("MQTT CONFIG: applied version=%lu telemetry=%lus",
+                     (unsigned long)candidate.config_version,
+                     (unsigned long)candidate.telemetry_frequency_seconds);
+            return mqtt_publish_reported_config(request_version,
+                                                "APPLIED",
+                                                "Configuration applied");
+
+        case DEVICE_CONFIG_UNCHANGED:
+            return mqtt_publish_reported_config(request_version,
+                                                "APPLIED",
+                                                "Configuration already applied");
+
+        case DEVICE_CONFIG_REJECTED_STALE:
+            return mqtt_reject_config(request_version, "Stale configVersion");
+
+        case DEVICE_CONFIG_REJECTED_CONFLICT:
+            return mqtt_reject_config(request_version, "configVersion conflict");
+
+        case DEVICE_CONFIG_PERSISTENCE_ERROR:
+            return mqtt_reject_config(request_version, "Flash persistence failed");
+
+        case DEVICE_CONFIG_REJECTED_INVALID:
+        default:
+            return mqtt_reject_config(request_version, "Configuration out of range");
+    }
 }
 
 static int mqtt_handle_command(const char *payload)
@@ -1648,6 +2076,13 @@ static int mqtt_handle_publish_packet(const uint8_t *packet,
     if (strcmp(topic, MQTT_TOPIC_CMD) == 0)
     {
         if (mqtt_handle_command(payload) != 0)
+        {
+            return -1;
+        }
+    }
+    else if (strcmp(topic, MQTT_TOPIC_CONFIG_DESIRED) == 0)
+    {
+        if (mqtt_handle_desired_config(payload) != 0)
         {
             return -1;
         }
@@ -1793,15 +2228,29 @@ int TlsClient_MqttTest(void)
         return -1;
     }
 
-    if (mqtt_subscribe_cmd() != 0)
+    if (mqtt_subscribe_topic(MQTT_TOPIC_CMD, 1U) != 0)
     {
-        tls_log("MQTT: SUBSCRIBE failed");
+        tls_log("MQTT: command SUBSCRIBE failed");
+        return -1;
+    }
+
+    if (mqtt_subscribe_topic(MQTT_TOPIC_CONFIG_DESIRED, 2U) != 0)
+    {
+        tls_log("MQTT: configuration SUBSCRIBE failed");
         return -1;
     }
 
     if (mqtt_publish_status() != 0)
     {
         tls_log("MQTT: PUBLISH failed");
+        return -1;
+    }
+
+    if (mqtt_publish_reported_config(DeviceConfig_Get()->config_version,
+                                     "APPLIED",
+                                     "Configuration restored after boot") != 0)
+    {
+        tls_log("MQTT: initial reported config failed");
         return -1;
     }
 
@@ -1823,7 +2272,10 @@ int TlsClient_MqttTest(void)
 
 int TlsClient_MqttProcess(void)
 {
+    const DeviceConfig *config;
     uint32_t now;
+    uint32_t telemetry_interval_ms;
+    uint32_t ping_interval_ms;
 
     if (!tls_connected || !mqtt_ready)
     {
@@ -1836,8 +2288,12 @@ int TlsClient_MqttProcess(void)
         return -1;
     }
 
+    config = DeviceConfig_Get();
+    telemetry_interval_ms = config->telemetry_frequency_seconds * 1000U;
+    ping_interval_ms = (uint32_t)mqtt_negotiated_keep_alive_seconds * 500U;
+
     now = HAL_GetTick();
-    if ((now - mqtt_last_telemetry_ms) >= MQTT_TELEMETRY_INTERVAL_MS)
+    if ((now - mqtt_last_telemetry_ms) >= telemetry_interval_ms)
     {
         mqtt_last_telemetry_ms = now;
         if (mqtt_publish_telemetry() != 0)
@@ -1847,7 +2303,7 @@ int TlsClient_MqttProcess(void)
         }
     }
 
-    if ((now - mqtt_last_ping_ms) >= MQTT_PING_INTERVAL_MS)
+    if ((now - mqtt_last_ping_ms) >= ping_interval_ms)
     {
         mqtt_last_ping_ms = now;
         if (mqtt_send_ping() != 0)
