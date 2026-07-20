@@ -2,11 +2,19 @@
 #define INC_AWS_JOBS_H_
 
 #include <stddef.h>
+#include <stdint.h>
+
+#include "flash_staging.h"
 
 typedef int (*AwsJobsPublishCallback)(const char *topic, const char *payload);
+typedef int (*AwsJobsDownloadStartCallback)(
+    const char *url,
+    uint32_t expected_size,
+    const uint8_t expected_sha256[FLASH_STAGING_SHA256_SIZE]);
 
 /* Initializes the session-independent Jobs state machine. */
-void AwsJobs_Init(AwsJobsPublishCallback publish_callback);
+void AwsJobs_Init(AwsJobsPublishCallback publish_callback,
+                  AwsJobsDownloadStartCallback download_start_callback);
 
 /* Topics are ordered so response topics are subscribed before notify-next. */
 size_t AwsJobs_SubscriptionCount(void);
@@ -18,6 +26,9 @@ void AwsJobs_OnMqttDisconnected(void);
 
 /* Runs bounded retry/backoff work from the existing MQTT service loop. */
 int AwsJobs_Process(void);
+
+/* Completes the currently active asynchronous download execution. */
+int AwsJobs_OnDownloadComplete(int succeeded, const char *detail);
 
 /*
  * Returns 1 when the topic was handled, 0 when it is not a Jobs topic,

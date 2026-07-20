@@ -1,7 +1,8 @@
 # Flash staging for AWS IoT Jobs
 
-Status: storage foundation and AWS IoT Jobs control plane implemented; HTTPS
-artifact download is the next integration stage.
+Status: storage foundation, AWS IoT Jobs control plane, and bounded HTTPS
+artifact download implemented. Firmware installation/bootloader OTA remains
+outside this stage.
 
 ## Memory layout
 
@@ -85,6 +86,6 @@ Further fault-injection tests for the AWS Jobs integration should reset the
 device during transfer and use an incorrect digest. After restart, an
 interrupted or corrupted transfer must never be reported as `READY`.
 
-The production AWS Jobs handler must serialize Flash operations with
-configuration updates and report progress/results on the existing jobs result
-channel.
+The AWS Jobs downloader serializes Flash staging operations in the existing
+MQTT service loop. It restarts an interrupted transfer from byte zero and
+reports terminal status through the reserved AWS Jobs update topic.

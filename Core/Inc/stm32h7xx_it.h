@@ -55,6 +55,7 @@ void DebugMon_Handler(void);
 void SysTick_Handler(void);
 /* USER CODE BEGIN EFP */
 void USART3_IRQHandler(void);
+void Fault_ReportFatal(const char *name);
 /* USER CODE END EFP */
 
 #ifdef __cplusplus

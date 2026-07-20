@@ -47,6 +47,7 @@
 #include "aws_iot_config.h"
 #include "FreeRTOS.h"
 #include "task.h"
+#include "stm32h7xx_it.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -509,26 +510,9 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 void vAssertCalled(const char *file, int line)
 {
-    char buf[220];
-
-    snprintf(buf, sizeof(buf),
-             "\r\nFREERTOS ASSERT: %s:%d\r\n",
-             file ? file : "unknown",
-             line);
-
-    SYS_LOG(buf);
-
-    taskDISABLE_INTERRUPTS();
-
-    while (1)
-    {
-        HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
-
-        for (volatile uint32_t i = 0; i < 1600000; i++)
-        {
-            __NOP();
-        }
-    }
+    (void)file;
+    (void)line;
+    Fault_ReportFatal("FreeRTOS assert");
 }
 
 static void Print_ResetReason(void)
@@ -545,39 +529,14 @@ static void Print_ResetReason(void)
 
 void vApplicationMallocFailedHook(void)
 {
-    SYS_LOG("FREERTOS: MALLOC FAILED");
-
-    taskDISABLE_INTERRUPTS();
-
-    while (1)
-    {
-        HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
-
-        for (volatile uint32_t i = 0; i < 800000; i++)
-        {
-            __NOP();
-        }
-    }
+    Fault_ReportFatal("FreeRTOS malloc failed");
 }
 
 void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
 {
     (void)xTask;
-
-    SYS_LOGF("FREERTOS: STACK OVERFLOW in task: %s",
-             pcTaskName ? pcTaskName : "unknown");
-
-    taskDISABLE_INTERRUPTS();
-
-    while (1)
-    {
-        HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
-
-        for (volatile uint32_t i = 0; i < 1600000; i++)
-        {
-            __NOP();
-        }
-    }
+    (void)pcTaskName;
+    Fault_ReportFatal("FreeRTOS stack overflow");
 }
 
 static void Net_PrintIp(void)

@@ -29,7 +29,7 @@
 #define AWS_JOBS_JOB_ID_MAX_LENGTH       64U
 #define AWS_JOBS_OPERATION_MAX_LENGTH    32U
 #define AWS_JOBS_MODE_MAX_LENGTH         24U
-#define AWS_JOBS_URL_MAX_LENGTH          512U
+#define AWS_JOBS_URL_MAX_LENGTH         1024U
 #define AWS_JOBS_SHA256_HEX_LENGTH       64U
 #define AWS_JOBS_JSON_MAX_DEPTH          8U
 #define AWS_JOBS_STEP_TIMEOUT_MINUTES    10U
@@ -52,16 +52,24 @@ typedef struct
     const char *end;
 } JsonSlice;
 
+typedef enum
+{
+    AWS_JOBS_DOCUMENT_VALIDATE_ONLY = 0,
+    AWS_JOBS_DOCUMENT_DOWNLOAD
+} AwsJobsDocumentMode;
+
 typedef struct
 {
     char url[AWS_JOBS_URL_MAX_LENGTH + 1U];
     uint32_t size_bytes;
     uint8_t sha256[FLASH_STAGING_SHA256_SIZE];
+    AwsJobsDocumentMode mode;
 } AwsJobsArtifact;
 
 typedef struct
 {
     AwsJobsPublishCallback publish;
+    AwsJobsDownloadStartCallback download_start;
     AwsJobsState state;
     uint32_t token_counter;
     uint32_t execution_version;
@@ -677,8 +685,20 @@ static int Jobs_ValidateDocument(JsonSlice document,
         return -1;
     }
 
-    if ((Json_GetRequiredString(document, "mode", mode, sizeof(mode)) != 0) ||
-        (strcmp(mode, "validate-only") != 0))
+    if (Json_GetRequiredString(document, "mode", mode, sizeof(mode)) != 0)
+    {
+        *reason = "unsupported_mode";
+        return -1;
+    }
+    if (strcmp(mode, "validate-only") == 0)
+    {
+        artifact->mode = AWS_JOBS_DOCUMENT_VALIDATE_ONLY;
+    }
+    else if (strcmp(mode, "download") == 0)
+    {
+        artifact->mode = AWS_JOBS_DOCUMENT_DOWNLOAD;
+    }
+    else
     {
         *reason = "unsupported_mode";
         return -1;
@@ -925,14 +945,38 @@ static int Jobs_HandleStartNextAccepted(const char *payload)
                    : -1;
     }
 
-    Jobs_Logf("JOBS: validated job=%s artifactSize=%lu mode=validate-only",
+    if (artifact.mode == AWS_JOBS_DOCUMENT_VALIDATE_ONLY)
+    {
+        Jobs_Logf("JOBS: validated job=%s artifactSize=%lu mode=validate-only",
+                  jobs_context.active_job_id,
+                  (unsigned long)artifact.size_bytes);
+        return Jobs_PublishTerminalStatus("SUCCEEDED",
+                                          "VALIDATED",
+                                          "document_valid") == 0
+                   ? 1
+                   : -1;
+    }
+
+    if ((jobs_context.download_start == NULL) ||
+        (jobs_context.download_start(artifact.url,
+                                     artifact.size_bytes,
+                                     artifact.sha256) != 0))
+    {
+        Jobs_Logf("JOBS: download start failed job=%s",
+                  jobs_context.active_job_id);
+        return Jobs_PublishTerminalStatus("FAILED",
+                                          "DOWNLOAD_FAILED",
+                                          "download_start_failed") == 0
+                   ? 1
+                   : -1;
+    }
+
+    jobs_context.state = AWS_JOBS_STATE_EXECUTION_ACTIVE;
+    jobs_context.response_deadline_ms = 0U;
+    Jobs_Logf("JOBS: download active job=%s artifactSize=%lu",
               jobs_context.active_job_id,
               (unsigned long)artifact.size_bytes);
-    return Jobs_PublishTerminalStatus("SUCCEEDED",
-                                      "VALIDATED",
-                                      "document_valid") == 0
-               ? 1
-               : -1;
+    return 1;
 }
 
 static int Jobs_TopicHasUpdateSuffix(const char *topic, const char *suffix)
@@ -975,10 +1019,12 @@ static int Jobs_TopicMatchesActiveUpdate(const char *topic, const char *suffix)
            (strcmp(topic, expected) == 0);
 }
 
-void AwsJobs_Init(AwsJobsPublishCallback publish_callback)
+void AwsJobs_Init(AwsJobsPublishCallback publish_callback,
+                  AwsJobsDownloadStartCallback download_start_callback)
 {
     memset(&jobs_context, 0, sizeof(jobs_context));
     jobs_context.publish = publish_callback;
+    jobs_context.download_start = download_start_callback;
     jobs_context.state = AWS_JOBS_STATE_IDLE;
 }
 
@@ -1031,6 +1077,50 @@ int AwsJobs_Process(void)
     }
 
     return 0;
+}
+
+static int Jobs_IsSafeDetail(const char *detail)
+{
+    size_t index;
+
+    if ((detail == NULL) || (detail[0] == '\0') || (strlen(detail) > 40U))
+    {
+        return 0;
+    }
+
+    for (index = 0U; detail[index] != '\0'; index++)
+    {
+        char value = detail[index];
+        if (!(((value >= 'a') && (value <= 'z')) ||
+              ((value >= '0') && (value <= '9')) ||
+              (value == '_')))
+        {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int AwsJobs_OnDownloadComplete(int succeeded, const char *detail)
+{
+    const char *safe_detail = Jobs_IsSafeDetail(detail)
+                                  ? detail
+                                  : "download_failed";
+
+    if ((jobs_context.state != AWS_JOBS_STATE_EXECUTION_ACTIVE) ||
+        (jobs_context.active_job_id[0] == '\0'))
+    {
+        Jobs_Log("JOBS: ignored download completion without active execution");
+        return -1;
+    }
+
+    Jobs_Logf("JOBS: download completed job=%s result=%s detail=%s",
+              jobs_context.active_job_id,
+              succeeded ? "success" : "failure",
+              safe_detail);
+    return Jobs_PublishTerminalStatus(succeeded ? "SUCCEEDED" : "FAILED",
+                                      succeeded ? "STAGED" : "DOWNLOAD_FAILED",
+                                      succeeded ? "artifact_staged" : safe_detail);
 }
 
 int AwsJobs_HandleMessage(const char *topic, const char *payload)

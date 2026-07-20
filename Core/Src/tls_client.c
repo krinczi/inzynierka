@@ -6,6 +6,7 @@
 #include "debug_logger.h"
 #include "device_config.h"
 #include "flash_staging.h"
+#include "https_downloader.h"
 #include "iot_events.h"
 #include "main.h"
 
@@ -357,7 +358,7 @@ int TlsClient_Init(void)
     FlashStagingResult staging_result;
 
     tls_log("TLS: init");
-    tls_log("TLS BUILD: mqtt_config_v1 dual_slot_flash");
+    tls_log("TLS BUILD: mqtt_config_v1 dual_slot_flash jobs_https_v5");
     tls_connected = 0;
     tls_ctx_ready = 0;
     DeviceConfig_Init();
@@ -710,6 +711,7 @@ int TlsClient_Connect(void)
     tls_last_recv_errno = 0;
 
     tls_log_diag("TLS: free ctx...");
+    HttpsDownloader_Abort();
     tls_ctx_free_all();
     tls_log_diag("TLS: free ctx OK");
 
@@ -1361,6 +1363,17 @@ static int mqtt_subscribe_topic(const char *topic, uint16_t packet_id)
             mqtt_expected_suback_packet_id = 0U;
             tls_log("MQTT: SUBACK timeout");
             return -1;
+        }
+
+        /*
+         * mqtt_read_available() may have completed this synchronous
+         * subscription.  Do not yield once more after the matching SUBACK:
+         * the caller can advance immediately to the next subscription and
+         * the normal MQTT service loop will yield between later operations.
+         */
+        if (mqtt_suback_result != 0)
+        {
+            break;
         }
 
         osDelay(10U);
@@ -2377,6 +2390,18 @@ static int mqtt_read_available(void)
             {
                 return -1;
             }
+
+            /*
+             * A synchronous SUBSCRIBE waits only for its own SUBACK. Do not
+             * keep draining TLS data after that acknowledgement: retained
+             * publishes and later packets stay in the bounded MQTT buffer or
+             * socket and are handled by the next service step.
+             */
+            if ((mqtt_expected_suback_packet_id != 0U) &&
+                (mqtt_suback_result != 0))
+            {
+                return 0;
+            }
             continue;
         }
 
@@ -2433,7 +2458,10 @@ int TlsClient_MqttTest(void)
         return -1;
     }
 
-    AwsJobs_Init(mqtt_publish_json);
+    tls_log("MQTT: base subscriptions OK");
+    HttpsDownloader_Init(&tls_ca_cert, &tls_ctr_drbg);
+    AwsJobs_Init(mqtt_publish_json, HttpsDownloader_Start);
+    tls_log("MQTT: AWS Jobs init OK");
     for (jobs_subscription_index = 0U;
          jobs_subscription_index < AwsJobs_SubscriptionCount();
          jobs_subscription_index++)
@@ -2492,6 +2520,8 @@ int TlsClient_MqttTest(void)
 int TlsClient_MqttProcess(void)
 {
     const DeviceConfig *config;
+    int download_result;
+    int jobs_completion_result;
     uint32_t now;
     uint32_t telemetry_interval_ms;
     uint32_t ping_interval_ms;
@@ -2511,6 +2541,21 @@ int TlsClient_MqttProcess(void)
     {
         mqtt_ready = 0;
         return -1;
+    }
+
+    download_result = HttpsDownloader_Process();
+    if (download_result != 0)
+    {
+        jobs_completion_result = AwsJobs_OnDownloadComplete(
+            download_result > 0,
+            download_result > 0 ? "artifact_staged"
+                                : HttpsDownloader_GetLastError());
+        HttpsDownloader_Reset();
+        if (jobs_completion_result != 0)
+        {
+            mqtt_ready = 0;
+            return -1;
+        }
     }
 
     if (mqtt_flush_queued_events() != 0)
@@ -2555,6 +2600,7 @@ int TlsClient_MqttIsReady(void)
 void TlsClient_Disconnect(void)
 {
     tls_log("TLS: disconnect");
+    HttpsDownloader_Abort();
     AwsJobs_OnMqttDisconnected();
     mqtt_ready = 0;
     mqtt_rx_length = 0U;

@@ -88,7 +88,21 @@ static void Fault_UartWriteHex(uint32_t value)
   }
 }
 
-static void Fault_Report(const char *name)
+static uint8_t Fault_StackFrameIsReadable(const uint32_t *stack_frame)
+{
+  uintptr_t address = (uintptr_t)stack_frame;
+
+  return ((address >= 0x20000000UL) &&
+          (address <= (0x20020000UL - (8UL * sizeof(uint32_t))))) ||
+         ((address >= 0x24000000UL) &&
+          (address <= (0x24080000UL - (8UL * sizeof(uint32_t))))) ||
+         ((address >= 0x30000000UL) &&
+          (address <= (0x30048000UL - (8UL * sizeof(uint32_t)))));
+}
+
+static void Fault_Report(const char *name,
+                         const uint32_t *stack_frame,
+                         uint32_t exc_return)
 {
   __disable_irq();
 
@@ -107,9 +121,46 @@ static void Fault_Report(const char *name)
   Fault_UartWriteHex(SCB->BFAR);
   Fault_UartWrite("\r\n");
 
+  Fault_UartWrite("[FATAL] EXC_RETURN=0x");
+  Fault_UartWriteHex(exc_return);
+  Fault_UartWrite(" SP=0x");
+  Fault_UartWriteHex((uint32_t)(uintptr_t)stack_frame);
+  Fault_UartWrite("\r\n");
+
+  if (Fault_StackFrameIsReadable(stack_frame) != 0U)
+  {
+    Fault_UartWrite("[FATAL] R0=0x");
+    Fault_UartWriteHex(stack_frame[0]);
+    Fault_UartWrite(" R1=0x");
+    Fault_UartWriteHex(stack_frame[1]);
+    Fault_UartWrite(" R2=0x");
+    Fault_UartWriteHex(stack_frame[2]);
+    Fault_UartWrite(" R3=0x");
+    Fault_UartWriteHex(stack_frame[3]);
+    Fault_UartWrite("\r\n");
+    Fault_UartWrite("[FATAL] R12=0x");
+    Fault_UartWriteHex(stack_frame[4]);
+    Fault_UartWrite(" LR=0x");
+    Fault_UartWriteHex(stack_frame[5]);
+    Fault_UartWrite(" PC=0x");
+    Fault_UartWriteHex(stack_frame[6]);
+    Fault_UartWrite(" XPSR=0x");
+    Fault_UartWriteHex(stack_frame[7]);
+    Fault_UartWrite("\r\n");
+  }
+  else
+  {
+    Fault_UartWrite("[FATAL] stack frame outside known SRAM\r\n");
+  }
+
   while (1)
   {
   }
+}
+
+void Fault_ReportFatal(const char *name)
+{
+  Fault_Report(name, NULL, 0U);
 }
 
 /* USER CODE END 0 */
@@ -145,7 +196,14 @@ void NMI_Handler(void)
 void HardFault_Handler(void)
 {
   /* USER CODE BEGIN HardFault_IRQn 0 */
-  Fault_Report("HardFault");
+  uint32_t exc_return;
+  const uint32_t *stack_frame;
+
+  __asm volatile ("mov %0, lr" : "=r" (exc_return));
+  stack_frame = ((exc_return & 4U) != 0U)
+                  ? (const uint32_t *)__get_PSP()
+                  : (const uint32_t *)__get_MSP();
+  Fault_Report("HardFault", stack_frame, exc_return);
   /* USER CODE END HardFault_IRQn 0 */
   while (1)
   {
@@ -160,7 +218,7 @@ void HardFault_Handler(void)
 void MemManage_Handler(void)
 {
   /* USER CODE BEGIN MemoryManagement_IRQn 0 */
-  Fault_Report("MemManage");
+  Fault_Report("MemManage", NULL, 0U);
   /* USER CODE END MemoryManagement_IRQn 0 */
   while (1)
   {
@@ -175,7 +233,7 @@ void MemManage_Handler(void)
 void BusFault_Handler(void)
 {
   /* USER CODE BEGIN BusFault_IRQn 0 */
-  Fault_Report("BusFault");
+  Fault_Report("BusFault", NULL, 0U);
   /* USER CODE END BusFault_IRQn 0 */
   while (1)
   {
@@ -190,7 +248,7 @@ void BusFault_Handler(void)
 void UsageFault_Handler(void)
 {
   /* USER CODE BEGIN UsageFault_IRQn 0 */
-  Fault_Report("UsageFault");
+  Fault_Report("UsageFault", NULL, 0U);
   /* USER CODE END UsageFault_IRQn 0 */
   while (1)
   {
