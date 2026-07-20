@@ -6,9 +6,10 @@
 
 /*
  * The final two 128 KiB sectors of Bank 2 are reserved for configuration.
- * The linker script ends application FLASH at 0x081C0000, so neither slot can
- * overlap executable code. A new record is always written to the inactive
- * slot; the previous valid slot remains available if power is lost.
+ * Application code is restricted to Bank 1 and the preceding Bank 2 sectors
+ * are reserved for download staging, so neither configuration slot can
+ * overlap executable or staged data. A new record is always written to the
+ * inactive slot; the previous valid slot remains available if power is lost.
  */
 #define DEVICE_CONFIG_SLOT_A_ADDRESS       0x081C0000UL
 #define DEVICE_CONFIG_SLOT_B_ADDRESS       0x081E0000UL

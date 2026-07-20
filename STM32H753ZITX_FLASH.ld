@@ -43,14 +43,30 @@ _Min_Stack_Size = 0x400; /* required amount of stack */
 /* Specify the memory areas */
 MEMORY
 {
-  /* Last 256 KiB (Bank 2 sectors 6-7) are reserved for dual-slot config. */
-  FLASH (rx)     : ORIGIN = 0x08000000, LENGTH = 1792K
+  /*
+   * Application code is restricted to Bank 1. Bank 2 is reserved for
+   * download staging and the existing dual-slot configuration store.
+   */
+  FLASH (rx)              : ORIGIN = 0x08000000, LENGTH = 1024K
+  FLASH_STAGING_META (r)  : ORIGIN = 0x08100000, LENGTH = 128K
+  FLASH_STAGING_DATA (r)  : ORIGIN = 0x08120000, LENGTH = 640K
+  FLASH_CONFIG (r)        : ORIGIN = 0x081C0000, LENGTH = 256K
   DTCMRAM (xrw)  : ORIGIN = 0x20000000, LENGTH = 128K
   RAM_D1 (xrw)   : ORIGIN = 0x24000000, LENGTH = 512K
   RAM_D2 (xrw)   : ORIGIN = 0x30000000, LENGTH = 288K
   RAM_D3 (xrw)   : ORIGIN = 0x38000000, LENGTH = 64K
   ITCMRAM (xrw)  : ORIGIN = 0x00000000, LENGTH = 64K
 }
+
+__flash_staging_metadata_start__ = ORIGIN(FLASH_STAGING_META);
+__flash_staging_metadata_end__ = ORIGIN(FLASH_STAGING_META) + LENGTH(FLASH_STAGING_META);
+__flash_staging_data_start__ = ORIGIN(FLASH_STAGING_DATA);
+__flash_staging_data_end__ = ORIGIN(FLASH_STAGING_DATA) + LENGTH(FLASH_STAGING_DATA);
+
+ASSERT(ORIGIN(FLASH) + LENGTH(FLASH) <= ORIGIN(FLASH_STAGING_META),
+       "Application overlaps Flash staging metadata")
+ASSERT(ORIGIN(FLASH_STAGING_DATA) + LENGTH(FLASH_STAGING_DATA) <= ORIGIN(FLASH_CONFIG),
+       "Flash staging data overlaps device configuration")
 
 /* Define output sections */
 SECTIONS

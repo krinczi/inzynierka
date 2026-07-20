@@ -28,6 +28,8 @@
 #include "tls_client.h"
 #include "debug_logger.h"
 #include "iot_events.h"
+#include "flash_staging.h"
+#include "flash_staging_self_test.h"
 #include "lwip/netif.h"
 #include "lwip/dhcp.h"
 #include "lwip/ip4_addr.h"
@@ -58,6 +60,13 @@
 #define NET_ENABLE_DNS_SELF_TEST 0
 #endif
 
+#ifndef FLASH_STAGING_BUTTON_SELF_TEST_ENABLED
+#define FLASH_STAGING_BUTTON_SELF_TEST_ENABLED 1U
+#endif
+
+#define FLASH_STAGING_BUTTON_HOLD_MS 1500U
+#define FLASH_STAGING_BUTTON_SAMPLE_MS 20U
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -83,6 +92,9 @@ extern struct netif gnetif;
 uint8_t tls_test_done = 0;
 uint32_t last_blink_ms = 0;
 uint32_t last_log_ms = 0;
+#if FLASH_STAGING_BUTTON_SELF_TEST_ENABLED
+static uint8_t flash_staging_self_test_requested = 0U;
+#endif
 extern volatile uint32_t eth_rx_irq_count;
 extern volatile uint32_t eth_tx_irq_count;
 extern volatile uint32_t eth_err_irq_count;
@@ -108,6 +120,9 @@ void StartDefaultTask(void *argument);
 
 /* USER CODE BEGIN PFP */
 static void Print_ResetReason(void);
+#if FLASH_STAGING_BUTTON_SELF_TEST_ENABLED
+static uint8_t FlashStagingSelfTest_ButtonHeldAtBoot(void);
+#endif
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -116,6 +131,31 @@ static void Print_ResetReason(void);
 #define SYS_LOGF(...)      Debug_Logf(DEBUG_SRC_SYSTEM, __VA_ARGS__)
 #define NET_LOG(text)      Debug_LogLine(DEBUG_SRC_NET, (text))
 #define NET_LOGF(...)      Debug_Logf(DEBUG_SRC_NET, __VA_ARGS__)
+
+#if FLASH_STAGING_BUTTON_SELF_TEST_ENABLED
+static uint8_t FlashStagingSelfTest_ButtonHeldAtBoot(void)
+{
+    uint32_t start_ms;
+
+    if (HAL_GPIO_ReadPin(B1_GPIO_Port, B1_Pin) != GPIO_PIN_SET)
+    {
+        return 0U;
+    }
+
+    start_ms = HAL_GetTick();
+    while ((HAL_GetTick() - start_ms) < FLASH_STAGING_BUTTON_HOLD_MS)
+    {
+        if (HAL_GPIO_ReadPin(B1_GPIO_Port, B1_Pin) != GPIO_PIN_SET)
+        {
+            return 0U;
+        }
+
+        HAL_Delay(FLASH_STAGING_BUTTON_SAMPLE_MS);
+    }
+
+    return 1U;
+}
+#endif
 
 /* USER CODE END 0 */
 
@@ -160,6 +200,9 @@ int main(void)
   /* USER CODE BEGIN 2 */
 //  NetDebugServer_Init();
 //  TlsClient_Init();
+#if FLASH_STAGING_BUTTON_SELF_TEST_ENABLED
+  flash_staging_self_test_requested = FlashStagingSelfTest_ButtonHeldAtBoot();
+#endif
   HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_SET);
   /* USER CODE END 2 */
 
@@ -172,6 +215,12 @@ int main(void)
   SYS_LOG("BOOT: GPIO init OK");
   SYS_LOG("BOOT: UART3 init OK");
   SYS_LOG("BOOT: before RTOS");
+#if FLASH_STAGING_BUTTON_SELF_TEST_ENABLED
+  if (flash_staging_self_test_requested)
+  {
+      SYS_LOG("BOOT: Flash staging self-test requested by USER button");
+  }
+#endif
   Print_ResetReason();
   /* USER CODE END RTOS_DEBUG */
 
@@ -857,6 +906,51 @@ static void Net_SetStaticIp(void)
     NET_LOG("NET: static config done");
 }
 
+static int Net_ConfigureConnectedInterface(void)
+{
+    NET_LOG("STEP: before Net_SetStaticIp");
+    Net_SetStaticIp();
+    NET_LOG("STEP: after Net_SetStaticIp");
+
+#if NET_ENABLE_DNS_SELF_TEST
+    NET_LOG("NET: ready for DNS-only test");
+    NET_LOG("STEP: DNS example.com");
+
+    if (Net_TestDns("example.com") != 0)
+    {
+        NET_LOG("DNS TEST: example.com FAILED");
+        return -1;
+    }
+
+    NET_LOG("DNS TEST: example.com OK");
+    NET_LOG("STEP: DNS AWS");
+
+    if (Net_TestDns(AWS_IOT_ENDPOINT) != 0)
+    {
+        NET_LOG("DNS TEST: AWS FAILED");
+        return -1;
+    }
+
+    NET_LOG("DNS TEST: AWS OK");
+#else
+    NET_LOG("NET: DNS self-test disabled");
+    NET_LOG("NET: TLS task will resolve AWS host");
+#endif
+
+    return 0;
+}
+
+static void FlashStaging_LogSnapshot(const char *source)
+{
+    const FlashStagingInfo *info = FlashStaging_GetInfo();
+
+    SYS_LOGF("FLASH STAGING: state=%s capacity=%lu size=%lu source=%s",
+             FlashStaging_StateName(info->state),
+             (unsigned long)info->capacity_bytes,
+             (unsigned long)info->file_size_bytes,
+             source);
+}
+
 static void Net_RestartDhcp(void)
 {
     char buf[80];
@@ -963,6 +1057,23 @@ void StartDefaultTask(void *argument)
   /* USER CODE BEGIN 5 */
     SYS_LOG("RTOS: defaultTask start");
 
+#if FLASH_STAGING_BUTTON_SELF_TEST_ENABLED
+    if (flash_staging_self_test_requested)
+    {
+        FlashStagingResult staging_init_result = FlashStaging_Init();
+        FlashStagingResult staging_test_result;
+
+        SYS_LOGF("FLASH SELFTEST: init result=%d state=%s",
+                 (int)staging_init_result,
+                 FlashStaging_StateName(FlashStaging_GetInfo()->state));
+        staging_test_result = FlashStagingSelfTest_Run();
+        SYS_LOGF("FLASH SELFTEST: complete result=%d state=%s",
+                 (int)staging_test_result,
+                 FlashStaging_StateName(FlashStaging_GetInfo()->state));
+        flash_staging_self_test_requested = 0U;
+    }
+#endif
+
     HAL_NVIC_SetPriority(ETH_IRQn, 7, 0);
     HAL_NVIC_EnableIRQ(ETH_IRQn);
 
@@ -975,46 +1086,22 @@ void StartDefaultTask(void *argument)
     int mqtt_ready = 0;
     uint32_t mqtt_retry_after_ms = 0U;
 
+    /* Local persistent services must be available even when Ethernet is down. */
+    SYS_LOG("RTOS: local services init start");
+    if (TlsClient_Init() == 0)
+    {
+        tls_initialized = 1;
+        SYS_LOG("RTOS: local services init OK, TLS handshake available");
+    }
+    else
+    {
+        tls_initialized = 0;
+        SYS_LOG("RTOS: local services init FAILED");
+    }
+
     if (Net_WaitForLink() == 0)
     {
-        NET_LOG("STEP: before Net_SetStaticIp");
-        Net_SetStaticIp();
-        NET_LOG("STEP: after Net_SetStaticIp");
-
-#if NET_ENABLE_DNS_SELF_TEST
-        NET_LOG("NET: ready for DNS-only test");
-
-        NET_LOG("STEP: DNS example.com");
-        int dns_example_ok = Net_TestDns("example.com");
-
-        if (dns_example_ok == 0)
-        {
-            NET_LOG("DNS TEST: example.com OK");
-
-            NET_LOG("STEP: DNS AWS");
-            int dns_aws_ok = Net_TestDns(AWS_IOT_ENDPOINT);
-
-            if (dns_aws_ok == 0)
-            {
-                NET_LOG("DNS TEST: AWS OK");
-                network_ready = 1;
-            }
-            else
-            {
-                NET_LOG("DNS TEST: AWS FAILED");
-                network_ready = 0;
-            }
-        }
-        else
-        {
-            NET_LOG("DNS TEST: example.com FAILED");
-            network_ready = 0;
-        }
-#else
-        NET_LOG("NET: DNS self-test disabled");
-        NET_LOG("NET: TLS task will resolve AWS host");
-        network_ready = 1;
-#endif
+        network_ready = (Net_ConfigureConnectedInterface() == 0);
     }
     else
     {
@@ -1024,23 +1111,11 @@ void StartDefaultTask(void *argument)
 
     if (network_ready)
     {
-        SYS_LOG("RTOS: DNS OK, TLS init start");
-
-        if (TlsClient_Init() == 0)
-        {
-            tls_initialized = 1;
-            SYS_LOG("RTOS: TLS init OK, handshake test enabled");
-        }
-        else
-        {
-            tls_initialized = 0;
-            SYS_LOG("RTOS: TLS init FAILED");
-        }
+        SYS_LOG("RTOS: network ready, TLS handshake enabled");
     }
     else
     {
-        tls_initialized = 0;
-        SYS_LOG("RTOS: DNS failed, TLS skipped");
+        SYS_LOG("RTOS: network unavailable, TLS/MQTT deferred");
     }
 
     SYS_LOG("RTOS: network services init OK");
@@ -1084,13 +1159,26 @@ void StartDefaultTask(void *argument)
 
             if (Net_WaitForLink() == 0)
             {
-                Net_SetStaticIp();
-                osDelay(1000);
-                NET_LOG("NET: ready for ping test after reconnect");
-                (void)IotEvents_QueueDiagnostic(IOT_DIAGNOSTIC_INFO,
-                                                "ETHERNET",
-                                                "ETHERNET_LINK_RESTORED",
-                                                "Ethernet link was restored");
+                network_ready = (Net_ConfigureConnectedInterface() == 0);
+
+                if (network_ready)
+                {
+                    FlashStaging_LogSnapshot("ethernet-restored");
+                    osDelay(1000);
+                    NET_LOG("NET: ready after reconnect");
+                    (void)IotEvents_QueueDiagnostic(IOT_DIAGNOSTIC_INFO,
+                                                    "ETHERNET",
+                                                    "ETHERNET_LINK_RESTORED",
+                                                    "Ethernet link was restored");
+                }
+                else
+                {
+                    NET_LOG("NET: interface configuration failed after reconnect");
+                }
+            }
+            else
+            {
+                network_ready = 0;
             }
         }
 

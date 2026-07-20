@@ -4,6 +4,7 @@
 #include "aws_certs.h"
 #include "debug_logger.h"
 #include "device_config.h"
+#include "flash_staging.h"
 #include "iot_events.h"
 #include "main.h"
 
@@ -345,6 +346,8 @@ static void tls_ctx_free_all(void)
 int TlsClient_Init(void)
 {
     const DeviceConfig *config;
+    const FlashStagingInfo *staging_info;
+    FlashStagingResult staging_result;
 
     tls_log("TLS: init");
     tls_log("TLS BUILD: mqtt_config_v1 dual_slot_flash");
@@ -352,6 +355,19 @@ int TlsClient_Init(void)
     tls_ctx_ready = 0;
     DeviceConfig_Init();
     IotEvents_Init();
+    staging_result = FlashStaging_Init();
+    staging_info = FlashStaging_GetInfo();
+    tls_logf("FLASH STAGING: state=%s capacity=%lu size=%lu result=%d",
+             FlashStaging_StateName(staging_info->state),
+             (unsigned long)staging_info->capacity_bytes,
+             (unsigned long)staging_info->file_size_bytes,
+             (int)staging_result);
+    if (staging_result != FLASH_STAGING_OK)
+    {
+        (void)IotEvents_QueueAlert(IOT_ALERT_WARNING,
+                                   "FLASH_STAGING_INVALID",
+                                   "Staged file metadata or integrity is invalid");
+    }
     config = DeviceConfig_Get();
     tls_logf("CONFIG: loaded version=%lu telemetry=%lus keepalive=%lus",
              (unsigned long)config->config_version,
