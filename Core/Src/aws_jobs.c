@@ -1,0 +1,1101 @@
+#include "aws_jobs.h"
+
+#include "debug_logger.h"
+#include "flash_staging.h"
+#include "main.h"
+#include "mqtt_topics.h"
+
+#include <stdint.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
+
+#define AWS_JOBS_BASE_TOPIC \
+    "$aws/things/" MQTT_DEVICE_ID "/jobs"
+
+#define AWS_JOBS_TOPIC_START_NEXT \
+    AWS_JOBS_BASE_TOPIC "/start-next"
+#define AWS_JOBS_TOPIC_START_NEXT_ACCEPTED \
+    AWS_JOBS_TOPIC_START_NEXT "/accepted"
+#define AWS_JOBS_TOPIC_START_NEXT_REJECTED \
+    AWS_JOBS_TOPIC_START_NEXT "/rejected"
+#define AWS_JOBS_TOPIC_NOTIFY_NEXT \
+    AWS_JOBS_BASE_TOPIC "/notify-next"
+#define AWS_JOBS_TOPIC_UPDATE_ACCEPTED_FILTER \
+    AWS_JOBS_BASE_TOPIC "/+/update/accepted"
+#define AWS_JOBS_TOPIC_UPDATE_REJECTED_FILTER \
+    AWS_JOBS_BASE_TOPIC "/+/update/rejected"
+
+#define AWS_JOBS_JOB_ID_MAX_LENGTH       64U
+#define AWS_JOBS_OPERATION_MAX_LENGTH    32U
+#define AWS_JOBS_MODE_MAX_LENGTH         24U
+#define AWS_JOBS_URL_MAX_LENGTH          512U
+#define AWS_JOBS_SHA256_HEX_LENGTH       64U
+#define AWS_JOBS_JSON_MAX_DEPTH          8U
+#define AWS_JOBS_STEP_TIMEOUT_MINUTES    10U
+#define AWS_JOBS_RETRY_BASE_MS            5000U
+#define AWS_JOBS_RETRY_MAX_MS             60000U
+#define AWS_JOBS_RESPONSE_TIMEOUT_MS       15000U
+
+typedef enum
+{
+    AWS_JOBS_STATE_IDLE = 0,
+    AWS_JOBS_STATE_START_NEXT_PENDING,
+    AWS_JOBS_STATE_EXECUTION_ACTIVE,
+    AWS_JOBS_STATE_UPDATE_PENDING,
+    AWS_JOBS_STATE_PAUSED
+} AwsJobsState;
+
+typedef struct
+{
+    const char *start;
+    const char *end;
+} JsonSlice;
+
+typedef struct
+{
+    char url[AWS_JOBS_URL_MAX_LENGTH + 1U];
+    uint32_t size_bytes;
+    uint8_t sha256[FLASH_STAGING_SHA256_SIZE];
+} AwsJobsArtifact;
+
+typedef struct
+{
+    AwsJobsPublishCallback publish;
+    AwsJobsState state;
+    uint32_t token_counter;
+    uint32_t execution_version;
+    uint32_t retry_after_ms;
+    uint32_t response_deadline_ms;
+    uint8_t retry_attempt;
+    char active_job_id[AWS_JOBS_JOB_ID_MAX_LENGTH + 1U];
+    char pending_status[16];
+} AwsJobsContext;
+
+enum
+{
+    JSON_MEMBER_FOUND = 0,
+    JSON_MEMBER_NOT_FOUND = 1,
+    JSON_MEMBER_INVALID = -1
+};
+
+static AwsJobsContext jobs_context;
+
+/* Subscribe to response topics first; notify-next is intentionally last. */
+static const char *const jobs_subscription_topics[] = {
+    AWS_JOBS_TOPIC_START_NEXT_ACCEPTED,
+    AWS_JOBS_TOPIC_START_NEXT_REJECTED,
+    AWS_JOBS_TOPIC_UPDATE_ACCEPTED_FILTER,
+    AWS_JOBS_TOPIC_UPDATE_REJECTED_FILTER,
+    AWS_JOBS_TOPIC_NOTIFY_NEXT
+};
+
+static void Jobs_Log(const char *message)
+{
+    Debug_LogLine(DEBUG_SRC_TLS, message);
+}
+
+static void Jobs_Logf(const char *format, ...)
+{
+    char message[160];
+    va_list args;
+
+    va_start(args, format);
+    (void)vsnprintf(message, sizeof(message), format, args);
+    va_end(args);
+    Debug_LogLine(DEBUG_SRC_TLS, message);
+}
+
+static const char *Json_SkipWhitespace(const char *cursor, const char *end)
+{
+    while ((cursor < end) &&
+           ((*cursor == ' ') || (*cursor == '\t') ||
+            (*cursor == '\r') || (*cursor == '\n')))
+    {
+        cursor++;
+    }
+
+    return cursor;
+}
+
+static int Json_IsHexDigit(char value)
+{
+    return ((value >= '0') && (value <= '9')) ||
+           ((value >= 'a') && (value <= 'f')) ||
+           ((value >= 'A') && (value <= 'F'));
+}
+
+static int Json_SkipString(const char *cursor,
+                           const char *end,
+                           const char **after)
+{
+    if ((cursor >= end) || (*cursor != '"'))
+    {
+        return -1;
+    }
+
+    cursor++;
+    while (cursor < end)
+    {
+        unsigned char value = (unsigned char)*cursor++;
+
+        if (value == '"')
+        {
+            *after = cursor;
+            return 0;
+        }
+
+        if (value < 0x20U)
+        {
+            return -1;
+        }
+
+        if (value == '\\')
+        {
+            char escape;
+
+            if (cursor >= end)
+            {
+                return -1;
+            }
+
+            escape = *cursor++;
+            if (escape == 'u')
+            {
+                size_t index;
+
+                if ((size_t)(end - cursor) < 4U)
+                {
+                    return -1;
+                }
+
+                for (index = 0U; index < 4U; index++)
+                {
+                    if (!Json_IsHexDigit(cursor[index]))
+                    {
+                        return -1;
+                    }
+                }
+                cursor += 4U;
+            }
+            else if ((escape != '"') && (escape != '\\') &&
+                     (escape != '/') && (escape != 'b') &&
+                     (escape != 'f') && (escape != 'n') &&
+                     (escape != 'r') && (escape != 't'))
+            {
+                return -1;
+            }
+        }
+    }
+
+    return -1;
+}
+
+static int Json_SkipValue(const char *cursor,
+                          const char *end,
+                          uint32_t depth,
+                          const char **after)
+{
+    const char *next;
+
+    if (depth > AWS_JOBS_JSON_MAX_DEPTH)
+    {
+        return -1;
+    }
+
+    cursor = Json_SkipWhitespace(cursor, end);
+    if (cursor >= end)
+    {
+        return -1;
+    }
+
+    if (*cursor == '"')
+    {
+        return Json_SkipString(cursor, end, after);
+    }
+
+    if (*cursor == '{')
+    {
+        cursor = Json_SkipWhitespace(cursor + 1, end);
+        if ((cursor < end) && (*cursor == '}'))
+        {
+            *after = cursor + 1;
+            return 0;
+        }
+
+        for (;;)
+        {
+            if (Json_SkipString(cursor, end, &next) != 0)
+            {
+                return -1;
+            }
+
+            cursor = Json_SkipWhitespace(next, end);
+            if ((cursor >= end) || (*cursor != ':'))
+            {
+                return -1;
+            }
+
+            if (Json_SkipValue(cursor + 1, end, depth + 1U, &next) != 0)
+            {
+                return -1;
+            }
+
+            cursor = Json_SkipWhitespace(next, end);
+            if ((cursor < end) && (*cursor == '}'))
+            {
+                *after = cursor + 1;
+                return 0;
+            }
+
+            if ((cursor >= end) || (*cursor != ','))
+            {
+                return -1;
+            }
+            cursor = Json_SkipWhitespace(cursor + 1, end);
+        }
+    }
+
+    if (*cursor == '[')
+    {
+        cursor = Json_SkipWhitespace(cursor + 1, end);
+        if ((cursor < end) && (*cursor == ']'))
+        {
+            *after = cursor + 1;
+            return 0;
+        }
+
+        for (;;)
+        {
+            if (Json_SkipValue(cursor, end, depth + 1U, &next) != 0)
+            {
+                return -1;
+            }
+
+            cursor = Json_SkipWhitespace(next, end);
+            if ((cursor < end) && (*cursor == ']'))
+            {
+                *after = cursor + 1;
+                return 0;
+            }
+
+            if ((cursor >= end) || (*cursor != ','))
+            {
+                return -1;
+            }
+            cursor = Json_SkipWhitespace(cursor + 1, end);
+        }
+    }
+
+    next = cursor;
+    while ((next < end) && (*next != ',') && (*next != '}') &&
+           (*next != ']') && (*next != ' ') && (*next != '\t') &&
+           (*next != '\r') && (*next != '\n'))
+    {
+        next++;
+    }
+
+    if (next == cursor)
+    {
+        return -1;
+    }
+
+    *after = next;
+    return 0;
+}
+
+static int Json_KeyEquals(const char *start,
+                          const char *end,
+                          const char *expected)
+{
+    size_t expected_length = strlen(expected);
+    size_t actual_length = (size_t)(end - start);
+
+    if ((memchr(start, '\\', actual_length) != NULL) ||
+        (actual_length != expected_length))
+    {
+        return 0;
+    }
+
+    return memcmp(start, expected, expected_length) == 0;
+}
+
+static int Json_ObjectFind(JsonSlice object,
+                           const char *member_name,
+                           JsonSlice *value)
+{
+    const char *cursor = Json_SkipWhitespace(object.start, object.end);
+    int found = 0;
+
+    if ((cursor >= object.end) || (*cursor != '{'))
+    {
+        return JSON_MEMBER_INVALID;
+    }
+
+    cursor = Json_SkipWhitespace(cursor + 1, object.end);
+    if ((cursor < object.end) && (*cursor == '}'))
+    {
+        return JSON_MEMBER_NOT_FOUND;
+    }
+
+    for (;;)
+    {
+        const char *key_start;
+        const char *key_after;
+        const char *value_start;
+        const char *value_after;
+
+        if ((cursor >= object.end) || (*cursor != '"'))
+        {
+            return JSON_MEMBER_INVALID;
+        }
+
+        key_start = cursor + 1;
+        if (Json_SkipString(cursor, object.end, &key_after) != 0)
+        {
+            return JSON_MEMBER_INVALID;
+        }
+
+        cursor = Json_SkipWhitespace(key_after, object.end);
+        if ((cursor >= object.end) || (*cursor != ':'))
+        {
+            return JSON_MEMBER_INVALID;
+        }
+
+        value_start = Json_SkipWhitespace(cursor + 1, object.end);
+        if (Json_SkipValue(value_start, object.end, 1U, &value_after) != 0)
+        {
+            return JSON_MEMBER_INVALID;
+        }
+
+        if (Json_KeyEquals(key_start, key_after - 1, member_name))
+        {
+            if (found)
+            {
+                return JSON_MEMBER_INVALID;
+            }
+
+            value->start = value_start;
+            value->end = value_after;
+            found = 1;
+        }
+
+        cursor = Json_SkipWhitespace(value_after, object.end);
+        if ((cursor < object.end) && (*cursor == '}'))
+        {
+            return found ? JSON_MEMBER_FOUND : JSON_MEMBER_NOT_FOUND;
+        }
+
+        if ((cursor >= object.end) || (*cursor != ','))
+        {
+            return JSON_MEMBER_INVALID;
+        }
+        cursor = Json_SkipWhitespace(cursor + 1, object.end);
+    }
+}
+
+static int Json_SliceIsObject(JsonSlice value)
+{
+    const char *cursor = Json_SkipWhitespace(value.start, value.end);
+    const char *after;
+
+    if ((cursor >= value.end) || (*cursor != '{') ||
+        (Json_SkipValue(cursor, value.end, 1U, &after) != 0))
+    {
+        return 0;
+    }
+
+    return Json_SkipWhitespace(after, value.end) == value.end;
+}
+
+static int Json_SliceIsNull(JsonSlice value)
+{
+    const char *start = Json_SkipWhitespace(value.start, value.end);
+    const char *end = value.end;
+
+    while ((end > start) &&
+           ((end[-1] == ' ') || (end[-1] == '\t') ||
+            (end[-1] == '\r') || (end[-1] == '\n')))
+    {
+        end--;
+    }
+
+    return ((size_t)(end - start) == 4U) &&
+           (memcmp(start, "null", 4U) == 0);
+}
+
+static int Json_CopyString(JsonSlice value, char *output, size_t output_size)
+{
+    const char *cursor = Json_SkipWhitespace(value.start, value.end);
+    size_t length = 0U;
+
+    if ((output_size == 0U) || (cursor >= value.end) || (*cursor != '"'))
+    {
+        return -1;
+    }
+
+    cursor++;
+    while (cursor < value.end)
+    {
+        unsigned char decoded = (unsigned char)*cursor++;
+
+        if (decoded == '"')
+        {
+            if (Json_SkipWhitespace(cursor, value.end) != value.end)
+            {
+                return -1;
+            }
+
+            output[length] = '\0';
+            return 0;
+        }
+
+        if ((decoded < 0x20U) || ((length + 1U) >= output_size))
+        {
+            return -1;
+        }
+
+        if (decoded == '\\')
+        {
+            char escape;
+
+            if (cursor >= value.end)
+            {
+                return -1;
+            }
+
+            escape = *cursor++;
+            switch (escape)
+            {
+            case '"': decoded = '"'; break;
+            case '\\': decoded = '\\'; break;
+            case '/': decoded = '/'; break;
+            case 'b': decoded = '\b'; break;
+            case 'f': decoded = '\f'; break;
+            case 'n': decoded = '\n'; break;
+            case 'r': decoded = '\r'; break;
+            case 't': decoded = '\t'; break;
+            default:
+                /* Unicode escapes are rejected to keep identifiers unambiguous. */
+                return -1;
+            }
+        }
+
+        output[length++] = (char)decoded;
+    }
+
+    return -1;
+}
+
+static int Json_GetUInt32(JsonSlice value, uint32_t *output)
+{
+    const char *cursor = Json_SkipWhitespace(value.start, value.end);
+    uint32_t result = 0U;
+    int has_digit = 0;
+
+    while ((cursor < value.end) && (*cursor >= '0') && (*cursor <= '9'))
+    {
+        uint32_t digit = (uint32_t)(*cursor - '0');
+
+        if (result > ((UINT32_MAX - digit) / 10U))
+        {
+            return -1;
+        }
+
+        result = (result * 10U) + digit;
+        has_digit = 1;
+        cursor++;
+    }
+
+    if (!has_digit || (Json_SkipWhitespace(cursor, value.end) != value.end))
+    {
+        return -1;
+    }
+
+    *output = result;
+    return 0;
+}
+
+static int Json_GetRequiredObjectMember(JsonSlice object,
+                                        const char *name,
+                                        JsonSlice *value)
+{
+    return (Json_ObjectFind(object, name, value) == JSON_MEMBER_FOUND) &&
+           Json_SliceIsObject(*value)
+               ? 0
+               : -1;
+}
+
+static int Json_GetRequiredString(JsonSlice object,
+                                  const char *name,
+                                  char *output,
+                                  size_t output_size)
+{
+    JsonSlice value;
+
+    return (Json_ObjectFind(object, name, &value) == JSON_MEMBER_FOUND) &&
+           (Json_CopyString(value, output, output_size) == 0)
+               ? 0
+               : -1;
+}
+
+static int Json_GetRequiredUInt32(JsonSlice object,
+                                  const char *name,
+                                  uint32_t *output)
+{
+    JsonSlice value;
+
+    return (Json_ObjectFind(object, name, &value) == JSON_MEMBER_FOUND) &&
+           (Json_GetUInt32(value, output) == 0)
+               ? 0
+               : -1;
+}
+
+static int Jobs_IsValidJobId(const char *job_id)
+{
+    size_t index;
+    size_t length = strlen(job_id);
+
+    if ((length == 0U) || (length > AWS_JOBS_JOB_ID_MAX_LENGTH))
+    {
+        return 0;
+    }
+
+    for (index = 0U; index < length; index++)
+    {
+        char value = job_id[index];
+
+        if (!(((value >= 'a') && (value <= 'z')) ||
+              ((value >= 'A') && (value <= 'Z')) ||
+              ((value >= '0') && (value <= '9')) ||
+              (value == '-') || (value == '_')))
+        {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+static int Jobs_HexNibble(char value, uint8_t *output)
+{
+    if ((value >= '0') && (value <= '9'))
+    {
+        *output = (uint8_t)(value - '0');
+        return 0;
+    }
+
+    if ((value >= 'a') && (value <= 'f'))
+    {
+        *output = (uint8_t)(value - 'a' + 10);
+        return 0;
+    }
+
+    if ((value >= 'A') && (value <= 'F'))
+    {
+        *output = (uint8_t)(value - 'A' + 10);
+        return 0;
+    }
+
+    return -1;
+}
+
+static int Jobs_DecodeSha256(const char *hex,
+                             uint8_t output[FLASH_STAGING_SHA256_SIZE])
+{
+    size_t index;
+
+    if (strlen(hex) != AWS_JOBS_SHA256_HEX_LENGTH)
+    {
+        return -1;
+    }
+
+    for (index = 0U; index < FLASH_STAGING_SHA256_SIZE; index++)
+    {
+        uint8_t high;
+        uint8_t low;
+
+        if ((Jobs_HexNibble(hex[index * 2U], &high) != 0) ||
+            (Jobs_HexNibble(hex[(index * 2U) + 1U], &low) != 0))
+        {
+            return -1;
+        }
+
+        output[index] = (uint8_t)((high << 4U) | low);
+    }
+
+    return 0;
+}
+
+static int Jobs_IsValidHttpsUrl(const char *url)
+{
+    size_t index;
+
+    if ((strncmp(url, "https://", 8U) != 0) || (url[8] == '\0'))
+    {
+        return 0;
+    }
+
+    for (index = 0U; url[index] != '\0'; index++)
+    {
+        unsigned char value = (unsigned char)url[index];
+
+        if ((value <= 0x20U) || (value >= 0x7FU))
+        {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+static int Jobs_ValidateDocument(JsonSlice document,
+                                 AwsJobsArtifact *artifact,
+                                 const char **reason)
+{
+    JsonSlice artifact_object;
+    uint32_t schema_version;
+    char operation[AWS_JOBS_OPERATION_MAX_LENGTH + 1U];
+    char mode[AWS_JOBS_MODE_MAX_LENGTH + 1U];
+    char sha256_hex[AWS_JOBS_SHA256_HEX_LENGTH + 1U];
+    const FlashStagingInfo *staging_info = FlashStaging_GetInfo();
+
+    if ((Json_GetRequiredUInt32(document, "schemaVersion", &schema_version) != 0) ||
+        (schema_version != 1U))
+    {
+        *reason = "unsupported_schema";
+        return -1;
+    }
+
+    if ((Json_GetRequiredString(document,
+                                "operation",
+                                operation,
+                                sizeof(operation)) != 0) ||
+        (strcmp(operation, "stage-file") != 0))
+    {
+        *reason = "unsupported_operation";
+        return -1;
+    }
+
+    if ((Json_GetRequiredString(document, "mode", mode, sizeof(mode)) != 0) ||
+        (strcmp(mode, "validate-only") != 0))
+    {
+        *reason = "unsupported_mode";
+        return -1;
+    }
+
+    if (Json_GetRequiredObjectMember(document,
+                                     "artifact",
+                                     &artifact_object) != 0)
+    {
+        *reason = "invalid_artifact";
+        return -1;
+    }
+
+    if ((Json_GetRequiredString(artifact_object,
+                                "url",
+                                artifact->url,
+                                sizeof(artifact->url)) != 0) ||
+        !Jobs_IsValidHttpsUrl(artifact->url))
+    {
+        *reason = "invalid_https_url";
+        return -1;
+    }
+
+    if ((Json_GetRequiredUInt32(artifact_object,
+                                "size",
+                                &artifact->size_bytes) != 0) ||
+        (artifact->size_bytes == 0U) ||
+        (artifact->size_bytes > staging_info->capacity_bytes))
+    {
+        *reason = "invalid_artifact_size";
+        return -1;
+    }
+
+    if ((Json_GetRequiredString(artifact_object,
+                                "sha256",
+                                sha256_hex,
+                                sizeof(sha256_hex)) != 0) ||
+        (Jobs_DecodeSha256(sha256_hex, artifact->sha256) != 0))
+    {
+        *reason = "invalid_sha256";
+        return -1;
+    }
+
+    *reason = "document_valid";
+    return 0;
+}
+
+static void Jobs_ClearActiveExecution(void)
+{
+    jobs_context.execution_version = 0U;
+    jobs_context.active_job_id[0] = '\0';
+    jobs_context.pending_status[0] = '\0';
+}
+
+static void Jobs_ScheduleRetry(const char *reason)
+{
+    uint32_t delay_ms = AWS_JOBS_RETRY_BASE_MS;
+    uint8_t shift = jobs_context.retry_attempt;
+
+    if (shift > 3U)
+    {
+        shift = 3U;
+    }
+    delay_ms <<= shift;
+    if (delay_ms > AWS_JOBS_RETRY_MAX_MS)
+    {
+        delay_ms = AWS_JOBS_RETRY_MAX_MS;
+    }
+
+    if (jobs_context.retry_attempt < UINT8_MAX)
+    {
+        jobs_context.retry_attempt++;
+    }
+
+    jobs_context.retry_after_ms = HAL_GetTick() + delay_ms;
+    jobs_context.response_deadline_ms = 0U;
+    jobs_context.state = AWS_JOBS_STATE_PAUSED;
+    Jobs_Logf("JOBS: retry scheduled in %lu ms reason=%s",
+              (unsigned long)delay_ms,
+              reason);
+}
+
+static int Jobs_RequestNext(void)
+{
+    char payload[256];
+    int written;
+
+    if (jobs_context.state != AWS_JOBS_STATE_IDLE)
+    {
+        return 0;
+    }
+
+    jobs_context.token_counter++;
+    written = snprintf(payload,
+                       sizeof(payload),
+                       "{\"statusDetails\":{\"phase\":\"STARTING\"},"
+                       "\"stepTimeoutInMinutes\":%u,"
+                       "\"clientToken\":\"stm32-start-%lu\"}",
+                       (unsigned int)AWS_JOBS_STEP_TIMEOUT_MINUTES,
+                       (unsigned long)jobs_context.token_counter);
+
+    if ((written < 0) || ((size_t)written >= sizeof(payload)))
+    {
+        Jobs_Log("JOBS: start-next payload too large");
+        return -1;
+    }
+
+    if ((jobs_context.publish == NULL) ||
+        (jobs_context.publish(AWS_JOBS_TOPIC_START_NEXT, payload) != 0))
+    {
+        Jobs_Log("JOBS: start-next publish failed");
+        return -1;
+    }
+
+    jobs_context.state = AWS_JOBS_STATE_START_NEXT_PENDING;
+    jobs_context.response_deadline_ms = HAL_GetTick() + AWS_JOBS_RESPONSE_TIMEOUT_MS;
+    Jobs_Log("JOBS: start-next requested");
+    return 0;
+}
+
+static int Jobs_PublishTerminalStatus(const char *status,
+                                      const char *phase,
+                                      const char *detail)
+{
+    char topic[192];
+    char payload[512];
+    int topic_written;
+    int payload_written;
+
+    jobs_context.token_counter++;
+    topic_written = snprintf(topic,
+                             sizeof(topic),
+                             AWS_JOBS_BASE_TOPIC "/%s/update",
+                             jobs_context.active_job_id);
+    payload_written = snprintf(payload,
+                               sizeof(payload),
+                               "{\"status\":\"%s\",\"statusDetails\":{"
+                               "\"phase\":\"%s\",\"detail\":\"%s\"},"
+                               "\"expectedVersion\":%lu,"
+                               "\"includeJobExecutionState\":true,"
+                               "\"clientToken\":\"stm32-update-%lu\"}",
+                               status,
+                               phase,
+                               detail,
+                               (unsigned long)jobs_context.execution_version,
+                               (unsigned long)jobs_context.token_counter);
+
+    if ((topic_written < 0) || ((size_t)topic_written >= sizeof(topic)) ||
+        (payload_written < 0) || ((size_t)payload_written >= sizeof(payload)))
+    {
+        Jobs_Log("JOBS: update payload or topic too large");
+        return -1;
+    }
+
+    if ((jobs_context.publish == NULL) ||
+        (jobs_context.publish(topic, payload) != 0))
+    {
+        Jobs_Logf("JOBS: update publish failed job=%s",
+                  jobs_context.active_job_id);
+        return -1;
+    }
+
+    (void)snprintf(jobs_context.pending_status,
+                   sizeof(jobs_context.pending_status),
+                   "%s",
+                   status);
+    jobs_context.state = AWS_JOBS_STATE_UPDATE_PENDING;
+    jobs_context.response_deadline_ms = HAL_GetTick() + AWS_JOBS_RESPONSE_TIMEOUT_MS;
+    Jobs_Logf("JOBS: status=%s published job=%s",
+              status,
+              jobs_context.active_job_id);
+    return 0;
+}
+
+static int Jobs_HandleStartNextAccepted(const char *payload)
+{
+    JsonSlice root = { payload, payload + strlen(payload) };
+    JsonSlice execution;
+    JsonSlice document;
+    AwsJobsArtifact artifact;
+    const char *reason;
+    int member_result;
+
+    if (!Json_SliceIsObject(root))
+    {
+        Jobs_ScheduleRetry("invalid_start_response");
+        Jobs_Log("JOBS: invalid start-next response");
+        return 1;
+    }
+
+    member_result = Json_ObjectFind(root, "execution", &execution);
+    if ((member_result == JSON_MEMBER_NOT_FOUND) ||
+        ((member_result == JSON_MEMBER_FOUND) && Json_SliceIsNull(execution)))
+    {
+        jobs_context.state = AWS_JOBS_STATE_IDLE;
+        jobs_context.retry_attempt = 0U;
+        jobs_context.response_deadline_ms = 0U;
+        Jobs_ClearActiveExecution();
+        Jobs_Log("JOBS: no pending execution");
+        return 1;
+    }
+
+    if ((member_result != JSON_MEMBER_FOUND) || !Json_SliceIsObject(execution))
+    {
+        Jobs_ScheduleRetry("invalid_start_response");
+        Jobs_Log("JOBS: invalid start-next response");
+        return 1;
+    }
+
+    if ((Json_GetRequiredString(execution,
+                                "jobId",
+                                jobs_context.active_job_id,
+                                sizeof(jobs_context.active_job_id)) != 0) ||
+        !Jobs_IsValidJobId(jobs_context.active_job_id) ||
+        (Json_GetRequiredUInt32(execution,
+                                "versionNumber",
+                                &jobs_context.execution_version) != 0))
+    {
+        Jobs_ScheduleRetry("invalid_job_identity");
+        Jobs_Log("JOBS: invalid job identity or version");
+        return 1;
+    }
+
+    jobs_context.state = AWS_JOBS_STATE_EXECUTION_ACTIVE;
+    if (Json_GetRequiredObjectMember(execution, "jobDocument", &document) != 0)
+    {
+        Jobs_Logf("JOBS: rejected job=%s reason=missing_job_document",
+                  jobs_context.active_job_id);
+        return Jobs_PublishTerminalStatus("REJECTED",
+                                          "REJECTED",
+                                          "missing_job_document") == 0
+                   ? 1
+                   : -1;
+    }
+
+    memset(&artifact, 0, sizeof(artifact));
+    if (Jobs_ValidateDocument(document, &artifact, &reason) != 0)
+    {
+        Jobs_Logf("JOBS: rejected job=%s reason=%s",
+                  jobs_context.active_job_id,
+                  reason);
+        return Jobs_PublishTerminalStatus("REJECTED", "REJECTED", reason) == 0
+                   ? 1
+                   : -1;
+    }
+
+    Jobs_Logf("JOBS: validated job=%s artifactSize=%lu mode=validate-only",
+              jobs_context.active_job_id,
+              (unsigned long)artifact.size_bytes);
+    return Jobs_PublishTerminalStatus("SUCCEEDED",
+                                      "VALIDATED",
+                                      "document_valid") == 0
+               ? 1
+               : -1;
+}
+
+static int Jobs_TopicHasUpdateSuffix(const char *topic, const char *suffix)
+{
+    static const char prefix[] = AWS_JOBS_BASE_TOPIC "/";
+    const char *job_start;
+    const char *job_end;
+
+    if (strncmp(topic, prefix, sizeof(prefix) - 1U) != 0)
+    {
+        return 0;
+    }
+
+    job_start = topic + sizeof(prefix) - 1U;
+    job_end = strchr(job_start, '/');
+    if ((job_end == NULL) || (job_end == job_start))
+    {
+        return 0;
+    }
+
+    return strcmp(job_end, suffix) == 0;
+}
+
+static int Jobs_TopicMatchesActiveUpdate(const char *topic, const char *suffix)
+{
+    char expected[192];
+    int written;
+
+    if (jobs_context.active_job_id[0] == '\0')
+    {
+        return 0;
+    }
+
+    written = snprintf(expected,
+                       sizeof(expected),
+                       AWS_JOBS_BASE_TOPIC "/%s%s",
+                       jobs_context.active_job_id,
+                       suffix);
+    return (written >= 0) && ((size_t)written < sizeof(expected)) &&
+           (strcmp(topic, expected) == 0);
+}
+
+void AwsJobs_Init(AwsJobsPublishCallback publish_callback)
+{
+    memset(&jobs_context, 0, sizeof(jobs_context));
+    jobs_context.publish = publish_callback;
+    jobs_context.state = AWS_JOBS_STATE_IDLE;
+}
+
+size_t AwsJobs_SubscriptionCount(void)
+{
+    return sizeof(jobs_subscription_topics) / sizeof(jobs_subscription_topics[0]);
+}
+
+const char *AwsJobs_SubscriptionTopic(size_t index)
+{
+    return index < AwsJobs_SubscriptionCount()
+               ? jobs_subscription_topics[index]
+               : NULL;
+}
+
+int AwsJobs_OnMqttConnected(void)
+{
+    jobs_context.state = AWS_JOBS_STATE_IDLE;
+    jobs_context.retry_attempt = 0U;
+    jobs_context.retry_after_ms = 0U;
+    jobs_context.response_deadline_ms = 0U;
+    Jobs_ClearActiveExecution();
+    return Jobs_RequestNext();
+}
+
+void AwsJobs_OnMqttDisconnected(void)
+{
+    jobs_context.state = AWS_JOBS_STATE_IDLE;
+    jobs_context.retry_attempt = 0U;
+    jobs_context.retry_after_ms = 0U;
+    jobs_context.response_deadline_ms = 0U;
+    Jobs_ClearActiveExecution();
+}
+
+int AwsJobs_Process(void)
+{
+    if (((jobs_context.state == AWS_JOBS_STATE_START_NEXT_PENDING) ||
+         (jobs_context.state == AWS_JOBS_STATE_UPDATE_PENDING)) &&
+        ((int32_t)(HAL_GetTick() - jobs_context.response_deadline_ms) >= 0))
+    {
+        Jobs_ScheduleRetry("response_timeout");
+    }
+
+    if ((jobs_context.state == AWS_JOBS_STATE_PAUSED) &&
+        ((int32_t)(HAL_GetTick() - jobs_context.retry_after_ms) >= 0))
+    {
+        jobs_context.state = AWS_JOBS_STATE_IDLE;
+        Jobs_ClearActiveExecution();
+        return Jobs_RequestNext();
+    }
+
+    return 0;
+}
+
+int AwsJobs_HandleMessage(const char *topic, const char *payload)
+{
+    if ((topic == NULL) || (payload == NULL))
+    {
+        return 0;
+    }
+
+    if (strcmp(topic, AWS_JOBS_TOPIC_NOTIFY_NEXT) == 0)
+    {
+        Jobs_Log("JOBS: notify-next received");
+        if (jobs_context.state == AWS_JOBS_STATE_IDLE)
+        {
+            return Jobs_RequestNext() == 0 ? 1 : -1;
+        }
+        return 1;
+    }
+
+    if (strcmp(topic, AWS_JOBS_TOPIC_START_NEXT_ACCEPTED) == 0)
+    {
+        return Jobs_HandleStartNextAccepted(payload);
+    }
+
+    if (strcmp(topic, AWS_JOBS_TOPIC_START_NEXT_REJECTED) == 0)
+    {
+        Jobs_ClearActiveExecution();
+        Jobs_ScheduleRetry("start_next_rejected");
+        Jobs_Log("JOBS: start-next rejected by AWS");
+        return 1;
+    }
+
+    if (Jobs_TopicHasUpdateSuffix(topic, "/update/accepted"))
+    {
+        if ((jobs_context.state == AWS_JOBS_STATE_UPDATE_PENDING) &&
+            Jobs_TopicMatchesActiveUpdate(topic, "/update/accepted"))
+        {
+            Jobs_Logf("JOBS: status=%s accepted job=%s",
+                      jobs_context.pending_status,
+                      jobs_context.active_job_id);
+            jobs_context.state = AWS_JOBS_STATE_IDLE;
+            jobs_context.retry_attempt = 0U;
+            jobs_context.response_deadline_ms = 0U;
+            Jobs_ClearActiveExecution();
+            return Jobs_RequestNext() == 0 ? 1 : -1;
+        }
+
+        Jobs_Log("JOBS: ignored unexpected update/accepted");
+        return 1;
+    }
+
+    if (Jobs_TopicHasUpdateSuffix(topic, "/update/rejected"))
+    {
+        if (Jobs_TopicMatchesActiveUpdate(topic, "/update/rejected"))
+        {
+            Jobs_Logf("JOBS: status update rejected job=%s",
+                      jobs_context.active_job_id);
+            Jobs_ScheduleRetry("status_update_rejected");
+        }
+        else
+        {
+            Jobs_Log("JOBS: ignored unexpected update/rejected");
+        }
+        return 1;
+    }
+
+    return 0;
+}

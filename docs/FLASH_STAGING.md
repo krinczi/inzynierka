@@ -1,7 +1,7 @@
 # Flash staging for AWS IoT Jobs
 
-Status: storage foundation implemented; network download and AWS Jobs state
-machine are the next integration stage.
+Status: storage foundation and AWS IoT Jobs control plane implemented; HTTPS
+artifact download is the next integration stage.
 
 ## Memory layout
 

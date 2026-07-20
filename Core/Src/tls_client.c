@@ -1,4 +1,5 @@
 #include "tls_client.h"
+#include "aws_jobs.h"
 #include "aws_iot_config.h"
 #include "mqtt_topics.h"
 #include "aws_certs.h"
@@ -61,7 +62,8 @@
 #define TLS_SOCKET_IO_TIMEOUT_US       10000L
 #define TLS_SOCKET_IO_MAX_CHUNK        1024U
 
-#define MQTT_RX_BUFFER_SIZE            1024U
+#define MQTT_RX_BUFFER_SIZE            2048U
+#define MQTT_INCOMING_PAYLOAD_SIZE     1792U
 #define MQTT_JSON_BUFFER_SIZE          768U
 
 #ifndef STM32_APP_FIRMWARE_VERSION
@@ -106,6 +108,11 @@ static uint32_t mqtt_last_ping_ms = 0U;
 static uint16_t mqtt_negotiated_keep_alive_seconds = 60U;
 static uint8_t mqtt_rx_buffer[MQTT_RX_BUFFER_SIZE];
 static size_t mqtt_rx_length = 0U;
+static uint16_t mqtt_expected_suback_packet_id = 0U;
+static int mqtt_suback_result = 0;
+
+static int mqtt_process_rx_buffer(void);
+static int mqtt_read_available(void);
 
 typedef struct
 {
@@ -1303,11 +1310,11 @@ static int mqtt_send_connect(void)
 static int mqtt_subscribe_topic(const char *topic, uint16_t packet_id)
 {
     uint8_t pkt[256];
-    uint8_t suback[5];
     size_t topic_len = strlen(topic);
     size_t remaining = 2U + 2U + topic_len + 1U;
     size_t rem_len;
     size_t pos;
+    uint32_t wait_started_ms;
 
     if (remaining > 127U)
     {
@@ -1330,29 +1337,37 @@ static int mqtt_subscribe_topic(const char *topic, uint16_t packet_id)
 
     tls_logf("MQTT: SUBSCRIBE %s", topic);
 
+    mqtt_expected_suback_packet_id = packet_id;
+    mqtt_suback_result = 0;
+
     if (tls_write_all(pkt, pos, 5000U) != 0)
     {
+        mqtt_expected_suback_packet_id = 0U;
         return -1;
     }
 
-    if (tls_read_exact(suback, sizeof(suback), 5000U) != 0)
+    wait_started_ms = HAL_GetTick();
+    while (mqtt_suback_result == 0)
     {
-        tls_log("MQTT: SUBACK read failed");
-        return -1;
+        if (mqtt_read_available() != 0)
+        {
+            mqtt_expected_suback_packet_id = 0U;
+            tls_log("MQTT: SUBACK read failed");
+            return -1;
+        }
+
+        if ((HAL_GetTick() - wait_started_ms) >= 5000U)
+        {
+            mqtt_expected_suback_packet_id = 0U;
+            tls_log("MQTT: SUBACK timeout");
+            return -1;
+        }
+
+        osDelay(10U);
     }
 
-    tls_logf("MQTT: SUBACK %02X %02X %02X %02X %02X",
-             suback[0],
-             suback[1],
-             suback[2],
-             suback[3],
-             suback[4]);
-
-    if ((suback[0] != 0x90U) ||
-        (suback[1] != 0x03U) ||
-        (suback[2] != (uint8_t)((packet_id >> 8U) & 0xFFU)) ||
-        (suback[3] != (uint8_t)(packet_id & 0xFFU)) ||
-        (suback[4] == 0x80U))
+    mqtt_expected_suback_packet_id = 0U;
+    if (mqtt_suback_result < 0)
     {
         tls_log("MQTT: SUBSCRIBE refused");
         return -1;
@@ -2135,8 +2150,9 @@ static int mqtt_handle_publish_packet(const uint8_t *packet,
     size_t payload_length;
     uint8_t qos = (uint8_t)((packet[0] >> 1U) & 0x03U);
     uint16_t packet_id = 0U;
+    int jobs_result;
     char topic[160];
-    char payload[MQTT_JSON_BUFFER_SIZE];
+    char payload[MQTT_INCOMING_PAYLOAD_SIZE];
 
     if ((pos + 2U) > packet_length)
     {
@@ -2182,7 +2198,17 @@ static int mqtt_handle_publish_packet(const uint8_t *packet,
     payload[payload_length] = '\0';
     tls_logf("MQTT: received PUBLISH %s", topic);
 
-    if (strcmp(topic, MQTT_TOPIC_CMD) == 0)
+    jobs_result = AwsJobs_HandleMessage(topic, payload);
+    if (jobs_result < 0)
+    {
+        return -1;
+    }
+
+    if (jobs_result > 0)
+    {
+        /* Handled by the AWS IoT Jobs state machine. */
+    }
+    else if (strcmp(topic, MQTT_TOPIC_CMD) == 0)
     {
         if (mqtt_handle_command(payload) != 0)
         {
@@ -2210,6 +2236,53 @@ static int mqtt_handle_publish_packet(const uint8_t *packet,
         {
             return -1;
         }
+    }
+
+    return 0;
+}
+
+static int mqtt_handle_suback_packet(const uint8_t *packet,
+                                     size_t packet_length,
+                                     size_t header_length)
+{
+    uint16_t packet_id;
+    uint8_t return_code;
+
+    if ((packet_length - header_length) != 3U)
+    {
+        tls_log("MQTT: invalid SUBACK length");
+        return -1;
+    }
+
+    packet_id = ((uint16_t)packet[header_length] << 8U) |
+                packet[header_length + 1U];
+    return_code = packet[header_length + 2U];
+
+    tls_logf("MQTT: SUBACK packetId=%u code=%u",
+             (unsigned int)packet_id,
+             (unsigned int)return_code);
+
+    if ((mqtt_expected_suback_packet_id == 0U) ||
+        (packet_id != mqtt_expected_suback_packet_id))
+    {
+        tls_log("MQTT: unexpected SUBACK ignored");
+        return 0;
+    }
+
+    if ((return_code == 0x00U) ||
+        (return_code == 0x01U) ||
+        (return_code == 0x02U))
+    {
+        mqtt_suback_result = 1;
+    }
+    else if (return_code == 0x80U)
+    {
+        mqtt_suback_result = -1;
+    }
+    else
+    {
+        tls_log("MQTT: invalid SUBACK return code");
+        return -1;
     }
 
     return 0;
@@ -2255,6 +2328,15 @@ static int mqtt_process_rx_buffer(void)
             if (mqtt_handle_publish_packet(mqtt_rx_buffer,
                                            packet_length,
                                            header_length) != 0)
+            {
+                return -1;
+            }
+        }
+        else if ((mqtt_rx_buffer[0] & 0xF0U) == 0x90U)
+        {
+            if (mqtt_handle_suback_packet(mqtt_rx_buffer,
+                                          packet_length,
+                                          header_length) != 0)
             {
                 return -1;
             }
@@ -2323,6 +2405,8 @@ static int mqtt_send_ping(void)
 
 int TlsClient_MqttTest(void)
 {
+    size_t jobs_subscription_index;
+
     if (!tls_connected)
     {
         tls_log("MQTT: refused, TLS not connected");
@@ -2349,6 +2433,22 @@ int TlsClient_MqttTest(void)
         return -1;
     }
 
+    AwsJobs_Init(mqtt_publish_json);
+    for (jobs_subscription_index = 0U;
+         jobs_subscription_index < AwsJobs_SubscriptionCount();
+         jobs_subscription_index++)
+    {
+        const char *topic = AwsJobs_SubscriptionTopic(jobs_subscription_index);
+        uint16_t packet_id = (uint16_t)(3U + jobs_subscription_index);
+
+        if ((topic == NULL) ||
+            (mqtt_subscribe_topic(topic, packet_id) != 0))
+        {
+            tls_log("MQTT: AWS Jobs SUBSCRIBE failed");
+            return -1;
+        }
+    }
+
     if (mqtt_publish_status() != 0)
     {
         tls_log("MQTT: PUBLISH failed");
@@ -2369,13 +2469,18 @@ int TlsClient_MqttTest(void)
         return -1;
     }
 
+    if (AwsJobs_OnMqttConnected() != 0)
+    {
+        tls_log("MQTT: AWS Jobs start-next failed");
+        return -1;
+    }
+
     (void)IotEvents_QueueDiagnostic(IOT_DIAGNOSTIC_INFO,
                                     "MQTT",
                                     "MQTT_CONNECTED",
                                     "Connection with AWS IoT established");
 
     mqtt_ready = 1;
-    mqtt_rx_length = 0U;
     mqtt_last_telemetry_ms = HAL_GetTick();
     mqtt_last_ping_ms = HAL_GetTick();
     HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
@@ -2397,6 +2502,12 @@ int TlsClient_MqttProcess(void)
     }
 
     if (mqtt_read_available() != 0)
+    {
+        mqtt_ready = 0;
+        return -1;
+    }
+
+    if (AwsJobs_Process() != 0)
     {
         mqtt_ready = 0;
         return -1;
@@ -2444,7 +2555,10 @@ int TlsClient_MqttIsReady(void)
 void TlsClient_Disconnect(void)
 {
     tls_log("TLS: disconnect");
+    AwsJobs_OnMqttDisconnected();
     mqtt_ready = 0;
     mqtt_rx_length = 0U;
+    mqtt_expected_suback_packet_id = 0U;
+    mqtt_suback_result = 0;
     tls_ctx_free_all();
 }
