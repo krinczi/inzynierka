@@ -104,9 +104,17 @@ static int net_would_block( const mbedtls_net_context *ctx );
 void mbedtls_net_init( mbedtls_net_context *ctx )
 {
 /* USER CODE BEGIN 0 */
-
+  /*
+   * LwIP is owned and initialized exactly once by StartDefaultTask.
+   * A network-context initializer must only reset its own descriptor; calling
+   * MX_LWIP_Init() here would add gnetif for every TLS connection and trigger
+   * the LwIP "netif already added" assertion.
+   */
+  if( ctx != NULL )
+  {
+    ctx->fd = -1;
+  }
 /* USER CODE END 0 */
-  MX_LWIP_Init();
 /* USER CODE BEGIN 1 */
 
 /* USER CODE END 1 */

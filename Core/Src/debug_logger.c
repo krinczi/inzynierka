@@ -49,6 +49,103 @@ static uint8_t DebugLogger_SourceIsValid(DebugSource_t source)
     return ((uint32_t)source < (uint32_t)DEBUG_SRC_COUNT) ? 1U : 0U;
 }
 
+static void DebugLogger_AppendChar(char *buffer,
+                                   size_t capacity,
+                                   size_t *length,
+                                   char value)
+{
+    if ((*length + 1U) < capacity)
+    {
+        buffer[*length] = value;
+        (*length)++;
+        buffer[*length] = '\0';
+    }
+}
+
+static void DebugLogger_AppendBytes(char *buffer,
+                                    size_t capacity,
+                                    size_t *length,
+                                    const char *value,
+                                    size_t value_length)
+{
+    size_t index;
+
+    if (value == NULL)
+    {
+        value = "(null)";
+        value_length = sizeof("(null)") - 1U;
+    }
+
+    for (index = 0U; index < value_length; index++)
+    {
+        DebugLogger_AppendChar(buffer, capacity, length, value[index]);
+    }
+}
+
+static void DebugLogger_AppendString(char *buffer,
+                                     size_t capacity,
+                                     size_t *length,
+                                     const char *value)
+{
+    size_t value_length = 0U;
+
+    if (value == NULL)
+    {
+        value = "(null)";
+    }
+
+    while (value[value_length] != '\0')
+    {
+        value_length++;
+    }
+
+    DebugLogger_AppendBytes(buffer, capacity, length, value, value_length);
+}
+
+static void DebugLogger_AppendUnsigned(char *buffer,
+                                       size_t capacity,
+                                       size_t *length,
+                                       uint32_t value)
+{
+    char digits[10];
+    size_t digit_count = 0U;
+
+    do
+    {
+        digits[digit_count] = (char)('0' + (value % 10U));
+        digit_count++;
+        value /= 10U;
+    }
+    while ((value != 0U) && (digit_count < sizeof(digits)));
+
+    while (digit_count > 0U)
+    {
+        digit_count--;
+        DebugLogger_AppendChar(buffer, capacity, length, digits[digit_count]);
+    }
+}
+
+static uint16_t DebugLogger_FormatCounterMessage(char *buffer,
+                                                 size_t capacity,
+                                                 const char *prefix,
+                                                 uint32_t value,
+                                                 const char *suffix)
+{
+    size_t length = 0U;
+
+    if (capacity == 0U)
+    {
+        return 0U;
+    }
+
+    buffer[0] = '\0';
+    DebugLogger_AppendString(buffer, capacity, &length, prefix);
+    DebugLogger_AppendUnsigned(buffer, capacity, &length, value);
+    DebugLogger_AppendString(buffer, capacity, &length, suffix);
+
+    return (uint16_t)length;
+}
+
 static size_t DebugLogger_CopyLine(char *dst, size_t dst_len, const char *src)
 {
     size_t len = 0U;
@@ -162,26 +259,34 @@ static void DebugLogger_TransmitBuffer(size_t len)
 static void DebugLogger_TransmitLine(DebugSource_t source,
                                      const DebugLogMessage_t *message)
 {
-    int len;
+    size_t length = 0U;
+    size_t text_length = message->len;
 
-    len = snprintf((char *)debug_tx_buf,
-                   sizeof(debug_tx_buf),
-                   "[%lu][%s] %s\r\n",
-                   (unsigned long)message->tick,
-                   debug_source_tags[(uint32_t)source],
-                   message->text);
-
-    if (len < 0)
+    if (text_length >= sizeof(message->text))
     {
-        return;
+        text_length = sizeof(message->text) - 1U;
     }
 
-    if ((size_t)len >= sizeof(debug_tx_buf))
-    {
-        len = (int)(sizeof(debug_tx_buf) - 1U);
-    }
+    debug_tx_buf[0] = '\0';
+    DebugLogger_AppendChar((char *)debug_tx_buf, sizeof(debug_tx_buf), &length, '[');
+    DebugLogger_AppendUnsigned((char *)debug_tx_buf,
+                               sizeof(debug_tx_buf),
+                               &length,
+                               message->tick);
+    DebugLogger_AppendString((char *)debug_tx_buf, sizeof(debug_tx_buf), &length, "][");
+    DebugLogger_AppendString((char *)debug_tx_buf,
+                             sizeof(debug_tx_buf),
+                             &length,
+                             debug_source_tags[(uint32_t)source]);
+    DebugLogger_AppendString((char *)debug_tx_buf, sizeof(debug_tx_buf), &length, "] ");
+    DebugLogger_AppendBytes((char *)debug_tx_buf,
+                            sizeof(debug_tx_buf),
+                            &length,
+                            message->text,
+                            text_length);
+    DebugLogger_AppendString((char *)debug_tx_buf, sizeof(debug_tx_buf), &length, "\r\n");
 
-    DebugLogger_TransmitBuffer((size_t)len);
+    DebugLogger_TransmitBuffer(length);
 }
 
 static void DebugLogger_ReportDropped(void)
@@ -199,14 +304,12 @@ static void DebugLogger_ReportDropped(void)
 
             debug_reported_dropped[i] = current;
             message.tick = HAL_GetTick();
-            message.len = (uint16_t)snprintf(message.text,
-                                             sizeof(message.text),
-                                             "debug queue dropped %lu log(s)",
-                                             (unsigned long)delta);
-            if (message.len >= sizeof(message.text))
-            {
-                message.len = sizeof(message.text) - 1U;
-            }
+            message.len = DebugLogger_FormatCounterMessage(
+                message.text,
+                sizeof(message.text),
+                "debug queue dropped ",
+                delta,
+                " log(s)");
 
             DebugLogger_TransmitLine((DebugSource_t)i, &message);
         }
@@ -219,14 +322,12 @@ static void DebugLogger_ReportDropped(void)
 
         debug_reported_uart_errors = debug_uart_errors;
         message.tick = HAL_GetTick();
-        message.len = (uint16_t)snprintf(message.text,
-                                         sizeof(message.text),
-                                         "uart transmit error/drop %lu time(s)",
-                                         (unsigned long)delta);
-        if (message.len >= sizeof(message.text))
-        {
-            message.len = sizeof(message.text) - 1U;
-        }
+        message.len = DebugLogger_FormatCounterMessage(
+            message.text,
+            sizeof(message.text),
+            "uart transmit error/drop ",
+            delta,
+            " time(s)");
 
         DebugLogger_TransmitLine(DEBUG_SRC_SYSTEM, &message);
     }
