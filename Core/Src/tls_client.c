@@ -4,6 +4,7 @@
 #include "aws_certs.h"
 #include "debug_logger.h"
 #include "device_config.h"
+#include "iot_events.h"
 #include "main.h"
 
 #include <string.h>
@@ -350,6 +351,7 @@ int TlsClient_Init(void)
     tls_connected = 0;
     tls_ctx_ready = 0;
     DeviceConfig_Init();
+    IotEvents_Init();
     config = DeviceConfig_Get();
     tls_logf("CONFIG: loaded version=%lu telemetry=%lus keepalive=%lus",
              (unsigned long)config->config_version,
@@ -1538,6 +1540,89 @@ static int mqtt_publish_telemetry(void)
     return mqtt_publish_json(MQTT_TOPIC_TELEMETRY, payload);
 }
 
+static int mqtt_publish_queued_event(const IotEventMessage *event)
+{
+    char payload[MQTT_JSON_BUFFER_SIZE];
+    const DeviceConfig *config = DeviceConfig_Get();
+    int written;
+
+    if (event == NULL)
+    {
+        return -1;
+    }
+
+    if (event->type == IOT_MESSAGE_ALERT)
+    {
+        written = snprintf(payload,
+                           sizeof(payload),
+                           "{\"deviceId\":\"%s\",\"schemaVersion\":%u,"
+                           "\"eventId\":\"%s\",\"severity\":\"%s\","
+                           "\"code\":\"%s\",\"message\":\"%s\","
+                           "\"uptimeMs\":%lu,\"configVersion\":%lu,"
+                           "\"suppressedCount\":%lu}",
+                           MQTT_DEVICE_ID,
+                           IOT_EVENT_SCHEMA_VERSION,
+                           event->message_id,
+                           IotEvents_SeverityName(event->level),
+                           event->code,
+                           event->message,
+                           (unsigned long)event->uptime_ms,
+                           (unsigned long)config->config_version,
+                           (unsigned long)event->suppressed_count);
+    }
+    else
+    {
+        written = snprintf(payload,
+                           sizeof(payload),
+                           "{\"deviceId\":\"%s\",\"schemaVersion\":%u,"
+                           "\"logId\":\"%s\",\"level\":\"%s\","
+                           "\"source\":\"%s\",\"code\":\"%s\","
+                           "\"message\":\"%s\",\"uptimeMs\":%lu,"
+                           "\"configVersion\":%lu,\"suppressedCount\":%lu}",
+                           MQTT_DEVICE_ID,
+                           IOT_EVENT_SCHEMA_VERSION,
+                           event->message_id,
+                           IotEvents_DiagnosticLevelName(event->level),
+                           event->source,
+                           event->code,
+                           event->message,
+                           (unsigned long)event->uptime_ms,
+                           (unsigned long)config->config_version,
+                           (unsigned long)event->suppressed_count);
+    }
+
+    if ((written < 0) || ((size_t)written >= sizeof(payload)))
+    {
+        tls_log("MQTT EVENT: JSON too large");
+        return -1;
+    }
+
+    return mqtt_publish_json((event->type == IOT_MESSAGE_ALERT)
+                                 ? MQTT_TOPIC_ALERTS
+                                 : MQTT_TOPIC_DIAGNOSTICS,
+                             payload);
+}
+
+static int mqtt_flush_queued_events(void)
+{
+    unsigned int publish_budget = 2U;
+
+    while ((publish_budget > 0U) && (IotEvents_PendingCount() > 0U))
+    {
+        const IotEventMessage *event = IotEvents_Peek();
+
+        if (mqtt_publish_queued_event(event) != 0)
+        {
+            return -1;
+        }
+
+        IotEvents_Pop();
+        publish_budget--;
+    }
+
+    return 0;
+}
+
 static const char *json_value_start(const char *json, const char *key)
 {
     char pattern[48];
@@ -1850,6 +1935,7 @@ static int mqtt_reject_config(uint32_t request_version, const char *reason)
     tls_logf("MQTT CONFIG: rejected request=%lu reason=%s",
              (unsigned long)request_version,
              reason);
+    (void)IotEvents_QueueAlert(IOT_ALERT_WARNING, "CONFIG_REJECTED", reason);
     return mqtt_publish_reported_config(request_version, "REJECTED", reason);
 }
 
@@ -1928,6 +2014,10 @@ static int mqtt_handle_desired_config(const char *payload)
             tls_logf("MQTT CONFIG: applied version=%lu telemetry=%lus",
                      (unsigned long)candidate.config_version,
                      (unsigned long)candidate.telemetry_frequency_seconds);
+            (void)IotEvents_QueueDiagnostic(IOT_DIAGNOSTIC_INFO,
+                                            "CONFIG",
+                                            "CONFIG_APPLIED",
+                                            "Device configuration applied");
             return mqtt_publish_reported_config(request_version,
                                                 "APPLIED",
                                                 "Configuration applied");
@@ -1944,6 +2034,9 @@ static int mqtt_handle_desired_config(const char *payload)
             return mqtt_reject_config(request_version, "configVersion conflict");
 
         case DEVICE_CONFIG_PERSISTENCE_ERROR:
+            (void)IotEvents_QueueAlert(IOT_ALERT_CRITICAL,
+                                       "FLASH_WRITE_FAILED",
+                                       "Configuration could not be persisted to Flash");
             return mqtt_reject_config(request_version, "Flash persistence failed");
 
         case DEVICE_CONFIG_REJECTED_INVALID:
@@ -2260,6 +2353,11 @@ int TlsClient_MqttTest(void)
         return -1;
     }
 
+    (void)IotEvents_QueueDiagnostic(IOT_DIAGNOSTIC_INFO,
+                                    "MQTT",
+                                    "MQTT_CONNECTED",
+                                    "Connection with AWS IoT established");
+
     mqtt_ready = 1;
     mqtt_rx_length = 0U;
     mqtt_last_telemetry_ms = HAL_GetTick();
@@ -2283,6 +2381,12 @@ int TlsClient_MqttProcess(void)
     }
 
     if (mqtt_read_available() != 0)
+    {
+        mqtt_ready = 0;
+        return -1;
+    }
+
+    if (mqtt_flush_queued_events() != 0)
     {
         mqtt_ready = 0;
         return -1;

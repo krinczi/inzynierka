@@ -27,6 +27,7 @@
 #include "net_debug_server.h"
 #include "tls_client.h"
 #include "debug_logger.h"
+#include "iot_events.h"
 #include "lwip/netif.h"
 #include "lwip/dhcp.h"
 #include "lwip/ip4_addr.h"
@@ -1077,12 +1078,19 @@ void StartDefaultTask(void *argument)
         if (!netif_is_link_up(&gnetif))
         {
             NET_LOG("NET: link DOWN, waiting again...");
+            (void)IotEvents_QueueAlert(IOT_ALERT_WARNING,
+                                       "ETHERNET_LINK_LOST",
+                                       "Ethernet link was lost");
 
             if (Net_WaitForLink() == 0)
             {
                 Net_SetStaticIp();
                 osDelay(1000);
                 NET_LOG("NET: ready for ping test after reconnect");
+                (void)IotEvents_QueueDiagnostic(IOT_DIAGNOSTIC_INFO,
+                                                "ETHERNET",
+                                                "ETHERNET_LINK_RESTORED",
+                                                "Ethernet link was restored");
             }
         }
 
@@ -1113,12 +1121,18 @@ void StartDefaultTask(void *argument)
                 else
                 {
                     SYS_LOG("MQTT TEST: FAIL");
+                    (void)IotEvents_QueueAlert(IOT_ALERT_WARNING,
+                                               "MQTT_CONNECT_FAILED",
+                                               "MQTT session could not be established");
                     TlsClient_Disconnect();
                 }
             }
             else
             {
                 SYS_LOG("TLS TEST: HANDSHAKE FAIL");
+                (void)IotEvents_QueueAlert(IOT_ALERT_WARNING,
+                                           "TLS_HANDSHAKE_FAILED",
+                                           "TLS handshake with AWS IoT failed");
             }
         }
 
@@ -1129,6 +1143,9 @@ void StartDefaultTask(void *argument)
                 (TlsClient_MqttProcess() != 0))
             {
                 SYS_LOG("MQTT: session lost, reconnect scheduled");
+                (void)IotEvents_QueueAlert(IOT_ALERT_WARNING,
+                                           "MQTT_SESSION_LOST",
+                                           "MQTT session was lost; reconnect scheduled");
                 TlsClient_Disconnect();
                 mqtt_ready = 0;
                 mqtt_retry_after_ms = HAL_GetTick() + 5000U;

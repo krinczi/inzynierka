@@ -1,0 +1,74 @@
+#ifndef INC_IOT_EVENTS_H_
+#define INC_IOT_EVENTS_H_
+
+#include <stddef.h>
+#include <stdint.h>
+
+#define IOT_EVENT_SCHEMA_VERSION       1U
+#define IOT_EVENT_QUEUE_CAPACITY       8U
+#define IOT_EVENT_ID_CAPACITY          32U
+#define IOT_EVENT_CODE_CAPACITY        40U
+#define IOT_EVENT_SOURCE_CAPACITY      24U
+#define IOT_EVENT_MESSAGE_CAPACITY     385U
+
+typedef enum
+{
+    IOT_MESSAGE_ALERT = 0,
+    IOT_MESSAGE_DIAGNOSTIC
+} IotMessageType;
+
+typedef enum
+{
+    IOT_ALERT_INFO = 0,
+    IOT_ALERT_WARNING,
+    IOT_ALERT_ALARM,
+    IOT_ALERT_CRITICAL
+} IotAlertSeverity;
+
+/* Values intentionally match DeviceLogLevel from device_config.h. */
+typedef enum
+{
+    IOT_DIAGNOSTIC_ERROR = 0,
+    IOT_DIAGNOSTIC_WARN,
+    IOT_DIAGNOSTIC_INFO,
+    IOT_DIAGNOSTIC_DEBUG,
+    IOT_DIAGNOSTIC_TRACE
+} IotDiagnosticLevel;
+
+typedef enum
+{
+    IOT_EVENT_QUEUED = 0,
+    IOT_EVENT_SUPPRESSED,
+    IOT_EVENT_FILTERED,
+    IOT_EVENT_QUEUE_FULL,
+    IOT_EVENT_INVALID
+} IotEventResult;
+
+typedef struct
+{
+    IotMessageType type;
+    uint8_t level;
+    uint32_t uptime_ms;
+    uint32_t suppressed_count;
+    char message_id[IOT_EVENT_ID_CAPACITY];
+    char code[IOT_EVENT_CODE_CAPACITY];
+    char source[IOT_EVENT_SOURCE_CAPACITY];
+    char message[IOT_EVENT_MESSAGE_CAPACITY];
+} IotEventMessage;
+
+void IotEvents_Init(void);
+IotEventResult IotEvents_QueueAlert(IotAlertSeverity severity,
+                                    const char *code,
+                                    const char *message);
+IotEventResult IotEvents_QueueDiagnostic(IotDiagnosticLevel level,
+                                         const char *source,
+                                         const char *code,
+                                         const char *message);
+const IotEventMessage *IotEvents_Peek(void);
+void IotEvents_Pop(void);
+size_t IotEvents_PendingCount(void);
+uint32_t IotEvents_DroppedCount(void);
+const char *IotEvents_SeverityName(uint8_t severity);
+const char *IotEvents_DiagnosticLevelName(uint8_t level);
+
+#endif /* INC_IOT_EVENTS_H_ */
