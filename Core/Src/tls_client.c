@@ -70,6 +70,12 @@
     (5U + 2U + (MQTT_TOPIC_BUFFER_SIZE - 1U) + 2U)
 #define MQTT_JSON_BUFFER_SIZE          768U
 
+#define INTERACTION_DURATION_DEFAULT_SECONDS 300U
+#define INTERACTION_DURATION_MIN_SECONDS      30U
+#define INTERACTION_DURATION_MAX_SECONDS      1800U
+#define INTERACTION_TELEMETRY_INTERVAL_MS     5000U
+#define INTERACTION_DIAGNOSTIC_INTERVAL_MS    10000U
+
 #if (MQTT_INCOMING_PAYLOAD_SIZE + MQTT_MAX_PUBLISH_OVERHEAD) > MQTT_RX_BUFFER_SIZE
 #error "MQTT incoming payload and publish overhead exceed the RX buffer"
 #endif
@@ -114,6 +120,11 @@ static int mqtt_ready = 0;
 static uint32_t mqtt_last_telemetry_ms = 0U;
 static uint32_t mqtt_last_ping_ms = 0U;
 static uint16_t mqtt_negotiated_keep_alive_seconds = 60U;
+static uint8_t mqtt_interaction_active = 0U;
+static uint8_t mqtt_interaction_expiry_pending = 0U;
+static uint32_t mqtt_interaction_deadline_ms = 0U;
+static uint32_t mqtt_last_interaction_diagnostic_ms = 0U;
+static uint32_t mqtt_interaction_sequence = 0U;
 static uint8_t mqtt_rx_buffer[MQTT_RX_BUFFER_SIZE];
 static size_t mqtt_rx_length = 0U;
 static uint16_t mqtt_expected_suback_packet_id = 0U;
@@ -365,9 +376,14 @@ int TlsClient_Init(void)
     FlashStagingResult staging_result;
 
     tls_log("TLS: init");
-    tls_log("TLS BUILD: mqtt_config_v1 dual_slot_flash jobs_https_v6");
+    tls_log("TLS BUILD: mqtt_config_v1 dual_slot_flash jobs_https_v6 interaction_v1");
     tls_connected = 0;
     tls_ctx_ready = 0;
+    mqtt_interaction_active = 0U;
+    mqtt_interaction_expiry_pending = 0U;
+    mqtt_interaction_deadline_ms = 0U;
+    mqtt_last_interaction_diagnostic_ms = 0U;
+    mqtt_interaction_sequence = 0U;
     DeviceConfig_Init();
     IotEvents_Init();
     staging_result = FlashStaging_Init();
@@ -1443,19 +1459,97 @@ static int mqtt_publish_json(const char *topic, const char *payload)
     return 0;
 }
 
+static int mqtt_interaction_deadline_reached(uint32_t now)
+{
+    return mqtt_interaction_active &&
+           ((int32_t)(now - mqtt_interaction_deadline_ms) >= 0);
+}
+
+static int mqtt_interaction_refresh(uint32_t now)
+{
+    if (!mqtt_interaction_deadline_reached(now))
+    {
+        return 0;
+    }
+
+    mqtt_interaction_active = 0U;
+    mqtt_interaction_deadline_ms = 0U;
+    mqtt_interaction_expiry_pending = 1U;
+    tls_log("INTERACTION: expired, normal mode restored");
+    return 1;
+}
+
+static uint32_t mqtt_interaction_remaining_seconds(uint32_t now)
+{
+    uint32_t remaining_ms;
+
+    (void)mqtt_interaction_refresh(now);
+    if (!mqtt_interaction_active)
+    {
+        return 0U;
+    }
+
+    remaining_ms = mqtt_interaction_deadline_ms - now;
+    return (remaining_ms + 999U) / 1000U;
+}
+
+static int mqtt_publish_interaction_diagnostic(const char *code,
+                                                const char *message,
+                                                uint32_t now)
+{
+    char payload[MQTT_JSON_BUFFER_SIZE];
+    const DeviceConfig *config = DeviceConfig_Get();
+    int written;
+
+    mqtt_interaction_sequence++;
+    written = snprintf(payload,
+                       sizeof(payload),
+                       "{\"deviceId\":\"%s\",\"schemaVersion\":1,"
+                       "\"logId\":\"interaction-%08lx-%04lx\","
+                       "\"level\":\"DEBUG\",\"source\":\"INTERACTION\","
+                       "\"code\":\"%s\",\"message\":\"%s\","
+                       "\"uptimeMs\":%lu,\"configVersion\":%lu,"
+                       "\"suppressedCount\":0}",
+                       MQTT_DEVICE_ID,
+                       (unsigned long)now,
+                       (unsigned long)(mqtt_interaction_sequence & 0xFFFFU),
+                       code,
+                       message,
+                       (unsigned long)now,
+                       (unsigned long)config->config_version);
+
+    if ((written < 0) || ((size_t)written >= sizeof(payload)))
+    {
+        tls_log("INTERACTION: diagnostic JSON too large");
+        return -1;
+    }
+
+    return mqtt_publish_json(MQTT_TOPIC_DIAGNOSTICS, payload);
+}
+
 static int mqtt_publish_status(void)
 {
-    char payload[256];
+    char payload[384];
+    uint32_t now = HAL_GetTick();
+    uint32_t remaining_seconds = mqtt_interaction_remaining_seconds(now);
     int written;
 
     written = snprintf(payload,
                        sizeof(payload),
                        "{\"deviceId\":\"%s\",\"schemaVersion\":1,"
                        "\"state\":\"online\",\"uptimeMs\":%lu,"
-                       "\"firmwareVersion\":\"%s\"}",
+                       "\"firmwareVersion\":\"%s\","
+                       "\"interaction\":{\"active\":%s,"
+                       "\"remainingSeconds\":%lu,"
+                       "\"telemetryIntervalSeconds\":%lu,"
+                       "\"diagnosticsIntervalSeconds\":%lu}}",
                        MQTT_DEVICE_ID,
-                       (unsigned long)HAL_GetTick(),
-                       STM32_APP_FIRMWARE_VERSION);
+                       (unsigned long)now,
+                       STM32_APP_FIRMWARE_VERSION,
+                       mqtt_interaction_active ? "true" : "false",
+                       (unsigned long)remaining_seconds,
+                       (unsigned long)(INTERACTION_TELEMETRY_INTERVAL_MS / 1000U),
+                       (unsigned long)(INTERACTION_DIAGNOSTIC_INTERVAL_MS / 1000U));
 
     if ((written < 0) || ((size_t)written >= sizeof(payload)))
     {
@@ -1583,7 +1677,11 @@ static int mqtt_publish_telemetry(void)
         return -1;
     }
 
-    if (mqtt_json_append(payload, sizeof(payload), &length, "}") != 0)
+    if (mqtt_json_append(payload,
+                         sizeof(payload),
+                         &length,
+                         ",\"interactionMode\":%s}",
+                         mqtt_interaction_active ? "true" : "false") != 0)
     {
         return -1;
     }
@@ -2100,6 +2198,8 @@ static int mqtt_handle_command(const char *payload)
 {
     char command_id[96];
     char command_type[48];
+    uint32_t now;
+    uint32_t duration_seconds;
     int led_on;
 
     if (json_get_string(payload, "commandId", command_id, sizeof(command_id)) != 0)
@@ -2112,6 +2212,75 @@ static int mqtt_handle_command(const char *payload)
     {
         tls_log("MQTT CMD: missing/invalid type");
         return mqtt_publish_command_result(command_id, "FAILED", "Invalid command type");
+    }
+
+    if (strcmp(command_type, "interaction.start") == 0)
+    {
+        duration_seconds = INTERACTION_DURATION_DEFAULT_SECONDS;
+        if (strstr(payload, "\"durationSeconds\"") != NULL)
+        {
+            if ((json_get_uint32(payload, "durationSeconds", &duration_seconds) != 0) ||
+                (duration_seconds < INTERACTION_DURATION_MIN_SECONDS) ||
+                (duration_seconds > INTERACTION_DURATION_MAX_SECONDS))
+            {
+                tls_log("INTERACTION: invalid durationSeconds");
+                return mqtt_publish_command_result(command_id,
+                                                   "FAILED",
+                                                   "durationSeconds must be 30..1800");
+            }
+        }
+
+        now = HAL_GetTick();
+        mqtt_interaction_active = 1U;
+        mqtt_interaction_expiry_pending = 0U;
+        mqtt_interaction_deadline_ms = now + (duration_seconds * 1000U);
+        mqtt_last_interaction_diagnostic_ms = now;
+        mqtt_last_telemetry_ms = now - INTERACTION_TELEMETRY_INTERVAL_MS;
+        tls_logf("INTERACTION: started duration=%lus commandId=%s",
+                 (unsigned long)duration_seconds,
+                 command_id);
+
+        if ((mqtt_publish_interaction_diagnostic("MODE_STARTED",
+                                                 "Full interaction mode started",
+                                                 now) != 0) ||
+            (mqtt_publish_status() != 0))
+        {
+            return -1;
+        }
+        return mqtt_publish_command_result(command_id,
+                                           "ACKED",
+                                           "Interaction mode started");
+    }
+
+    if (strcmp(command_type, "interaction.stop") == 0)
+    {
+        now = HAL_GetTick();
+        mqtt_interaction_active = 0U;
+        mqtt_interaction_expiry_pending = 0U;
+        mqtt_interaction_deadline_ms = 0U;
+        tls_logf("INTERACTION: stopped commandId=%s", command_id);
+
+        if ((mqtt_publish_interaction_diagnostic("MODE_STOPPED",
+                                                 "Normal mode restored by command",
+                                                 now) != 0) ||
+            (mqtt_publish_status() != 0))
+        {
+            return -1;
+        }
+        return mqtt_publish_command_result(command_id,
+                                           "ACKED",
+                                           "Interaction mode stopped");
+    }
+
+    if (strcmp(command_type, "interaction.status") == 0)
+    {
+        if (mqtt_publish_status() != 0)
+        {
+            return -1;
+        }
+        return mqtt_publish_command_result(command_id,
+                                           "ACKED",
+                                           "Interaction status published");
     }
 
     if (strcmp(command_type, "set_led") != 0)
@@ -2132,6 +2301,38 @@ static int mqtt_handle_command(const char *payload)
     return mqtt_publish_command_result(command_id,
                                        "ACKED",
                                        led_on ? "LED switched on" : "LED switched off");
+}
+
+static int mqtt_process_interaction(uint32_t now)
+{
+    (void)mqtt_interaction_refresh(now);
+
+    if (mqtt_interaction_expiry_pending)
+    {
+        mqtt_interaction_expiry_pending = 0U;
+        if ((mqtt_publish_interaction_diagnostic("MODE_EXPIRED",
+                                                 "Interaction timeout expired",
+                                                 now) != 0) ||
+            (mqtt_publish_status() != 0))
+        {
+            return -1;
+        }
+    }
+
+    if (mqtt_interaction_active &&
+        ((now - mqtt_last_interaction_diagnostic_ms) >=
+         INTERACTION_DIAGNOSTIC_INTERVAL_MS))
+    {
+        mqtt_last_interaction_diagnostic_ms = now;
+        if (mqtt_publish_interaction_diagnostic("MODE_ACTIVE",
+                                                "Full interaction mode active",
+                                                now) != 0)
+        {
+            return -1;
+        }
+    }
+
+    return 0;
 }
 
 static int mqtt_decode_remaining_length(const uint8_t *packet,
@@ -2569,6 +2770,13 @@ int TlsClient_MqttProcess(void)
         }
     }
 
+    now = HAL_GetTick();
+    if (mqtt_process_interaction(now) != 0)
+    {
+        mqtt_ready = 0;
+        return -1;
+    }
+
     if (mqtt_flush_queued_events() != 0)
     {
         mqtt_ready = 0;
@@ -2577,9 +2785,13 @@ int TlsClient_MqttProcess(void)
 
     config = DeviceConfig_Get();
     telemetry_interval_ms = config->telemetry_frequency_seconds * 1000U;
+    if (mqtt_interaction_active &&
+        (telemetry_interval_ms > INTERACTION_TELEMETRY_INTERVAL_MS))
+    {
+        telemetry_interval_ms = INTERACTION_TELEMETRY_INTERVAL_MS;
+    }
     ping_interval_ms = (uint32_t)mqtt_negotiated_keep_alive_seconds * 500U;
 
-    now = HAL_GetTick();
     if ((now - mqtt_last_telemetry_ms) >= telemetry_interval_ms)
     {
         mqtt_last_telemetry_ms = now;
