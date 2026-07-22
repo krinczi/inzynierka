@@ -2,6 +2,7 @@
 
 #include "debug_logger.h"
 #include "flash_staging.h"
+#include "https_downloader.h"
 #include "main.h"
 #include "mqtt_topics.h"
 
@@ -29,7 +30,7 @@
 #define AWS_JOBS_JOB_ID_MAX_LENGTH       64U
 #define AWS_JOBS_OPERATION_MAX_LENGTH    32U
 #define AWS_JOBS_MODE_MAX_LENGTH         24U
-#define AWS_JOBS_URL_MAX_LENGTH         1024U
+#define AWS_JOBS_URL_MAX_LENGTH         HTTPS_DOWNLOADER_URL_MAX_LENGTH
 #define AWS_JOBS_SHA256_HEX_LENGTH       64U
 #define AWS_JOBS_JSON_MAX_DEPTH          8U
 #define AWS_JOBS_STEP_TIMEOUT_MINUTES    10U
@@ -131,6 +132,27 @@ static int Json_IsHexDigit(char value)
     return ((value >= '0') && (value <= '9')) ||
            ((value >= 'a') && (value <= 'f')) ||
            ((value >= 'A') && (value <= 'F'));
+}
+
+static int Json_HexValue(char value, uint8_t *output)
+{
+    if ((value >= '0') && (value <= '9'))
+    {
+        *output = (uint8_t)(value - '0');
+        return 0;
+    }
+    if ((value >= 'a') && (value <= 'f'))
+    {
+        *output = (uint8_t)(value - 'a' + 10);
+        return 0;
+    }
+    if ((value >= 'A') && (value <= 'F'))
+    {
+        *output = (uint8_t)(value - 'A' + 10);
+        return 0;
+    }
+
+    return -1;
 }
 
 static int Json_SkipString(const char *cursor,
@@ -483,10 +505,43 @@ static int Json_CopyString(JsonSlice value, char *output, size_t output_size)
             case 'n': decoded = '\n'; break;
             case 'r': decoded = '\r'; break;
             case 't': decoded = '\t'; break;
+            case 'u':
+            {
+                uint8_t digit;
+                uint16_t code_point = 0U;
+                size_t index;
+
+                if ((size_t)(value.end - cursor) < 4U)
+                {
+                    return -1;
+                }
+
+                for (index = 0U; index < 4U; index++)
+                {
+                    if (Json_HexValue(cursor[index], &digit) != 0)
+                    {
+                        return -1;
+                    }
+                    code_point = (uint16_t)((code_point << 4U) | digit);
+                }
+                cursor += 4U;
+
+                /* AWS may JSON-escape printable URL delimiters such as '&'. */
+                if ((code_point < 0x20U) || (code_point >= 0x7FU))
+                {
+                    return -1;
+                }
+                decoded = (unsigned char)code_point;
+                break;
+            }
             default:
-                /* Unicode escapes are rejected to keep identifiers unambiguous. */
                 return -1;
             }
+        }
+
+        if (decoded < 0x20U)
+        {
+            return -1;
         }
 
         output[length++] = (char)decoded;
@@ -662,6 +717,7 @@ static int Jobs_ValidateDocument(JsonSlice document,
                                  const char **reason)
 {
     JsonSlice artifact_object;
+    JsonSlice url_value;
     uint32_t schema_version;
     char operation[AWS_JOBS_OPERATION_MAX_LENGTH + 1U];
     char mode[AWS_JOBS_MODE_MAX_LENGTH + 1U];
@@ -712,12 +768,26 @@ static int Jobs_ValidateDocument(JsonSlice document,
         return -1;
     }
 
-    if ((Json_GetRequiredString(artifact_object,
-                                "url",
-                                artifact->url,
-                                sizeof(artifact->url)) != 0) ||
-        !Jobs_IsValidHttpsUrl(artifact->url))
+    if (Json_ObjectFind(artifact_object, "url", &url_value) != JSON_MEMBER_FOUND)
     {
+        Jobs_Log("JOBS: artifact URL field missing or invalid");
+        *reason = "invalid_https_url";
+        return -1;
+    }
+
+    if (Json_CopyString(url_value, artifact->url, sizeof(artifact->url)) != 0)
+    {
+        Jobs_Logf("JOBS: artifact URL decode failed encodedBytes=%lu capacity=%lu",
+                  (unsigned long)(url_value.end - url_value.start),
+                  (unsigned long)(sizeof(artifact->url) - 1U));
+        *reason = "invalid_https_url";
+        return -1;
+    }
+
+    if (!Jobs_IsValidHttpsUrl(artifact->url))
+    {
+        Jobs_Logf("JOBS: artifact URL validation failed decodedBytes=%lu",
+                  (unsigned long)strlen(artifact->url));
         *reason = "invalid_https_url";
         return -1;
     }

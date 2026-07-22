@@ -8,6 +8,12 @@
 
 #include "flash_staging.h"
 
+/*
+ * Maximum complete HTTPS URL accepted by the Jobs download path. Keep this
+ * public so the Jobs validator cannot accept a URL that the downloader rejects.
+ */
+#define HTTPS_DOWNLOADER_URL_MAX_LENGTH  2048U
+
 typedef enum
 {
     HTTPS_DOWNLOADER_IDLE = 0,

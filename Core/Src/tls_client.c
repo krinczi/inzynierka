@@ -63,9 +63,16 @@
 #define TLS_SOCKET_IO_TIMEOUT_US       10000L
 #define TLS_SOCKET_IO_MAX_CHUNK        1024U
 
-#define MQTT_RX_BUFFER_SIZE            2048U
-#define MQTT_INCOMING_PAYLOAD_SIZE     1792U
+#define MQTT_RX_BUFFER_SIZE            4096U
+#define MQTT_INCOMING_PAYLOAD_SIZE     3840U
+#define MQTT_TOPIC_BUFFER_SIZE          160U
+#define MQTT_MAX_PUBLISH_OVERHEAD \
+    (5U + 2U + (MQTT_TOPIC_BUFFER_SIZE - 1U) + 2U)
 #define MQTT_JSON_BUFFER_SIZE          768U
+
+#if (MQTT_INCOMING_PAYLOAD_SIZE + MQTT_MAX_PUBLISH_OVERHEAD) > MQTT_RX_BUFFER_SIZE
+#error "MQTT incoming payload and publish overhead exceed the RX buffer"
+#endif
 
 #ifndef STM32_APP_FIRMWARE_VERSION
 #define STM32_APP_FIRMWARE_VERSION     "0.1.0"
@@ -358,7 +365,7 @@ int TlsClient_Init(void)
     FlashStagingResult staging_result;
 
     tls_log("TLS: init");
-    tls_log("TLS BUILD: mqtt_config_v1 dual_slot_flash jobs_https_v5");
+    tls_log("TLS BUILD: mqtt_config_v1 dual_slot_flash jobs_https_v6");
     tls_connected = 0;
     tls_ctx_ready = 0;
     DeviceConfig_Init();
@@ -2164,7 +2171,7 @@ static int mqtt_handle_publish_packet(const uint8_t *packet,
     uint8_t qos = (uint8_t)((packet[0] >> 1U) & 0x03U);
     uint16_t packet_id = 0U;
     int jobs_result;
-    char topic[160];
+    char topic[MQTT_TOPIC_BUFFER_SIZE];
     char payload[MQTT_INCOMING_PAYLOAD_SIZE];
 
     if ((pos + 2U) > packet_length)
@@ -2203,7 +2210,9 @@ static int mqtt_handle_publish_packet(const uint8_t *packet,
     payload_length = packet_length - pos;
     if (payload_length >= sizeof(payload))
     {
-        tls_log("MQTT: incoming payload too large");
+        tls_logf("MQTT: incoming payload too large bytes=%lu capacity=%lu",
+                 (unsigned long)payload_length,
+                 (unsigned long)(sizeof(payload) - 1U));
         return -1;
     }
 
@@ -2327,7 +2336,9 @@ static int mqtt_process_rx_buffer(void)
         packet_length = header_length + remaining;
         if (packet_length > sizeof(mqtt_rx_buffer))
         {
-            tls_log("MQTT: packet exceeds RX buffer");
+            tls_logf("MQTT: packet exceeds RX buffer bytes=%lu capacity=%lu",
+                     (unsigned long)packet_length,
+                     (unsigned long)sizeof(mqtt_rx_buffer));
             return -1;
         }
 

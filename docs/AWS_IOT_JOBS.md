@@ -88,14 +88,20 @@ invalid placeholder URL and must not be submitted unchanged.
   is the next MQTT packet. Interleaved retained `PUBLISH` packets (for example
   `config/desired`) are processed and acknowledged before the matching
   packet identifier is accepted.
-- Incoming MQTT packet limit: 2048 bytes.
-- Parsed Jobs payload limit: 1791 bytes plus terminator.
+- Incoming MQTT packet limit: 4096 bytes.
+- Parsed Jobs payload limit: 3839 bytes plus terminator.
 - Maximum JSON nesting depth: 8.
 - Maximum job ID: 64 characters, restricted to letters, numbers, `_`, and `-`.
 - Only schema version 1 and operation `stage-file` are accepted.
 - Modes `validate-only` and `download` are accepted.
-- URL must use HTTPS, contain printable ASCII only, and fit in 1024 characters
+- URL must use HTTPS, contain printable ASCII only, and fit in 2048 characters
   (including the query string of a presigned S3 URL).
+- Printable ASCII `\\uXXXX` escapes emitted by a JSON serializer are decoded
+  before URL validation; control characters and non-ASCII escapes are rejected.
+- The MQTT receive path accepts a bounded packet of 4096 bytes and a maximum
+  decoded payload of 3839 bytes. This accommodates the AWS execution envelope
+  plus the supported 2048-character URL while still rejecting oversized job
+  responses before copying them to the parser stack.
 - Artifact size must be from 1 byte through the actual Flash staging capacity.
 - SHA-256 must contain exactly 64 hexadecimal characters and is decoded into
   32 bytes during validation.
@@ -202,7 +208,7 @@ URL=$(aws s3 presign \
   --region "$REGION" \
   --expires-in 3600)
 
-test "${#URL}" -le 1024 || { echo "Presigned URL exceeds device limit"; false; }
+test "${#URL}" -le 2048 || { echo "Presigned URL exceeds device limit"; false; }
 
 THING_ARN=$(aws iot describe-thing \
   --region "$REGION" \
