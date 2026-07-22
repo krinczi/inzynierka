@@ -47,7 +47,9 @@ MEMORY
    * Application code is restricted to Bank 1. Bank 2 is reserved for
    * download staging and the existing dual-slot configuration store.
    */
-  FLASH (rx)              : ORIGIN = 0x08000000, LENGTH = 1024K
+  FLASH (rx)              : ORIGIN = 0x08000000, LENGTH = 768K
+  FLASH_CREDENTIALS_A (r) : ORIGIN = 0x080C0000, LENGTH = 128K
+  FLASH_CREDENTIALS_B (r) : ORIGIN = 0x080E0000, LENGTH = 128K
   FLASH_STAGING_META (r)  : ORIGIN = 0x08100000, LENGTH = 128K
   FLASH_STAGING_DATA (r)  : ORIGIN = 0x08120000, LENGTH = 640K
   FLASH_CONFIG (r)        : ORIGIN = 0x081C0000, LENGTH = 256K
@@ -65,6 +67,12 @@ __flash_staging_data_end__ = ORIGIN(FLASH_STAGING_DATA) + LENGTH(FLASH_STAGING_D
 
 ASSERT(ORIGIN(FLASH) + LENGTH(FLASH) <= ORIGIN(FLASH_STAGING_META),
        "Application overlaps Flash staging metadata")
+ASSERT(ORIGIN(FLASH) + LENGTH(FLASH) <= ORIGIN(FLASH_CREDENTIALS_A),
+       "Application overlaps credential slot A")
+ASSERT(ORIGIN(FLASH_CREDENTIALS_A) + LENGTH(FLASH_CREDENTIALS_A) <= ORIGIN(FLASH_CREDENTIALS_B),
+       "Credential slots overlap")
+ASSERT(ORIGIN(FLASH_CREDENTIALS_B) + LENGTH(FLASH_CREDENTIALS_B) <= ORIGIN(FLASH_STAGING_META),
+       "Credential slot B overlaps Bank 2 staging metadata")
 ASSERT(ORIGIN(FLASH_STAGING_DATA) + LENGTH(FLASH_STAGING_DATA) <= ORIGIN(FLASH_CONFIG),
        "Flash staging data overlaps device configuration")
 

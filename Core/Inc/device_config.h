@@ -1,6 +1,7 @@
 #ifndef INC_DEVICE_CONFIG_H_
 #define INC_DEVICE_CONFIG_H_
 
+#include <stddef.h>
 #include <stdint.h>
 
 #define DEVICE_CONFIG_SCHEMA_VERSION              1U
@@ -11,6 +12,7 @@
 #define DEVICE_CONFIG_LOG_MAX_BYTES               4096U
 #define DEVICE_CONFIG_KEEP_ALIVE_MIN_SECONDS      15U
 #define DEVICE_CONFIG_KEEP_ALIVE_MAX_SECONDS      900U
+#define DEVICE_HARDWARE_UID_HEX_LENGTH             24U
 
 #define DEVICE_METRIC_TEMPERATURE                 (1U << 0)
 #define DEVICE_METRIC_VOLTAGE                     (1U << 1)
@@ -32,6 +34,12 @@ typedef enum
     DEVICE_LOG_LEVEL_TRACE
 } DeviceLogLevel;
 
+typedef enum
+{
+    DEVICE_PROVISIONING_UNPROVISIONED = 0,
+    DEVICE_PROVISIONING_PROVISIONED = 1
+} DeviceProvisioningState;
+
 typedef struct
 {
     uint32_t config_version;
@@ -41,6 +49,7 @@ typedef struct
     uint8_t enabled_metrics;
     uint8_t log_level;
     uint8_t allow_rollback;
+    uint8_t provisioning_state;
 } DeviceConfig;
 
 typedef enum
@@ -59,5 +68,8 @@ int DeviceConfig_IsValid(const DeviceConfig *config);
 int DeviceConfig_Equals(const DeviceConfig *left, const DeviceConfig *right);
 DeviceConfigApplyResult DeviceConfig_Apply(const DeviceConfig *candidate);
 const char *DeviceConfig_LogLevelName(uint8_t level);
+int DeviceConfig_SetProvisioned(void);
+void DeviceConfig_GetHardwareUid(char *output, size_t output_size);
+const char *DeviceConfig_ProvisioningStateName(uint8_t state);
 
 #endif /* INC_DEVICE_CONFIG_H_ */

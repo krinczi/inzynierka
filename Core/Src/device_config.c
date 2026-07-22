@@ -2,6 +2,7 @@
 #include "main.h"
 
 #include <stddef.h>
+#include <stdio.h>
 #include <string.h>
 
 /*
@@ -31,7 +32,7 @@ typedef struct
     uint8_t enabled_metrics;
     uint8_t log_level;
     uint8_t allow_rollback;
-    uint8_t reserved;
+    uint8_t provisioning_state;
     uint32_t crc32;
 } DeviceConfigFlashRecord;
 
@@ -54,6 +55,7 @@ static void DeviceConfig_SetDefaults(void)
                                      DEVICE_METRIC_SIGNAL;
     current_config.log_level = DEVICE_LOG_LEVEL_INFO;
     current_config.allow_rollback = 0U;
+    current_config.provisioning_state = DEVICE_PROVISIONING_UNPROVISIONED;
     current_generation = 0U;
     active_slot_address = 0U;
 }
@@ -106,6 +108,7 @@ static void DeviceConfig_RecordToConfig(const DeviceConfigFlashRecord *record,
     config->enabled_metrics = record->enabled_metrics;
     config->log_level = record->log_level;
     config->allow_rollback = record->allow_rollback;
+    config->provisioning_state = record->provisioning_state;
 }
 
 static int DeviceConfig_RecordIsValid(const DeviceConfigFlashRecord *record)
@@ -146,6 +149,7 @@ static void DeviceConfig_PrepareRecord(const DeviceConfig *config,
     record->enabled_metrics = config->enabled_metrics;
     record->log_level = config->log_level;
     record->allow_rollback = config->allow_rollback;
+    record->provisioning_state = config->provisioning_state;
     record->crc32 = DeviceConfig_Crc32((const uint8_t *)record,
                                        offsetof(DeviceConfigFlashRecord, crc32));
 }
@@ -263,7 +267,8 @@ int DeviceConfig_IsValid(const DeviceConfig *config)
         (config->enabled_metrics == 0U) ||
         ((config->enabled_metrics & (uint8_t)(~DEVICE_METRIC_ALL)) != 0U) ||
         (config->log_level > DEVICE_LOG_LEVEL_TRACE) ||
-        (config->allow_rollback > 1U))
+        (config->allow_rollback > 1U) ||
+        (config->provisioning_state > DEVICE_PROVISIONING_PROVISIONED))
     {
         return 0;
     }
@@ -284,7 +289,8 @@ int DeviceConfig_Equals(const DeviceConfig *left, const DeviceConfig *right)
            (left->mqtt_keep_alive_seconds == right->mqtt_keep_alive_seconds) &&
            (left->enabled_metrics == right->enabled_metrics) &&
            (left->log_level == right->log_level) &&
-           (left->allow_rollback == right->allow_rollback);
+           (left->allow_rollback == right->allow_rollback) &&
+           (left->provisioning_state == right->provisioning_state);
 }
 
 DeviceConfigApplyResult DeviceConfig_Apply(const DeviceConfig *candidate)
@@ -325,4 +331,52 @@ const char *DeviceConfig_LogLevelName(uint8_t level)
     }
 
     return names[level];
+}
+
+int DeviceConfig_SetProvisioned(void)
+{
+    DeviceConfig candidate = current_config;
+
+    if (current_config.provisioning_state == DEVICE_PROVISIONING_PROVISIONED)
+    {
+        return 0;
+    }
+
+    candidate.provisioning_state = DEVICE_PROVISIONING_PROVISIONED;
+    if (DeviceConfig_Persist(&candidate) != 0)
+    {
+        return -1;
+    }
+
+    current_config = candidate;
+    return 0;
+}
+
+void DeviceConfig_GetHardwareUid(char *output, size_t output_size)
+{
+    if ((output == NULL) || (output_size < (DEVICE_HARDWARE_UID_HEX_LENGTH + 1U)))
+    {
+        if ((output != NULL) && (output_size > 0U))
+        {
+            output[0] = '\0';
+        }
+        return;
+    }
+
+    (void)snprintf(output,
+                   output_size,
+                   "%08lX%08lX%08lX",
+                   (unsigned long)HAL_GetUIDw0(),
+                   (unsigned long)HAL_GetUIDw1(),
+                   (unsigned long)HAL_GetUIDw2());
+}
+
+const char *DeviceConfig_ProvisioningStateName(uint8_t state)
+{
+    if (state == DEVICE_PROVISIONING_PROVISIONED)
+    {
+        return "PROVISIONED";
+    }
+
+    return "UNPROVISIONED";
 }
