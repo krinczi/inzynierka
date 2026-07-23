@@ -12,9 +12,10 @@ typedef int (*AwsJobsDownloadStartCallback)(
     uint32_t expected_size,
     const uint8_t expected_sha256[FLASH_STAGING_SHA256_SIZE]);
 
-/* Initializes the session-independent Jobs state machine. */
-void AwsJobs_Init(AwsJobsPublishCallback publish_callback,
-                  AwsJobsDownloadStartCallback download_start_callback);
+/* Initializes Jobs and builds its reserved topics for the runtime Thing name. */
+int AwsJobs_Init(AwsJobsPublishCallback publish_callback,
+                 AwsJobsDownloadStartCallback download_start_callback,
+                 const char *thing_name);
 
 /* Topics are ordered so response topics are subscribed before notify-next. */
 size_t AwsJobs_SubscriptionCount(void);

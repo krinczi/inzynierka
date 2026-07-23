@@ -67,6 +67,8 @@
 
 #define FLASH_STAGING_BUTTON_HOLD_MS 1500U
 #define FLASH_STAGING_BUTTON_SAMPLE_MS 20U
+#define NET_DHCP_ACQUIRE_TIMEOUT_MS 30000U
+#define NET_DHCP_RETRY_DELAY_MS      5000U
 
 /* USER CODE END PD */
 
@@ -715,161 +717,76 @@ static int Net_TestDns(const char *hostname)
 }
 #endif
 
-static int Net_TestTcpIp(const char *ip, uint16_t port)
+static int Net_ConfigureConnectedInterface(void)
 {
-    int sock;
-    struct sockaddr_in addr;
-    char buf[192];
+    uint32_t start_ms;
+    uint32_t last_log_ms;
+    ip4_addr_t zero;
+    err_t err;
+    char buf[96];
 
-    snprintf(buf, sizeof(buf), "TCPIP: connect %s:%u\r\n", ip, port);
-    NET_LOG(buf);
-
-    errno = 0;
-    NET_LOG("TCPIP: before socket");
-
-    sock = lwip_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-
-    snprintf(buf, sizeof(buf), "TCPIP: after socket sock=%d errno=%d\r\n", sock, errno);
-    NET_LOG(buf);
-
-    if (sock < 0)
+    if (!netif_is_link_up(&gnetif))
     {
-        NET_LOG("TCPIP: socket failed");
+        NET_LOG("NET: DHCP skipped, Ethernet link is down");
         return -1;
     }
 
-    int nonblock = 1;
-
-    errno = 0;
-    NET_LOG("TCPIP: before nonblock ioctl");
-
-    int io_ret = lwip_ioctl(sock, FIONBIO, &nonblock);
-
-    snprintf(buf, sizeof(buf), "TCPIP: after nonblock ioctl ret=%d errno=%d\r\n", io_ret, errno);
-    NET_LOG(buf);
-
-    if (io_ret < 0)
+    IP4_ADDR(&zero, 0, 0, 0, 0);
+    NET_LOG("NET: DHCP configuration start");
+    dhcp_stop(&gnetif);
+    netif_set_addr(&gnetif, &zero, &zero, &zero);
+    netif_set_default(&gnetif);
+    if (!netif_is_up(&gnetif))
     {
-        NET_LOG("TCPIP: nonblock ioctl failed");
-        lwip_close(sock);
+        netif_set_up(&gnetif);
+    }
+
+    osDelay(200);
+    err = dhcp_start(&gnetif);
+    if (err != ERR_OK)
+    {
+        NET_LOGF("NET: dhcp_start failed err=%d", (int)err);
         return -1;
     }
 
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = PP_HTONS(port);
-    addr.sin_addr.s_addr = inet_addr(ip);
+    start_ms = HAL_GetTick();
+    last_log_ms = start_ms;
+    NET_LOG("NET: waiting for DHCP lease...");
 
-    errno = 0;
-    NET_LOG("TCPIP: before connect");
-
-    int ret = lwip_connect(sock, (struct sockaddr *)&addr, sizeof(addr));
-
-    snprintf(buf, sizeof(buf), "TCPIP: after connect ret=%d errno=%d\r\n", ret, errno);
-    NET_LOG(buf);
-
-    if (ret == 0)
+    while (!dhcp_supplied_address(&gnetif))
     {
-        NET_LOG("TCPIP: connect OK immediate");
-        lwip_close(sock);
-        return 0;
-    }
+        uint32_t now = HAL_GetTick();
 
-    /*
-     * Nie uzywamy blokujacego oczekiwania na socket, bo u Ciebie potrafi wisiec.
-     * Pollujemy SO_ERROR recznie przez max 30 sekund.
-     */
-    uint32_t start = HAL_GetTick();
-
-    while ((HAL_GetTick() - start) < 30000)
-    {
-        int err = 0;
-        socklen_t len = sizeof(err);
-
-        errno = 0;
-        int gs_ret = lwip_getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &len);
-
-        snprintf(buf, sizeof(buf),
-                 "TCPIP: poll getsockopt ret=%d sockerr=%d errno=%d t=%lu\r\n",
-                 gs_ret,
-                 err,
-                 errno,
-                 (unsigned long)(HAL_GetTick() - start));
-        NET_LOG(buf);
-
-        if (gs_ret == 0 && err == 0)
+        if (!netif_is_link_up(&gnetif))
         {
-            uint32_t elapsed = HAL_GetTick() - start;
-
-            if (elapsed >= 1000)
-            {
-                NET_LOG("TCPIP: connect probably OK after delay by SO_ERROR=0");
-                lwip_close(sock);
-                return 0;
-            }
-        }
-
-        if (err != 0 && err != EINPROGRESS && err != EALREADY && err != EWOULDBLOCK && err != EAGAIN)
-        {
-            snprintf(buf, sizeof(buf), "TCPIP: connect failed sockerr=%d\r\n", err);
-            NET_LOG(buf);
-            lwip_close(sock);
+            NET_LOG("NET: link lost while waiting for DHCP");
+            dhcp_stop(&gnetif);
             return -1;
         }
 
-        osDelay(1000);
+        if ((now - start_ms) >= NET_DHCP_ACQUIRE_TIMEOUT_MS)
+        {
+            NET_LOG("NET: DHCP lease timeout");
+            dhcp_stop(&gnetif);
+            return -1;
+        }
+
+        if ((now - last_log_ms) >= 5000U)
+        {
+            last_log_ms = now;
+            NET_LOGF("NET: DHCP waiting elapsed=%lums",
+                     (unsigned long)(now - start_ms));
+        }
+
+        osDelay(100);
     }
 
-    NET_LOG("TCPIP: connect TIMEOUT manual poll");
-    lwip_close(sock);
-    return -1;
-}
-
-static void Net_SetStaticIp(void)
-{
-    NET_LOG("STATIC: enter");
-
-    ip4_addr_t ipaddr;
-    ip4_addr_t netmask;
-    ip4_addr_t gw;
-    IP4_ADDR(&ipaddr, 192, 168, 18, 222);
-    IP4_ADDR(&netmask, 255, 255, 255, 0);
-    IP4_ADDR(&gw, 192, 168, 18, 1);
-
-    dhcp_stop(&gnetif);
-
-    netif_set_addr(&gnetif, &ipaddr, &netmask, &gw);
-    netif_set_default(&gnetif);
-    netif_set_up(&gnetif);
-
-    ip_addr_t dns1;
-    ip_addr_t dns2;
-    IP4_ADDR(&dns1, 192, 168, 18, 1);
-    IP4_ADDR(&dns2, 8, 8, 8, 8);
-
-    dns_setserver(0, &dns1);
-    dns_setserver(1, &dns2);
-
-    NET_LOG("NET: static IP set");
-
-    char buf[96];
-
-    snprintf(buf, sizeof(buf), "NET: DNS0=%s\r\n", ipaddr_ntoa(dns_getserver(0)));
-    NET_LOG(buf);
-
-    snprintf(buf, sizeof(buf), "NET: DNS1=%s\r\n", ipaddr_ntoa(dns_getserver(1)));
-    NET_LOG(buf);
-
+    NET_LOG("NET: DHCP lease acquired");
     Net_PrintIp();
-
-    NET_LOG("NET: static config done");
-}
-
-static int Net_ConfigureConnectedInterface(void)
-{
-    NET_LOG("STEP: before Net_SetStaticIp");
-    Net_SetStaticIp();
-    NET_LOG("STEP: after Net_SetStaticIp");
+    snprintf(buf, sizeof(buf), "NET: DNS0=%s", ipaddr_ntoa(dns_getserver(0)));
+    NET_LOG(buf);
+    snprintf(buf, sizeof(buf), "NET: DNS1=%s", ipaddr_ntoa(dns_getserver(1)));
+    NET_LOG(buf);
 
 #if NET_ENABLE_DNS_SELF_TEST
     NET_LOG("NET: ready for DNS-only test");
@@ -909,99 +826,6 @@ static void FlashStaging_LogSnapshot(const char *source)
              (unsigned long)info->file_size_bytes,
              source);
 }
-
-static void Net_RestartDhcp(void)
-{
-    char buf[80];
-    err_t err;
-    ip4_addr_t zero;
-
-    IP4_ADDR(&zero, 0, 0, 0, 0);
-
-    NET_LOG("NET: DHCP restart");
-
-    dhcp_stop(&gnetif);
-    netif_set_addr(&gnetif, &zero, &zero, &zero);
-
-    osDelay(500);
-
-    if (!netif_is_up(&gnetif))
-    {
-        netif_set_up(&gnetif);
-    }
-
-    osDelay(200);
-
-    err = dhcp_start(&gnetif);
-
-    snprintf(buf, sizeof(buf), "NET: dhcp_start err=%d\r\n", (int)err);
-    NET_LOG(buf);
-}
-
-static void Net_WaitForLinkAndDhcp(void)
-{
-    uint32_t last_log;
-    uint32_t last_retry;
-
-    NET_LOG("NET: waiting for Ethernet link...");
-
-    while (!netif_is_link_up(&gnetif))
-    {
-        osDelay(100);
-    }
-
-    NET_LOG("NET: Ethernet link UP");
-
-    osDelay(1500);
-
-    if (!netif_is_up(&gnetif))
-    {
-        netif_set_up(&gnetif);
-        NET_LOG("NET: netif set UP");
-    }
-
-    Net_RestartDhcp();
-
-    last_log = HAL_GetTick();
-    last_retry = HAL_GetTick();
-
-    NET_LOG("NET: waiting for DHCP...");
-
-    while (!dhcp_supplied_address(&gnetif))
-    {
-        uint32_t now = HAL_GetTick();
-
-        if ((now - last_log) >= 2000)
-        {
-            char ip[16];
-            char buf[128];
-
-            last_log = now;
-
-            ip4addr_ntoa_r(netif_ip4_addr(&gnetif), ip, sizeof(ip));
-
-            snprintf(buf, sizeof(buf),
-                     "NET: link=%d netif=%d dhcp=%d ip=%s\r\n",
-                     netif_is_link_up(&gnetif),
-                     netif_is_up(&gnetif),
-                     dhcp_supplied_address(&gnetif),
-                     ip);
-
-            NET_LOG(buf);
-        }
-
-        if ((now - last_retry) >= 10000)
-        {
-            last_retry = now;
-            Net_RestartDhcp();
-        }
-
-        osDelay(100);
-    }
-
-    NET_LOG("NET: DHCP OK");
-    Net_PrintIp();
-}
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartDefaultTask */
@@ -1039,11 +863,19 @@ void StartDefaultTask(void *argument)
     MX_LWIP_Init();
 
     SYS_LOG("RTOS: LWIP init OK");
+    NET_LOGF("NET: MAC=%02X:%02X:%02X:%02X:%02X:%02X",
+             gnetif.hwaddr[0],
+             gnetif.hwaddr[1],
+             gnetif.hwaddr[2],
+             gnetif.hwaddr[3],
+             gnetif.hwaddr[4],
+             gnetif.hwaddr[5]);
 
     int network_ready = 0;
     int tls_initialized = 0;
     int mqtt_ready = 0;
     uint32_t mqtt_retry_after_ms = 0U;
+    uint32_t network_retry_after_ms = 0U;
 
     /* Local persistent services must be available even when Ethernet is down. */
     SYS_LOG("RTOS: local services init start");
@@ -1061,6 +893,10 @@ void StartDefaultTask(void *argument)
     if (Net_WaitForLink() == 0)
     {
         network_ready = (Net_ConfigureConnectedInterface() == 0);
+        if (!network_ready)
+        {
+            network_retry_after_ms = HAL_GetTick() + NET_DHCP_RETRY_DELAY_MS;
+        }
     }
     else
     {
@@ -1112,6 +948,12 @@ void StartDefaultTask(void *argument)
         if (!netif_is_link_up(&gnetif))
         {
             NET_LOG("NET: link DOWN, waiting again...");
+            network_ready = 0;
+            if (mqtt_ready)
+            {
+                TlsClient_Disconnect();
+                mqtt_ready = 0;
+            }
             (void)IotEvents_QueueAlert(IOT_ALERT_WARNING,
                                        "ETHERNET_LINK_LOST",
                                        "Ethernet link was lost");
@@ -1122,6 +964,7 @@ void StartDefaultTask(void *argument)
 
                 if (network_ready)
                 {
+                    network_retry_after_ms = 0U;
                     FlashStaging_LogSnapshot("ethernet-restored");
                     osDelay(1000);
                     NET_LOG("NET: ready after reconnect");
@@ -1132,6 +975,8 @@ void StartDefaultTask(void *argument)
                 }
                 else
                 {
+                    network_retry_after_ms =
+                        HAL_GetTick() + NET_DHCP_RETRY_DELAY_MS;
                     NET_LOG("NET: interface configuration failed after reconnect");
                 }
             }
@@ -1139,6 +984,22 @@ void StartDefaultTask(void *argument)
             {
                 network_ready = 0;
             }
+        }
+
+        if (netif_is_link_up(&gnetif) &&
+            (!network_ready || (netif_ip4_addr(&gnetif)->addr == 0U)) &&
+            ((int32_t)(HAL_GetTick() - network_retry_after_ms) >= 0))
+        {
+            if (mqtt_ready)
+            {
+                TlsClient_Disconnect();
+                mqtt_ready = 0;
+            }
+
+            network_ready = (Net_ConfigureConnectedInterface() == 0);
+            network_retry_after_ms = network_ready
+                                         ? 0U
+                                         : HAL_GetTick() + NET_DHCP_RETRY_DELAY_MS;
         }
 
         if (!mqtt_ready &&

@@ -35,6 +35,7 @@
 /* Within 'USER CODE' section, code will be kept by default at each generation */
 /* USER CODE BEGIN 0 */
 #include "debug_logger.h"
+#include "device_identity.h"
 
 static void EthLog(const char *s) __attribute__((unused));
 static void EthLog(const char *s)
@@ -256,12 +257,7 @@ static void low_level_init(struct netif *netif)
   heth.Init.RxDesc = DMARxDscrTab;
   heth.Init.RxBuffLen = ETH_RX_BUFFER_SIZE;
   /* USER CODE BEGIN MACADDRESS */
-  MACAddr[0] = 0x02;
-  MACAddr[1] = 0x80;
-  MACAddr[2] = 0xE1;
-  MACAddr[3] = 0x12;
-  MACAddr[4] = 0x34;
-  MACAddr[5] = 0x56;
+  DeviceIdentity_GetMacAddress(MACAddr);
   /* USER CODE END MACADDRESS */
 
   hal_eth_init_status = HAL_ETH_Init(&heth);

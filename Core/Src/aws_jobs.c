@@ -4,28 +4,10 @@
 #include "flash_staging.h"
 #include "https_downloader.h"
 #include "main.h"
-#include "mqtt_topics.h"
-
 #include <stdint.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
-
-#define AWS_JOBS_BASE_TOPIC \
-    "$aws/things/" MQTT_DEVICE_ID "/jobs"
-
-#define AWS_JOBS_TOPIC_START_NEXT \
-    AWS_JOBS_BASE_TOPIC "/start-next"
-#define AWS_JOBS_TOPIC_START_NEXT_ACCEPTED \
-    AWS_JOBS_TOPIC_START_NEXT "/accepted"
-#define AWS_JOBS_TOPIC_START_NEXT_REJECTED \
-    AWS_JOBS_TOPIC_START_NEXT "/rejected"
-#define AWS_JOBS_TOPIC_NOTIFY_NEXT \
-    AWS_JOBS_BASE_TOPIC "/notify-next"
-#define AWS_JOBS_TOPIC_UPDATE_ACCEPTED_FILTER \
-    AWS_JOBS_BASE_TOPIC "/+/update/accepted"
-#define AWS_JOBS_TOPIC_UPDATE_REJECTED_FILTER \
-    AWS_JOBS_BASE_TOPIC "/+/update/rejected"
 
 #define AWS_JOBS_JOB_ID_MAX_LENGTH       64U
 #define AWS_JOBS_OPERATION_MAX_LENGTH    32U
@@ -37,6 +19,8 @@
 #define AWS_JOBS_RETRY_BASE_MS            5000U
 #define AWS_JOBS_RETRY_MAX_MS             60000U
 #define AWS_JOBS_RESPONSE_TIMEOUT_MS       15000U
+#define AWS_JOBS_TOPIC_MAX_LENGTH            256U
+#define AWS_JOBS_SUBSCRIPTION_COUNT            5U
 
 typedef enum
 {
@@ -79,6 +63,13 @@ typedef struct
     uint8_t retry_attempt;
     char active_job_id[AWS_JOBS_JOB_ID_MAX_LENGTH + 1U];
     char pending_status[16];
+    char base_topic[AWS_JOBS_TOPIC_MAX_LENGTH];
+    char start_next_topic[AWS_JOBS_TOPIC_MAX_LENGTH];
+    char start_next_accepted_topic[AWS_JOBS_TOPIC_MAX_LENGTH];
+    char start_next_rejected_topic[AWS_JOBS_TOPIC_MAX_LENGTH];
+    char update_accepted_filter[AWS_JOBS_TOPIC_MAX_LENGTH];
+    char update_rejected_filter[AWS_JOBS_TOPIC_MAX_LENGTH];
+    char notify_next_topic[AWS_JOBS_TOPIC_MAX_LENGTH];
 } AwsJobsContext;
 
 enum
@@ -89,15 +80,6 @@ enum
 };
 
 static AwsJobsContext jobs_context;
-
-/* Subscribe to response topics first; notify-next is intentionally last. */
-static const char *const jobs_subscription_topics[] = {
-    AWS_JOBS_TOPIC_START_NEXT_ACCEPTED,
-    AWS_JOBS_TOPIC_START_NEXT_REJECTED,
-    AWS_JOBS_TOPIC_UPDATE_ACCEPTED_FILTER,
-    AWS_JOBS_TOPIC_UPDATE_REJECTED_FILTER,
-    AWS_JOBS_TOPIC_NOTIFY_NEXT
-};
 
 static void Jobs_Log(const char *message)
 {
@@ -877,7 +859,7 @@ static int Jobs_RequestNext(void)
     }
 
     if ((jobs_context.publish == NULL) ||
-        (jobs_context.publish(AWS_JOBS_TOPIC_START_NEXT, payload) != 0))
+        (jobs_context.publish(jobs_context.start_next_topic, payload) != 0))
     {
         Jobs_Log("JOBS: start-next publish failed");
         return -1;
@@ -893,7 +875,7 @@ static int Jobs_PublishTerminalStatus(const char *status,
                                       const char *phase,
                                       const char *detail)
 {
-    char topic[192];
+    char topic[AWS_JOBS_TOPIC_MAX_LENGTH];
     char payload[512];
     int topic_written;
     int payload_written;
@@ -901,7 +883,8 @@ static int Jobs_PublishTerminalStatus(const char *status,
     jobs_context.token_counter++;
     topic_written = snprintf(topic,
                              sizeof(topic),
-                             AWS_JOBS_BASE_TOPIC "/%s/update",
+                             "%s/%s/update",
+                             jobs_context.base_topic,
                              jobs_context.active_job_id);
     payload_written = snprintf(payload,
                                sizeof(payload),
@@ -1051,16 +1034,17 @@ static int Jobs_HandleStartNextAccepted(const char *payload)
 
 static int Jobs_TopicHasUpdateSuffix(const char *topic, const char *suffix)
 {
-    static const char prefix[] = AWS_JOBS_BASE_TOPIC "/";
     const char *job_start;
     const char *job_end;
+    size_t prefix_length = strlen(jobs_context.base_topic);
 
-    if (strncmp(topic, prefix, sizeof(prefix) - 1U) != 0)
+    if ((strncmp(topic, jobs_context.base_topic, prefix_length) != 0) ||
+        (topic[prefix_length] != '/'))
     {
         return 0;
     }
 
-    job_start = topic + sizeof(prefix) - 1U;
+    job_start = topic + prefix_length + 1U;
     job_end = strchr(job_start, '/');
     if ((job_end == NULL) || (job_end == job_start))
     {
@@ -1072,7 +1056,7 @@ static int Jobs_TopicHasUpdateSuffix(const char *topic, const char *suffix)
 
 static int Jobs_TopicMatchesActiveUpdate(const char *topic, const char *suffix)
 {
-    char expected[192];
+    char expected[AWS_JOBS_TOPIC_MAX_LENGTH];
     int written;
 
     if (jobs_context.active_job_id[0] == '\0')
@@ -1082,32 +1066,96 @@ static int Jobs_TopicMatchesActiveUpdate(const char *topic, const char *suffix)
 
     written = snprintf(expected,
                        sizeof(expected),
-                       AWS_JOBS_BASE_TOPIC "/%s%s",
+                       "%s/%s%s",
+                       jobs_context.base_topic,
                        jobs_context.active_job_id,
                        suffix);
     return (written >= 0) && ((size_t)written < sizeof(expected)) &&
            (strcmp(topic, expected) == 0);
 }
 
-void AwsJobs_Init(AwsJobsPublishCallback publish_callback,
-                  AwsJobsDownloadStartCallback download_start_callback)
+static int Jobs_BuildTopic(char *output,
+                           size_t output_size,
+                           const char *format,
+                           const char *value)
+{
+    int written = snprintf(output, output_size, format, value);
+    return ((written >= 0) && ((size_t)written < output_size)) ? 0 : -1;
+}
+
+int AwsJobs_Init(AwsJobsPublishCallback publish_callback,
+                 AwsJobsDownloadStartCallback download_start_callback,
+                 const char *thing_name)
 {
     memset(&jobs_context, 0, sizeof(jobs_context));
+    if ((publish_callback == NULL) || (download_start_callback == NULL) ||
+        (thing_name == NULL) || (thing_name[0] == '\0'))
+    {
+        return -1;
+    }
+
+    if ((Jobs_BuildTopic(jobs_context.base_topic,
+                         sizeof(jobs_context.base_topic),
+                         "$aws/things/%s/jobs",
+                         thing_name) != 0) ||
+        (Jobs_BuildTopic(jobs_context.start_next_topic,
+                         sizeof(jobs_context.start_next_topic),
+                         "%s/start-next",
+                         jobs_context.base_topic) != 0) ||
+        (Jobs_BuildTopic(jobs_context.start_next_accepted_topic,
+                         sizeof(jobs_context.start_next_accepted_topic),
+                         "%s/accepted",
+                         jobs_context.start_next_topic) != 0) ||
+        (Jobs_BuildTopic(jobs_context.start_next_rejected_topic,
+                         sizeof(jobs_context.start_next_rejected_topic),
+                         "%s/rejected",
+                         jobs_context.start_next_topic) != 0) ||
+        (Jobs_BuildTopic(jobs_context.update_accepted_filter,
+                         sizeof(jobs_context.update_accepted_filter),
+                         "%s/+/update/accepted",
+                         jobs_context.base_topic) != 0) ||
+        (Jobs_BuildTopic(jobs_context.update_rejected_filter,
+                         sizeof(jobs_context.update_rejected_filter),
+                         "%s/+/update/rejected",
+                         jobs_context.base_topic) != 0) ||
+        (Jobs_BuildTopic(jobs_context.notify_next_topic,
+                         sizeof(jobs_context.notify_next_topic),
+                         "%s/notify-next",
+                         jobs_context.base_topic) != 0))
+    {
+        memset(&jobs_context, 0, sizeof(jobs_context));
+        return -1;
+    }
+
     jobs_context.publish = publish_callback;
     jobs_context.download_start = download_start_callback;
     jobs_context.state = AWS_JOBS_STATE_IDLE;
+    return 0;
 }
 
 size_t AwsJobs_SubscriptionCount(void)
 {
-    return sizeof(jobs_subscription_topics) / sizeof(jobs_subscription_topics[0]);
+    return AWS_JOBS_SUBSCRIPTION_COUNT;
 }
 
 const char *AwsJobs_SubscriptionTopic(size_t index)
 {
-    return index < AwsJobs_SubscriptionCount()
-               ? jobs_subscription_topics[index]
-               : NULL;
+    /* Subscribe to response topics first; notify-next is intentionally last. */
+    switch (index)
+    {
+        case 0U:
+            return jobs_context.start_next_accepted_topic;
+        case 1U:
+            return jobs_context.start_next_rejected_topic;
+        case 2U:
+            return jobs_context.update_accepted_filter;
+        case 3U:
+            return jobs_context.update_rejected_filter;
+        case 4U:
+            return jobs_context.notify_next_topic;
+        default:
+            return NULL;
+    }
 }
 
 int AwsJobs_OnMqttConnected(void)
@@ -1200,7 +1248,7 @@ int AwsJobs_HandleMessage(const char *topic, const char *payload)
         return 0;
     }
 
-    if (strcmp(topic, AWS_JOBS_TOPIC_NOTIFY_NEXT) == 0)
+    if (strcmp(topic, jobs_context.notify_next_topic) == 0)
     {
         Jobs_Log("JOBS: notify-next received");
         if (jobs_context.state == AWS_JOBS_STATE_IDLE)
@@ -1210,12 +1258,12 @@ int AwsJobs_HandleMessage(const char *topic, const char *payload)
         return 1;
     }
 
-    if (strcmp(topic, AWS_JOBS_TOPIC_START_NEXT_ACCEPTED) == 0)
+    if (strcmp(topic, jobs_context.start_next_accepted_topic) == 0)
     {
         return Jobs_HandleStartNextAccepted(payload);
     }
 
-    if (strcmp(topic, AWS_JOBS_TOPIC_START_NEXT_REJECTED) == 0)
+    if (strcmp(topic, jobs_context.start_next_rejected_topic) == 0)
     {
         Jobs_ClearActiveExecution();
         Jobs_ScheduleRetry("start_next_rejected");

@@ -6,6 +6,7 @@
 #include "credential_store.h"
 #include "debug_logger.h"
 #include "device_config.h"
+#include "device_identity.h"
 #include "fleet_provisioning.h"
 #include "flash_staging.h"
 #include "https_downloader.h"
@@ -67,7 +68,7 @@
 
 #define MQTT_RX_BUFFER_SIZE            8192U
 #define MQTT_INCOMING_PAYLOAD_SIZE     7680U
-#define MQTT_TOPIC_BUFFER_SIZE          160U
+#define MQTT_TOPIC_BUFFER_SIZE          MQTT_TOPICS_MAX_LENGTH
 #define MQTT_TX_BUFFER_SIZE            4096U
 #define MQTT_MAX_PUBLISH_OVERHEAD \
     (5U + 2U + (MQTT_TOPIC_BUFFER_SIZE - 1U) + 2U)
@@ -389,7 +390,7 @@ int TlsClient_Init(void)
     FlashStagingResult staging_result;
 
     tls_log("TLS: init");
-    tls_log("TLS BUILD: mqtt_config_v1 dual_slot_flash jobs_https_v6 interaction_v1 fleet_auto_v2");
+    tls_log("TLS BUILD: mqtt_config_v1 dual_slot_flash jobs_https_v6 interaction_v1 fleet_auto_v3 runtime_identity_v1 dhcp_v1");
     tls_connected = 0;
     tls_ctx_ready = 0;
     mqtt_interaction_active = 0U;
@@ -402,6 +403,15 @@ int TlsClient_Init(void)
     DeviceConfig_Init();
     (void)CredentialStore_Init();
     credential_state = CredentialStore_GetState();
+    if ((DeviceIdentity_Refresh() != 0) ||
+        (MqttTopics_Init(MQTT_ENV, DeviceIdentity_GetThingName()) != 0))
+    {
+        tls_log("IDENTITY: runtime identity or MQTT topics init failed");
+        return -1;
+    }
+    tls_logf("IDENTITY: thingName=%s clientId=%s",
+             DeviceIdentity_GetThingName(),
+             DeviceIdentity_GetClientId());
     if ((credential_state == CREDENTIAL_STORE_PROVISIONED) &&
         (DeviceConfig_Get()->provisioning_state != DEVICE_PROVISIONING_PROVISIONED))
     {
@@ -427,18 +437,16 @@ int TlsClient_Init(void)
              (unsigned long)config->telemetry_frequency_seconds,
              (unsigned long)config->mqtt_keep_alive_seconds);
     {
-        char hardware_uid[DEVICE_HARDWARE_UID_HEX_LENGTH + 1U];
-        DeviceConfig_GetHardwareUid(hardware_uid, sizeof(hardware_uid));
         tls_logf("PROVISIONING: state=%s hardwareUid=%s",
                  DeviceConfig_ProvisioningStateName(config->provisioning_state),
-                 hardware_uid);
+                 DeviceIdentity_GetHardwareUid());
         tls_logf("FLEET: credentialStore=%s automatic=%s",
                  CredentialStore_StateName(credential_state),
                  credential_state == CREDENTIAL_STORE_PROVISIONED ? "ready" : "required");
         FleetProvisioning_Init(mqtt_publish_json,
                                AWS_FLEET_PROVISIONING_TEMPLATE_NAME,
-                               MQTT_DEVICE_ID,
-                               hardware_uid);
+                               DeviceIdentity_GetThingName(),
+                               DeviceIdentity_GetHardwareUid());
     }
     return 0;
 }
@@ -765,6 +773,18 @@ int TlsClient_Connect(void)
     size_t client_certificate_length = sizeof(AWS_DEVICE_CERT_PEM);
     size_t client_private_key_length = sizeof(AWS_PRIVATE_KEY_PEM);
     uint32_t verify_flags = 0;
+
+    /*
+     * Fleet Provisioning may have committed a new Thing name since the
+     * previous session. Refresh identity and all derived topics before using
+     * the unique certificate for the reconnect.
+     */
+    if ((DeviceIdentity_Refresh() != 0) ||
+        (MqttTopics_Init(MQTT_ENV, DeviceIdentity_GetThingName()) != 0))
+    {
+        tls_log("IDENTITY: refresh before TLS connect failed");
+        return -1;
+    }
 
     if (CredentialStore_GetState() == CREDENTIAL_STORE_PROVISIONED)
     {
@@ -1328,19 +1348,19 @@ static int mqtt_send_connect(void)
     uint8_t pkt[256];
     uint8_t connack[4];
     const DeviceConfig *config = DeviceConfig_Get();
-    size_t client_id_len = strlen(AWS_CLIENT_ID);
+    const char *client_id = DeviceIdentity_GetClientId();
+    size_t client_id_len = strlen(client_id);
     size_t remaining = 10U + 2U + client_id_len;
     size_t rem_len;
     size_t pos;
 
-    if (remaining > 127U)
+    pkt[0] = 0x10U;
+    rem_len = mqtt_encode_remaining_length(&pkt[1], remaining);
+    if ((1U + rem_len + remaining) > sizeof(pkt))
     {
         tls_log("MQTT: CONNECT too large");
         return -1;
     }
-
-    pkt[0] = 0x10U;
-    rem_len = mqtt_encode_remaining_length(&pkt[1], remaining);
     pos = 1U + rem_len;
 
     if (mqtt_put_string(pkt, sizeof(pkt), &pos, "MQTT") != 0)
@@ -1353,12 +1373,12 @@ static int mqtt_send_connect(void)
     pkt[pos++] = (uint8_t)((config->mqtt_keep_alive_seconds >> 8U) & 0xFFU);
     pkt[pos++] = (uint8_t)(config->mqtt_keep_alive_seconds & 0xFFU);
 
-    if (mqtt_put_string(pkt, sizeof(pkt), &pos, AWS_CLIENT_ID) != 0)
+    if (mqtt_put_string(pkt, sizeof(pkt), &pos, client_id) != 0)
     {
         return -1;
     }
 
-    tls_logf("MQTT: CONNECT client=%s", AWS_CLIENT_ID);
+    tls_logf("MQTT: CONNECT client=%s", client_id);
 
     if (tls_write_all(pkt, pos, 5000U) != 0)
     {
@@ -1566,7 +1586,7 @@ static int mqtt_publish_interaction_diagnostic(const char *code,
                        "\"code\":\"%s\",\"message\":\"%s\","
                        "\"uptimeMs\":%lu,\"configVersion\":%lu,"
                        "\"suppressedCount\":0}",
-                       MQTT_DEVICE_ID,
+                       DeviceIdentity_GetThingName(),
                        (unsigned long)now,
                        (unsigned long)(mqtt_interaction_sequence & 0xFFFFU),
                        code,
@@ -1580,7 +1600,7 @@ static int mqtt_publish_interaction_diagnostic(const char *code,
         return -1;
     }
 
-    return mqtt_publish_json(MQTT_TOPIC_DIAGNOSTICS, payload);
+    return mqtt_publish_json(MqttTopics_Get()->diagnostics, payload);
 }
 
 static int mqtt_publish_status(void)
@@ -1588,11 +1608,8 @@ static int mqtt_publish_status(void)
     char payload[768];
     char hardware_uid[DEVICE_HARDWARE_UID_HEX_LENGTH + 1U];
     const DeviceConfig *config = DeviceConfig_Get();
-    const CredentialStoreData *credentials = CredentialStore_Get();
     CredentialStoreState credential_state = CredentialStore_GetState();
-    const char *thing_name = credential_state == CREDENTIAL_STORE_PROVISIONED
-                                 ? credentials->thing_name
-                                 : MQTT_DEVICE_ID;
+    const char *thing_name = DeviceIdentity_GetThingName();
     uint32_t now = HAL_GetTick();
     uint32_t remaining_seconds = mqtt_interaction_remaining_seconds(now);
     int written;
@@ -1612,7 +1629,7 @@ static int mqtt_publish_status(void)
                        "\"credentialState\":\"%s\","
                        "\"thingName\":\"%s\","
                        "\"hardwareUid\":\"%s\"}}",
-                       MQTT_DEVICE_ID,
+                       DeviceIdentity_GetThingName(),
                        (unsigned long)now,
                        STM32_APP_FIRMWARE_VERSION,
                        mqtt_interaction_active ? "true" : "false",
@@ -1630,7 +1647,7 @@ static int mqtt_publish_status(void)
         return -1;
     }
 
-    return mqtt_publish_json(MQTT_TOPIC_STATUS, payload);
+    return mqtt_publish_json(MqttTopics_Get()->status, payload);
 }
 
 static int mqtt_json_append(char *buffer, size_t buffer_size, size_t *length,
@@ -1710,7 +1727,7 @@ static int mqtt_publish_telemetry(void)
                          &length,
                          "{\"deviceId\":\"%s\",\"schemaVersion\":1,"
                          "\"configVersion\":%lu,\"uptimeMs\":%lu",
-                         MQTT_DEVICE_ID,
+                         DeviceIdentity_GetThingName(),
                          (unsigned long)config->config_version,
                          (unsigned long)uptime_ms) != 0)
     {
@@ -1759,7 +1776,7 @@ static int mqtt_publish_telemetry(void)
         return -1;
     }
 
-    return mqtt_publish_json(MQTT_TOPIC_TELEMETRY, payload);
+    return mqtt_publish_json(MqttTopics_Get()->telemetry, payload);
 }
 
 static int mqtt_publish_queued_event(const IotEventMessage *event)
@@ -1782,7 +1799,7 @@ static int mqtt_publish_queued_event(const IotEventMessage *event)
                            "\"code\":\"%s\",\"message\":\"%s\","
                            "\"uptimeMs\":%lu,\"configVersion\":%lu,"
                            "\"suppressedCount\":%lu}",
-                           MQTT_DEVICE_ID,
+                           DeviceIdentity_GetThingName(),
                            IOT_EVENT_SCHEMA_VERSION,
                            event->message_id,
                            IotEvents_SeverityName(event->level),
@@ -1801,7 +1818,7 @@ static int mqtt_publish_queued_event(const IotEventMessage *event)
                            "\"source\":\"%s\",\"code\":\"%s\","
                            "\"message\":\"%s\",\"uptimeMs\":%lu,"
                            "\"configVersion\":%lu,\"suppressedCount\":%lu}",
-                           MQTT_DEVICE_ID,
+                           DeviceIdentity_GetThingName(),
                            IOT_EVENT_SCHEMA_VERSION,
                            event->message_id,
                            IotEvents_DiagnosticLevelName(event->level),
@@ -1820,8 +1837,8 @@ static int mqtt_publish_queued_event(const IotEventMessage *event)
     }
 
     return mqtt_publish_json((event->type == IOT_MESSAGE_ALERT)
-                                 ? MQTT_TOPIC_ALERTS
-                                 : MQTT_TOPIC_DIAGNOSTICS,
+                                 ? MqttTopics_Get()->alerts
+                                 : MqttTopics_Get()->diagnostics,
                              payload);
 }
 
@@ -2087,7 +2104,7 @@ static int mqtt_publish_command_result(const char *command_id,
                            "{\"deviceId\":\"%s\",\"schemaVersion\":1,"
                            "\"commandId\":\"%s\",\"status\":\"%s\","
                            "\"message\":\"%s\",\"uptimeMs\":%lu}",
-                           MQTT_DEVICE_ID,
+                           DeviceIdentity_GetThingName(),
                            command_id,
                            status,
                            message,
@@ -2099,7 +2116,7 @@ static int mqtt_publish_command_result(const char *command_id,
         return -1;
     }
 
-    return mqtt_publish_json(MQTT_TOPIC_CMD_RESULT, payload);
+    return mqtt_publish_json(MqttTopics_Get()->command_result, payload);
 }
 
 static int mqtt_publish_reported_config(uint32_t request_version,
@@ -2129,7 +2146,7 @@ static int mqtt_publish_reported_config(uint32_t request_version,
                        "\"maxMessageBytes\":%u},"
                        "\"network\":{\"mqttKeepAliveSeconds\":%u},"
                        "\"firmware\":{\"allowRollback\":%s}}}",
-                       MQTT_DEVICE_ID,
+                       DeviceIdentity_GetThingName(),
                        DEVICE_CONFIG_SCHEMA_VERSION,
                        (unsigned long)request_version,
                        (unsigned long)config->config_version,
@@ -2149,7 +2166,7 @@ static int mqtt_publish_reported_config(uint32_t request_version,
         return -1;
     }
 
-    return mqtt_publish_json(MQTT_TOPIC_CONFIG_REPORTED, payload);
+    return mqtt_publish_json(MqttTopics_Get()->config_reported, payload);
 }
 
 static int mqtt_reject_config(uint32_t request_version, const char *reason)
@@ -2168,7 +2185,7 @@ static int mqtt_handle_desired_config(const char *payload)
     uint32_t schema_version;
     uint32_t request_version = candidate.config_version;
     uint32_t number;
-    char device_id[96];
+    char device_id[DEVICE_IDENTITY_THING_NAME_MAX_LENGTH + 1U];
     char log_level[16];
     int allow_rollback;
 
@@ -2184,7 +2201,7 @@ static int mqtt_handle_desired_config(const char *payload)
     }
 
     if ((json_get_string(payload, "deviceId", device_id, sizeof(device_id)) != 0) ||
-        (strcmp(device_id, MQTT_DEVICE_ID) != 0))
+        (strcmp(device_id, DeviceIdentity_GetThingName()) != 0))
     {
         return mqtt_reject_config(request_version, "deviceId mismatch");
     }
@@ -2606,14 +2623,14 @@ static int mqtt_handle_publish_packet(const uint8_t *packet,
         {
             /* Handled by the AWS IoT Jobs state machine. */
         }
-        else if (strcmp(topic, MQTT_TOPIC_CMD) == 0)
+        else if (strcmp(topic, MqttTopics_Get()->command) == 0)
         {
             if (mqtt_handle_command(payload) != 0)
             {
                 return -1;
             }
         }
-        else if (strcmp(topic, MQTT_TOPIC_CONFIG_DESIRED) == 0)
+        else if (strcmp(topic, MqttTopics_Get()->config_desired) == 0)
         {
             if (mqtt_handle_desired_config(payload) != 0)
             {
@@ -2864,13 +2881,13 @@ int TlsClient_MqttTest(void)
         return 0;
     }
 
-    if (mqtt_subscribe_topic(MQTT_TOPIC_CMD, 1U) != 0)
+    if (mqtt_subscribe_topic(MqttTopics_Get()->command, 1U) != 0)
     {
         tls_log("MQTT: command SUBSCRIBE failed");
         return -1;
     }
 
-    if (mqtt_subscribe_topic(MQTT_TOPIC_CONFIG_DESIRED, 2U) != 0)
+    if (mqtt_subscribe_topic(MqttTopics_Get()->config_desired, 2U) != 0)
     {
         tls_log("MQTT: configuration SUBSCRIBE failed");
         return -1;
@@ -2878,7 +2895,13 @@ int TlsClient_MqttTest(void)
 
     tls_log("MQTT: base subscriptions OK");
     HttpsDownloader_Init(&tls_ca_cert, &tls_ctr_drbg);
-    AwsJobs_Init(mqtt_publish_json, HttpsDownloader_Start);
+    if (AwsJobs_Init(mqtt_publish_json,
+                     HttpsDownloader_Start,
+                     DeviceIdentity_GetThingName()) != 0)
+    {
+        tls_log("MQTT: AWS Jobs init failed");
+        return -1;
+    }
     tls_log("MQTT: AWS Jobs init OK");
     for (jobs_subscription_index = 0U;
          jobs_subscription_index < AwsJobs_SubscriptionCount();
