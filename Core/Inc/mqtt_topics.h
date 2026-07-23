@@ -17,8 +17,13 @@ typedef struct
     char diagnostics[MQTT_TOPICS_MAX_LENGTH];
     char command[MQTT_TOPICS_MAX_LENGTH];
     char command_result[MQTT_TOPICS_MAX_LENGTH];
-    char config_desired[MQTT_TOPICS_MAX_LENGTH];
-    char config_reported[MQTT_TOPICS_MAX_LENGTH];
+    char shadow_config_get[MQTT_TOPICS_MAX_LENGTH];
+    char shadow_config_get_accepted[MQTT_TOPICS_MAX_LENGTH];
+    char shadow_config_get_rejected[MQTT_TOPICS_MAX_LENGTH];
+    char shadow_config_update[MQTT_TOPICS_MAX_LENGTH];
+    char shadow_config_update_delta[MQTT_TOPICS_MAX_LENGTH];
+    char shadow_config_update_accepted[MQTT_TOPICS_MAX_LENGTH];
+    char shadow_config_update_rejected[MQTT_TOPICS_MAX_LENGTH];
 } MqttTopics;
 
 /* Builds all application topics from the runtime device identity. */

@@ -22,6 +22,20 @@ static int MqttTopics_Build(char *output,
     return ((written >= 0) && ((size_t)written < output_size)) ? 0 : -1;
 }
 
+static int MqttTopics_BuildShadow(char *output,
+                                  size_t output_size,
+                                  const char *device_id,
+                                  const char *operation)
+{
+    int written = snprintf(output,
+                           output_size,
+                           "$aws/things/%s/shadow/name/config/%s",
+                           device_id,
+                           operation);
+
+    return ((written >= 0) && ((size_t)written < output_size)) ? 0 : -1;
+}
+
 int MqttTopics_Init(const char *environment, const char *device_id)
 {
     if ((environment == NULL) || (environment[0] == '\0') ||
@@ -63,16 +77,34 @@ int MqttTopics_Init(const char *environment, const char *device_id)
                           environment,
                           device_id,
                           "cmd/result") != 0) ||
-        (MqttTopics_Build(mqtt_topics.config_desired,
-                          sizeof(mqtt_topics.config_desired),
-                          environment,
-                          device_id,
-                          "config/desired") != 0) ||
-        (MqttTopics_Build(mqtt_topics.config_reported,
-                          sizeof(mqtt_topics.config_reported),
-                          environment,
-                          device_id,
-                          "config/reported") != 0))
+        (MqttTopics_BuildShadow(mqtt_topics.shadow_config_get,
+                                sizeof(mqtt_topics.shadow_config_get),
+                                device_id,
+                                "get") != 0) ||
+        (MqttTopics_BuildShadow(mqtt_topics.shadow_config_get_accepted,
+                                sizeof(mqtt_topics.shadow_config_get_accepted),
+                                device_id,
+                                "get/accepted") != 0) ||
+        (MqttTopics_BuildShadow(mqtt_topics.shadow_config_get_rejected,
+                                sizeof(mqtt_topics.shadow_config_get_rejected),
+                                device_id,
+                                "get/rejected") != 0) ||
+        (MqttTopics_BuildShadow(mqtt_topics.shadow_config_update,
+                                sizeof(mqtt_topics.shadow_config_update),
+                                device_id,
+                                "update") != 0) ||
+        (MqttTopics_BuildShadow(mqtt_topics.shadow_config_update_delta,
+                                sizeof(mqtt_topics.shadow_config_update_delta),
+                                device_id,
+                                "update/delta") != 0) ||
+        (MqttTopics_BuildShadow(mqtt_topics.shadow_config_update_accepted,
+                                sizeof(mqtt_topics.shadow_config_update_accepted),
+                                device_id,
+                                "update/accepted") != 0) ||
+        (MqttTopics_BuildShadow(mqtt_topics.shadow_config_update_rejected,
+                                sizeof(mqtt_topics.shadow_config_update_rejected),
+                                device_id,
+                                "update/rejected") != 0))
     {
         memset(&mqtt_topics, 0, sizeof(mqtt_topics));
         return -1;

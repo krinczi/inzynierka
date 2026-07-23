@@ -73,6 +73,7 @@
 #define MQTT_MAX_PUBLISH_OVERHEAD \
     (5U + 2U + (MQTT_TOPIC_BUFFER_SIZE - 1U) + 2U)
 #define MQTT_JSON_BUFFER_SIZE          768U
+#define MQTT_SHADOW_JSON_BUFFER_SIZE   1024U
 
 #define INTERACTION_DURATION_DEFAULT_SECONDS 300U
 #define INTERACTION_DURATION_MIN_SECONDS      30U
@@ -137,6 +138,7 @@ static uint32_t mqtt_last_interaction_diagnostic_ms = 0U;
 static uint32_t mqtt_interaction_sequence = 0U;
 static uint8_t mqtt_provisioning_failed_attempts = 0U;
 static uint32_t mqtt_provisioning_next_attempt_ms = 0U;
+static uint8_t mqtt_shadow_get_pending = 0U;
 static uint8_t mqtt_rx_buffer[MQTT_RX_BUFFER_SIZE];
 static size_t mqtt_rx_length = 0U;
 static uint16_t mqtt_expected_suback_packet_id = 0U;
@@ -390,7 +392,7 @@ int TlsClient_Init(void)
     FlashStagingResult staging_result;
 
     tls_log("TLS: init");
-    tls_log("TLS BUILD: mqtt_config_v1 dual_slot_flash jobs_https_v6 interaction_v1 fleet_auto_v3 runtime_identity_v1 dhcp_v1");
+    tls_log("TLS BUILD: mqtt_config_v1 dual_slot_flash jobs_https_v6 interaction_v1 fleet_auto_v3 runtime_identity_v1 dhcp_v1 device_shadow_v1");
     tls_connected = 0;
     tls_ctx_ready = 0;
     mqtt_interaction_active = 0U;
@@ -1417,14 +1419,13 @@ static int mqtt_subscribe_topic(const char *topic, uint16_t packet_id)
     size_t pos;
     uint32_t wait_started_ms;
 
-    if (remaining > 127U)
+    pkt[0] = 0x82U;
+    rem_len = mqtt_encode_remaining_length(&pkt[1], remaining);
+    if ((1U + rem_len + remaining) > sizeof(pkt))
     {
         tls_log("MQTT: SUBSCRIBE too large");
         return -1;
     }
-
-    pkt[0] = 0x82U;
-    rem_len = mqtt_encode_remaining_length(&pkt[1], remaining);
     pos = 1U + rem_len;
     pkt[pos++] = (uint8_t)((packet_id >> 8U) & 0xFFU);
     pkt[pos++] = (uint8_t)(packet_id & 0xFFU);
@@ -2123,7 +2124,8 @@ static int mqtt_publish_reported_config(uint32_t request_version,
                                         const char *status,
                                         const char *message)
 {
-    char payload[MQTT_JSON_BUFFER_SIZE];
+    char reported[MQTT_JSON_BUFFER_SIZE];
+    char payload[MQTT_SHADOW_JSON_BUFFER_SIZE];
     char metrics[128];
     const DeviceConfig *config = DeviceConfig_Get();
     int written;
@@ -2134,8 +2136,8 @@ static int mqtt_publish_reported_config(uint32_t request_version,
         return -1;
     }
 
-    written = snprintf(payload,
-                       sizeof(payload),
+    written = snprintf(reported,
+                       sizeof(reported),
                        "{\"deviceId\":\"%s\",\"schemaVersion\":%u,"
                        "\"requestVersion\":%lu,\"configVersion\":%lu,"
                        "\"status\":\"%s\",\"message\":\"%s\","
@@ -2160,13 +2162,55 @@ static int mqtt_publish_reported_config(uint32_t request_version,
                        (unsigned int)config->mqtt_keep_alive_seconds,
                        config->allow_rollback ? "true" : "false");
 
-    if ((written < 0) || ((size_t)written >= sizeof(payload)))
+    if ((written < 0) || ((size_t)written >= sizeof(reported)))
     {
         tls_log("MQTT CONFIG: reported JSON too large");
         return -1;
     }
 
-    return mqtt_publish_json(MqttTopics_Get()->config_reported, payload);
+    written = snprintf(payload,
+                       sizeof(payload),
+                       "{\"state\":{\"reported\":%s},"
+                       "\"clientToken\":\"stm32-config-%lu\"}",
+                       reported,
+                       (unsigned long)request_version);
+    if ((written < 0) || ((size_t)written >= sizeof(payload)))
+    {
+        tls_log("SHADOW CONFIG: update JSON too large");
+        return -1;
+    }
+
+    return mqtt_publish_json(MqttTopics_Get()->shadow_config_update, payload);
+}
+
+static int mqtt_request_shadow_config(void)
+{
+    char payload[96];
+    int written;
+
+    if (mqtt_shadow_get_pending)
+    {
+        return 0;
+    }
+
+    written = snprintf(payload,
+                       sizeof(payload),
+                       "{\"clientToken\":\"stm32-get-%lu\"}",
+                       (unsigned long)HAL_GetTick());
+    if ((written < 0) || ((size_t)written >= sizeof(payload)))
+    {
+        return -1;
+    }
+
+    mqtt_shadow_get_pending = 1U;
+    if (mqtt_publish_json(MqttTopics_Get()->shadow_config_get, payload) != 0)
+    {
+        mqtt_shadow_get_pending = 0U;
+        return -1;
+    }
+
+    tls_log("SHADOW CONFIG: get requested");
+    return 0;
 }
 
 static int mqtt_reject_config(uint32_t request_version, const char *reason)
@@ -2282,6 +2326,82 @@ static int mqtt_handle_desired_config(const char *payload)
         default:
             return mqtt_reject_config(request_version, "Configuration out of range");
     }
+}
+
+static int mqtt_handle_shadow_message(const char *topic, const char *payload)
+{
+    const MqttTopics *topics = MqttTopics_Get();
+
+    if (strcmp(topic, topics->shadow_config_update_delta) == 0)
+    {
+        tls_log("SHADOW CONFIG: delta received, requesting complete document");
+        return (mqtt_request_shadow_config() == 0) ? 1 : -1;
+    }
+
+    if (strcmp(topic, topics->shadow_config_get_accepted) == 0)
+    {
+        const char *desired = json_value_start(payload, "desired");
+        const char *cursor;
+        uint32_t shadow_version;
+
+        mqtt_shadow_get_pending = 0U;
+        if (json_get_uint32(payload, "version", &shadow_version) == 0)
+        {
+            tls_logf("SHADOW CONFIG: document received version=%lu",
+                     (unsigned long)shadow_version);
+        }
+        else
+        {
+            tls_log("SHADOW CONFIG: document received");
+        }
+
+        if ((desired == NULL) || (*desired != '{'))
+        {
+            tls_log("SHADOW CONFIG: no desired state");
+            return 1;
+        }
+
+        cursor = desired + 1;
+        while ((*cursor == ' ') || (*cursor == '\t') ||
+               (*cursor == '\r') || (*cursor == '\n'))
+        {
+            cursor++;
+        }
+        if (*cursor == '}')
+        {
+            tls_log("SHADOW CONFIG: desired state is empty");
+            return 1;
+        }
+
+        return (mqtt_handle_desired_config(desired) == 0) ? 1 : -1;
+    }
+
+    if (strcmp(topic, topics->shadow_config_get_rejected) == 0)
+    {
+        mqtt_shadow_get_pending = 0U;
+        tls_log("SHADOW CONFIG: get rejected");
+        return 1;
+    }
+
+    if (strcmp(topic, topics->shadow_config_update_accepted) == 0)
+    {
+        tls_log("SHADOW CONFIG: reported state accepted");
+        return 1;
+    }
+
+    if (strcmp(topic, topics->shadow_config_update_rejected) == 0)
+    {
+        char message[128] = "AWS IoT rejected the Shadow update";
+
+        (void)json_get_string(payload, "message", message, sizeof(message));
+        tls_logf("SHADOW CONFIG: update rejected reason=%s", message);
+        (void)IotEvents_QueueAlert(IOT_ALERT_WARNING,
+                                   "SHADOW_UPDATE_REJECTED",
+                                   message);
+        return 1;
+    }
+
+    return 0;
 }
 
 static int mqtt_handle_command(const char *payload)
@@ -2553,6 +2673,7 @@ static int mqtt_handle_publish_packet(const uint8_t *packet,
     uint16_t packet_id = 0U;
     int fleet_result;
     int jobs_result;
+    int shadow_result;
     char topic[MQTT_TOPIC_BUFFER_SIZE];
     char payload[MQTT_INCOMING_PAYLOAD_SIZE];
 
@@ -2623,18 +2744,24 @@ static int mqtt_handle_publish_packet(const uint8_t *packet,
         {
             /* Handled by the AWS IoT Jobs state machine. */
         }
-        else if (strcmp(topic, MqttTopics_Get()->command) == 0)
+        else
         {
-            if (mqtt_handle_command(payload) != 0)
+            shadow_result = mqtt_handle_shadow_message(topic, payload);
+            if (shadow_result < 0)
             {
                 return -1;
             }
-        }
-        else if (strcmp(topic, MqttTopics_Get()->config_desired) == 0)
-        {
-            if (mqtt_handle_desired_config(payload) != 0)
+
+            if (shadow_result > 0)
             {
-                return -1;
+                /* Handled by the AWS IoT Device Shadow configuration flow. */
+            }
+            else if (strcmp(topic, MqttTopics_Get()->command) == 0)
+            {
+                if (mqtt_handle_command(payload) != 0)
+                {
+                    return -1;
+                }
             }
         }
     }
@@ -2845,6 +2972,7 @@ int TlsClient_MqttTest(void)
     }
 
     tls_log("MQTT: test start");
+    mqtt_shadow_get_pending = 0U;
 
     if (mqtt_send_connect() != 0)
     {
@@ -2887,13 +3015,37 @@ int TlsClient_MqttTest(void)
         return -1;
     }
 
-    if (mqtt_subscribe_topic(MqttTopics_Get()->config_desired, 2U) != 0)
+    if (mqtt_subscribe_topic(MqttTopics_Get()->shadow_config_get_accepted, 2U) != 0)
     {
-        tls_log("MQTT: configuration SUBSCRIBE failed");
+        tls_log("SHADOW CONFIG: get/accepted SUBSCRIBE failed");
         return -1;
     }
 
-    tls_log("MQTT: base subscriptions OK");
+    if (mqtt_subscribe_topic(MqttTopics_Get()->shadow_config_get_rejected, 3U) != 0)
+    {
+        tls_log("SHADOW CONFIG: get/rejected SUBSCRIBE failed");
+        return -1;
+    }
+
+    if (mqtt_subscribe_topic(MqttTopics_Get()->shadow_config_update_delta, 4U) != 0)
+    {
+        tls_log("SHADOW CONFIG: update/delta SUBSCRIBE failed");
+        return -1;
+    }
+
+    if (mqtt_subscribe_topic(MqttTopics_Get()->shadow_config_update_accepted, 5U) != 0)
+    {
+        tls_log("SHADOW CONFIG: update/accepted SUBSCRIBE failed");
+        return -1;
+    }
+
+    if (mqtt_subscribe_topic(MqttTopics_Get()->shadow_config_update_rejected, 6U) != 0)
+    {
+        tls_log("SHADOW CONFIG: update/rejected SUBSCRIBE failed");
+        return -1;
+    }
+
+    tls_log("MQTT: base subscriptions and Device Shadow OK");
     HttpsDownloader_Init(&tls_ca_cert, &tls_ctr_drbg);
     if (AwsJobs_Init(mqtt_publish_json,
                      HttpsDownloader_Start,
@@ -2908,7 +3060,7 @@ int TlsClient_MqttTest(void)
          jobs_subscription_index++)
     {
         const char *topic = AwsJobs_SubscriptionTopic(jobs_subscription_index);
-        uint16_t packet_id = (uint16_t)(3U + jobs_subscription_index);
+        uint16_t packet_id = (uint16_t)(7U + jobs_subscription_index);
 
         if ((topic == NULL) ||
             (mqtt_subscribe_topic(topic, packet_id) != 0))
@@ -2928,7 +3080,13 @@ int TlsClient_MqttTest(void)
                                      "APPLIED",
                                      "Configuration restored after boot") != 0)
     {
-        tls_log("MQTT: initial reported config failed");
+        tls_log("SHADOW CONFIG: initial reported update failed");
+        return -1;
+    }
+
+    if (mqtt_request_shadow_config() != 0)
+    {
+        tls_log("SHADOW CONFIG: initial get failed");
         return -1;
     }
 
@@ -3087,5 +3245,6 @@ void TlsClient_Disconnect(void)
     mqtt_rx_length = 0U;
     mqtt_expected_suback_packet_id = 0U;
     mqtt_suback_result = 0;
+    mqtt_shadow_get_pending = 0U;
     tls_ctx_free_all();
 }
