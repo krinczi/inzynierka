@@ -2,6 +2,7 @@
 
 #include "debug_logger.h"
 #include "flash_staging.h"
+#include "firmware_authenticity.h"
 #include "https_downloader.h"
 #include "main.h"
 #include <stdint.h>
@@ -14,6 +15,7 @@
 #define AWS_JOBS_MODE_MAX_LENGTH         24U
 #define AWS_JOBS_URL_MAX_LENGTH         HTTPS_DOWNLOADER_URL_MAX_LENGTH
 #define AWS_JOBS_SHA256_HEX_LENGTH       64U
+#define AWS_JOBS_SIGNATURE_MAX_LENGTH   700U
 #define AWS_JOBS_JSON_MAX_DEPTH          8U
 #define AWS_JOBS_STEP_TIMEOUT_MINUTES    10U
 #define AWS_JOBS_RETRY_BASE_MS            5000U
@@ -43,12 +45,19 @@ typedef enum
     AWS_JOBS_DOCUMENT_DOWNLOAD
 } AwsJobsDocumentMode;
 
+typedef enum
+{
+    AWS_JOBS_ARTIFACT_SERVICE_FILE = 0,
+    AWS_JOBS_ARTIFACT_FIRMWARE
+} AwsJobsArtifactType;
+
 typedef struct
 {
     char url[AWS_JOBS_URL_MAX_LENGTH + 1U];
     uint32_t size_bytes;
     uint8_t sha256[FLASH_STAGING_SHA256_SIZE];
     AwsJobsDocumentMode mode;
+    AwsJobsArtifactType type;
 } AwsJobsArtifact;
 
 typedef struct
@@ -704,6 +713,8 @@ static int Jobs_ValidateDocument(JsonSlice document,
     char operation[AWS_JOBS_OPERATION_MAX_LENGTH + 1U];
     char mode[AWS_JOBS_MODE_MAX_LENGTH + 1U];
     char sha256_hex[AWS_JOBS_SHA256_HEX_LENGTH + 1U];
+    char artifact_type[24];
+    char signature[AWS_JOBS_SIGNATURE_MAX_LENGTH + 1U];
     const FlashStagingInfo *staging_info = FlashStaging_GetInfo();
 
     if ((Json_GetRequiredUInt32(document, "schemaVersion", &schema_version) != 0) ||
@@ -792,6 +803,62 @@ static int Jobs_ValidateDocument(JsonSlice document,
     {
         *reason = "invalid_sha256";
         return -1;
+    }
+
+    artifact->type = AWS_JOBS_ARTIFACT_SERVICE_FILE;
+    {
+        JsonSlice artifact_type_value;
+        int artifact_type_result =
+            Json_ObjectFind(artifact_object,
+                            "artifactType",
+                            &artifact_type_value);
+
+        if (artifact_type_result == JSON_MEMBER_FOUND)
+        {
+            if (Json_CopyString(artifact_type_value,
+                                artifact_type,
+                                sizeof(artifact_type)) != 0)
+            {
+                *reason = "invalid_artifact_type";
+                return -1;
+            }
+
+            if (strcmp(artifact_type, "firmware") == 0)
+            {
+                FirmwareAuthenticityResult auth_result;
+
+                artifact->type = AWS_JOBS_ARTIFACT_FIRMWARE;
+                if (Json_GetRequiredString(artifact_object,
+                                           "signature",
+                                           signature,
+                                           sizeof(signature)) != 0)
+                {
+                    *reason = "firmware_signature_required";
+                    return -1;
+                }
+
+                auth_result =
+                    FirmwareAuthenticity_VerifySha256(artifact->sha256,
+                                                       signature);
+                if (auth_result != FIRMWARE_AUTH_OK)
+                {
+                    Jobs_Logf("JOBS: firmware authenticity rejected reason=%s",
+                              FirmwareAuthenticity_ResultName(auth_result));
+                    *reason = "firmware_signature_invalid";
+                    return -1;
+                }
+            }
+            else if (strcmp(artifact_type, "service-file") != 0)
+            {
+                *reason = "unsupported_artifact_type";
+                return -1;
+            }
+        }
+        else if (artifact_type_result == JSON_MEMBER_INVALID)
+        {
+            *reason = "invalid_artifact_type";
+            return -1;
+        }
     }
 
     *reason = "document_valid";

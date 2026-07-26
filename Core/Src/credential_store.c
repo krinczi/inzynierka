@@ -1,5 +1,7 @@
 #include "credential_store.h"
 #include "main.h"
+#include "FreeRTOS.h"
+#include "task.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -7,9 +9,10 @@
 
 /*
  * The last two sectors of Bank 1 are outside the executable linker region.
- * Each update erases and writes only the inactive slot, so a power loss leaves
- * the previously verified record available. Firmware updates that use sector
- * erase for the application region do not touch either credential slot.
+ * Records are appended in alternating sectors. A sector erase is therefore
+ * needed only after all record positions in that inactive sector have been
+ * consumed, while a power loss leaves the previously verified generation
+ * available. Firmware updates do not touch either credential sector.
  */
 #define CREDENTIAL_SLOT_A_ADDRESS       0x080C0000UL
 #define CREDENTIAL_SLOT_B_ADDRESS       0x080E0000UL
@@ -19,6 +22,10 @@
 #define CREDENTIAL_STORAGE_FORMAT       1U
 #define CREDENTIAL_FLASHWORD_SIZE       32U
 #define CREDENTIAL_RECORD_SIZE          8192U
+#define CREDENTIAL_SECTOR_SIZE          (128U * 1024U)
+#define CREDENTIAL_RECORDS_PER_SECTOR   \
+    (CREDENTIAL_SECTOR_SIZE / CREDENTIAL_RECORD_SIZE)
+#define CREDENTIAL_PROGRAM_YIELD_WORDS     8U
 
 typedef struct
 {
@@ -53,6 +60,25 @@ static CredentialStoreState current_state;
 static CredentialStoreData current_data;
 static uint32_t current_generation;
 static uint32_t active_slot_address;
+
+static void CredentialStore_SecureZero(void *buffer, size_t length)
+{
+    volatile uint8_t *cursor = (volatile uint8_t *)buffer;
+
+    while (length-- > 0U)
+    {
+        *cursor++ = 0U;
+    }
+    __DSB();
+}
+
+static void CredentialStore_YieldToSupervisor(void)
+{
+    if (xTaskGetSchedulerState() == taskSCHEDULER_RUNNING)
+    {
+        taskYIELD();
+    }
+}
 
 static uint32_t CredentialStore_Crc32Update(uint32_t crc,
                                             const uint8_t *data,
@@ -111,6 +137,46 @@ static void CredentialStore_InvalidateCache(uint32_t address, size_t length)
     __ISB();
 }
 
+static int CredentialStore_AddressInSector(uint32_t address, uint32_t sector_base)
+{
+    return (address >= sector_base) &&
+           (address < (sector_base + CREDENTIAL_SECTOR_SIZE));
+}
+
+static int CredentialStore_RecordIsErased(uint32_t address)
+{
+    const uint32_t *word = (const uint32_t *)(uintptr_t)address;
+    const uint32_t *end =
+        (const uint32_t *)(uintptr_t)(address + CREDENTIAL_RECORD_SIZE);
+
+    CredentialStore_InvalidateCache(address, CREDENTIAL_RECORD_SIZE);
+    while (word < end)
+    {
+        if (*word != 0xFFFFFFFFUL)
+        {
+            return 0;
+        }
+        word++;
+    }
+    return 1;
+}
+
+static uint32_t CredentialStore_FindErasedRecord(uint32_t sector_base)
+{
+    uint32_t index;
+
+    for (index = 0U; index < CREDENTIAL_RECORDS_PER_SECTOR; index++)
+    {
+        uint32_t address =
+            sector_base + (index * CREDENTIAL_RECORD_SIZE);
+        if (CredentialStore_RecordIsErased(address))
+        {
+            return address;
+        }
+    }
+    return 0U;
+}
+
 static int CredentialStore_LengthsAreValid(const CredentialFlashHeader *header)
 {
     size_t total;
@@ -119,7 +185,6 @@ static int CredentialStore_LengthsAreValid(const CredentialFlashHeader *header)
         (header->certificate_pem_length > CREDENTIAL_STORE_CERTIFICATE_PEM_MAX_LENGTH) ||
         (header->private_key_pem_length == 0U) ||
         (header->private_key_pem_length > CREDENTIAL_STORE_PRIVATE_KEY_PEM_MAX_LENGTH) ||
-        (header->ownership_token_length == 0U) ||
         (header->ownership_token_length > CREDENTIAL_STORE_OWNERSHIP_TOKEN_MAX_LENGTH) ||
         (header->certificate_id_length == 0U) ||
         (header->certificate_id_length > CREDENTIAL_STORE_CERTIFICATE_ID_MAX_LENGTH) ||
@@ -130,6 +195,11 @@ static int CredentialStore_LengthsAreValid(const CredentialFlashHeader *header)
 
     if ((header->state == CREDENTIAL_STORE_PROVISIONED) &&
         (header->thing_name_length == 0U))
+    {
+        return 0;
+    }
+    if ((header->state == CREDENTIAL_STORE_PENDING_REGISTRATION) &&
+        (header->ownership_token_length == 0U))
     {
         return 0;
     }
@@ -205,17 +275,22 @@ static int CredentialStore_PrepareRecord(CredentialStoreState state,
         (certificate_length > CREDENTIAL_STORE_CERTIFICATE_PEM_MAX_LENGTH) ||
         (private_key_length == 0U) ||
         (private_key_length > CREDENTIAL_STORE_PRIVATE_KEY_PEM_MAX_LENGTH) ||
-        (ownership_token_length == 0U) ||
         (ownership_token_length > CREDENTIAL_STORE_OWNERSHIP_TOKEN_MAX_LENGTH) ||
         (certificate_id_length == 0U) ||
         (certificate_id_length > CREDENTIAL_STORE_CERTIFICATE_ID_MAX_LENGTH) ||
         (thing_name_length > CREDENTIAL_STORE_THING_NAME_MAX_LENGTH) ||
+        ((state == CREDENTIAL_STORE_PENDING_REGISTRATION) &&
+         (ownership_token_length == 0U)) ||
         ((state == CREDENTIAL_STORE_PROVISIONED) && (thing_name_length == 0U)))
     {
         return -1;
     }
 
-    memset(record, 0, sizeof(*record));
+    /*
+     * Keep the unused tail erased. The CRC still protects the complete record,
+     * but only the occupied Flash words have to be programmed.
+     */
+    memset(record, 0xFF, sizeof(*record));
     record->header.magic = CREDENTIAL_FLASH_MAGIC;
     record->header.storage_format = CREDENTIAL_STORAGE_FORMAT;
     record->header.header_size = sizeof(CredentialFlashHeader);
@@ -246,6 +321,19 @@ static int CredentialStore_PrepareRecord(CredentialStoreState state,
     return 0;
 }
 
+static size_t CredentialStore_ProgrammedLength(const CredentialFlashRecord *record)
+{
+    size_t length = sizeof(record->header) +
+                    (size_t)record->header.certificate_pem_length + 1U +
+                    (size_t)record->header.private_key_pem_length + 1U +
+                    (size_t)record->header.ownership_token_length + 1U +
+                    (size_t)record->header.certificate_id_length + 1U +
+                    (size_t)record->header.thing_name_length + 1U;
+
+    return (length + CREDENTIAL_FLASHWORD_SIZE - 1U) &
+           ~(size_t)(CREDENTIAL_FLASHWORD_SIZE - 1U);
+}
+
 static int CredentialStore_Write(CredentialStoreState state,
                                  const CredentialStoreData *data)
 {
@@ -255,6 +343,7 @@ static int CredentialStore_Write(CredentialStoreState state,
     uint32_t sector_error = 0xFFFFFFFFUL;
     uint32_t target_address;
     uint32_t target_sector;
+    size_t programmed_length;
     size_t offset;
     HAL_StatusTypeDef status;
 
@@ -262,15 +351,19 @@ static int CredentialStore_Write(CredentialStoreState state,
     {
         return -1;
     }
+    programmed_length = CredentialStore_ProgrammedLength(&record);
 
-    if (active_slot_address == CREDENTIAL_SLOT_A_ADDRESS)
+    if (CredentialStore_AddressInSector(active_slot_address,
+                                        CREDENTIAL_SLOT_A_ADDRESS))
     {
-        target_address = CREDENTIAL_SLOT_B_ADDRESS;
+        target_address =
+            CredentialStore_FindErasedRecord(CREDENTIAL_SLOT_B_ADDRESS);
         target_sector = CREDENTIAL_SLOT_B_SECTOR;
     }
     else
     {
-        target_address = CREDENTIAL_SLOT_A_ADDRESS;
+        target_address =
+            CredentialStore_FindErasedRecord(CREDENTIAL_SLOT_A_ADDRESS);
         target_sector = CREDENTIAL_SLOT_A_SECTOR;
     }
 
@@ -282,23 +375,40 @@ static int CredentialStore_Write(CredentialStoreState state,
 
     if (HAL_FLASH_Unlock() != HAL_OK)
     {
+        CredentialStore_SecureZero(&record, sizeof(record));
         return -1;
     }
 
     __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS_BANK1);
-    status = HAL_FLASHEx_Erase(&erase, &sector_error);
-    for (offset = 0U; (status == HAL_OK) && (offset < sizeof(record));
+    if (target_address == 0U)
+    {
+        status = HAL_FLASHEx_Erase(&erase, &sector_error);
+        target_address = (target_sector == CREDENTIAL_SLOT_A_SECTOR)
+                             ? CREDENTIAL_SLOT_A_ADDRESS
+                             : CREDENTIAL_SLOT_B_ADDRESS;
+    }
+    else
+    {
+        status = HAL_OK;
+    }
+    for (offset = 0U; (status == HAL_OK) && (offset < programmed_length);
          offset += CREDENTIAL_FLASHWORD_SIZE)
     {
         status = HAL_FLASH_Program(
             FLASH_TYPEPROGRAM_FLASHWORD,
             target_address + (uint32_t)offset,
             (uint32_t)(uintptr_t)(((const uint8_t *)&record) + offset));
+        if ((((offset / CREDENTIAL_FLASHWORD_SIZE) + 1U) %
+             CREDENTIAL_PROGRAM_YIELD_WORDS) == 0U)
+        {
+            CredentialStore_YieldToSupervisor();
+        }
     }
     (void)HAL_FLASH_Lock();
 
     if ((status != HAL_OK) || (sector_error != 0xFFFFFFFFUL))
     {
+        CredentialStore_SecureZero(&record, sizeof(record));
         return -1;
     }
 
@@ -307,6 +417,7 @@ static int CredentialStore_Write(CredentialStoreState state,
     if (!CredentialStore_RecordIsValid(persisted_record) ||
         (memcmp(persisted_record, &record, sizeof(record)) != 0))
     {
+        CredentialStore_SecureZero(&record, sizeof(record));
         return -1;
     }
 
@@ -314,41 +425,69 @@ static int CredentialStore_Write(CredentialStoreState state,
     current_data = *data;
     current_generation = record.header.generation;
     active_slot_address = target_address;
+    CredentialStore_SecureZero(&record, sizeof(record));
     return 0;
 }
 
 int CredentialStore_Init(void)
 {
-    const CredentialFlashRecord *slot_a =
-        (const CredentialFlashRecord *)(uintptr_t)CREDENTIAL_SLOT_A_ADDRESS;
-    const CredentialFlashRecord *slot_b =
-        (const CredentialFlashRecord *)(uintptr_t)CREDENTIAL_SLOT_B_ADDRESS;
     const CredentialFlashRecord *selected = NULL;
+    const uint32_t sector_bases[] = {
+        CREDENTIAL_SLOT_A_ADDRESS,
+        CREDENTIAL_SLOT_B_ADDRESS
+    };
+    size_t sector_index;
+    uint32_t record_index;
 
     current_state = CREDENTIAL_STORE_EMPTY;
     memset(&current_data, 0, sizeof(current_data));
     current_generation = 0U;
     active_slot_address = 0U;
 
-    CredentialStore_InvalidateCache(CREDENTIAL_SLOT_A_ADDRESS, sizeof(*slot_a));
-    CredentialStore_InvalidateCache(CREDENTIAL_SLOT_B_ADDRESS, sizeof(*slot_b));
-    if (CredentialStore_RecordIsValid(slot_a))
+    CredentialStore_InvalidateCache(CREDENTIAL_SLOT_A_ADDRESS,
+                                    CREDENTIAL_SECTOR_SIZE);
+    CredentialStore_InvalidateCache(CREDENTIAL_SLOT_B_ADDRESS,
+                                    CREDENTIAL_SECTOR_SIZE);
+    for (sector_index = 0U;
+         sector_index < (sizeof(sector_bases) / sizeof(sector_bases[0]));
+         sector_index++)
     {
-        selected = slot_a;
-        active_slot_address = CREDENTIAL_SLOT_A_ADDRESS;
-    }
-    if (CredentialStore_RecordIsValid(slot_b) &&
-        ((selected == NULL) || (slot_b->header.generation > selected->header.generation)))
-    {
-        selected = slot_b;
-        active_slot_address = CREDENTIAL_SLOT_B_ADDRESS;
+        for (record_index = 0U;
+             record_index < CREDENTIAL_RECORDS_PER_SECTOR;
+             record_index++)
+        {
+            uint32_t address = sector_bases[sector_index] +
+                               (record_index * CREDENTIAL_RECORD_SIZE);
+            const CredentialFlashRecord *record =
+                (const CredentialFlashRecord *)(uintptr_t)address;
+
+            if (CredentialStore_RecordIsValid(record) &&
+                ((selected == NULL) ||
+                 (record->header.generation > selected->header.generation)))
+            {
+                selected = record;
+                active_slot_address = address;
+            }
+        }
     }
 
     if (selected != NULL)
     {
+        CredentialStoreData sanitized;
         current_state = (CredentialStoreState)selected->header.state;
         current_generation = selected->header.generation;
         CredentialStore_RecordToData(selected, &current_data);
+
+        if ((current_state == CREDENTIAL_STORE_PROVISIONED) &&
+            (current_data.ownership_token[0] != '\0'))
+        {
+            sanitized = current_data;
+            CredentialStore_SecureZero(sanitized.ownership_token,
+                                       sizeof(sanitized.ownership_token));
+            (void)CredentialStore_Write(CREDENTIAL_STORE_PROVISIONED,
+                                        &sanitized);
+            CredentialStore_SecureZero(&sanitized, sizeof(sanitized));
+        }
     }
 
     return 0;
@@ -383,6 +522,7 @@ int CredentialStore_SavePending(const char *certificate_pem,
                                 const char *certificate_id)
 {
     CredentialStoreData data;
+    int result;
 
     if ((certificate_pem == NULL) || (private_key_pem == NULL) ||
         (ownership_token == NULL) || (certificate_id == NULL))
@@ -407,12 +547,15 @@ int CredentialStore_SavePending(const char *certificate_pem,
     strcpy(data.private_key_pem, private_key_pem);
     strcpy(data.ownership_token, ownership_token);
     strcpy(data.certificate_id, certificate_id);
-    return CredentialStore_Write(CREDENTIAL_STORE_PENDING_REGISTRATION, &data);
+    result = CredentialStore_Write(CREDENTIAL_STORE_PENDING_REGISTRATION, &data);
+    CredentialStore_SecureZero(&data, sizeof(data));
+    return result;
 }
 
 int CredentialStore_CommitProvisioned(const char *thing_name)
 {
     CredentialStoreData data;
+    int result;
 
     if ((current_state != CREDENTIAL_STORE_PENDING_REGISTRATION) ||
         (thing_name == NULL) ||
@@ -423,7 +566,15 @@ int CredentialStore_CommitProvisioned(const char *thing_name)
 
     data = current_data;
     strcpy(data.thing_name, thing_name);
-    return CredentialStore_Write(CREDENTIAL_STORE_PROVISIONED, &data);
+    /*
+     * The Fleet Provisioning ownership token is single-use and must not stay
+     * in the long-lived provisioned record.
+     */
+    CredentialStore_SecureZero(data.ownership_token,
+                               sizeof(data.ownership_token));
+    result = CredentialStore_Write(CREDENTIAL_STORE_PROVISIONED, &data);
+    CredentialStore_SecureZero(&data, sizeof(data));
+    return result;
 }
 
 int CredentialStore_Erase(void)
@@ -434,8 +585,12 @@ int CredentialStore_Erase(void)
 
     erase.TypeErase = FLASH_TYPEERASE_SECTORS;
     erase.Banks = FLASH_BANK_1;
-    erase.Sector = CREDENTIAL_SLOT_A_SECTOR;
-    erase.NbSectors = 2U;
+    erase.Sector = CredentialStore_AddressInSector(
+                       active_slot_address,
+                       CREDENTIAL_SLOT_B_ADDRESS)
+                       ? CREDENTIAL_SLOT_B_SECTOR
+                       : CREDENTIAL_SLOT_A_SECTOR;
+    erase.NbSectors = 1U;
     erase.VoltageRange = FLASH_VOLTAGE_RANGE_3;
 
     if (HAL_FLASH_Unlock() != HAL_OK)
@@ -444,6 +599,15 @@ int CredentialStore_Erase(void)
     }
     __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS_BANK1);
     status = HAL_FLASHEx_Erase(&erase, &sector_error);
+    CredentialStore_YieldToSupervisor();
+    if ((status == HAL_OK) && (sector_error == 0xFFFFFFFFUL))
+    {
+        erase.Sector = (erase.Sector == CREDENTIAL_SLOT_A_SECTOR)
+                           ? CREDENTIAL_SLOT_B_SECTOR
+                           : CREDENTIAL_SLOT_A_SECTOR;
+        sector_error = 0xFFFFFFFFUL;
+        status = HAL_FLASHEx_Erase(&erase, &sector_error);
+    }
     (void)HAL_FLASH_Lock();
     if ((status != HAL_OK) || (sector_error != 0xFFFFFFFFUL))
     {

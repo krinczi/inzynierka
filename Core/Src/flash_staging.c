@@ -38,6 +38,8 @@ _Static_assert(sizeof(FlashStagingMetadata) == 64U,
 static FlashStagingInfo staging_info;
 static mbedtls_sha256_context staging_sha256;
 static int staging_sha256_active;
+static uint32_t staging_prepare_sector;
+static uint32_t staging_prepare_sector_count;
 static uint32_t staging_programmed_bytes;
 static size_t staging_write_buffer_used;
 static uint8_t staging_write_buffer[FLASH_STAGING_FLASHWORD_SIZE]
@@ -165,6 +167,8 @@ static void FlashStaging_ResetRuntime(FlashStagingState state)
     memset(&staging_info, 0, sizeof(staging_info));
     staging_info.state = state;
     staging_info.capacity_bytes = FlashStaging_DataCapacity();
+    staging_prepare_sector = 0U;
+    staging_prepare_sector_count = 0U;
     staging_programmed_bytes = 0U;
     staging_write_buffer_used = 0U;
     memset(staging_write_buffer, 0xFF, sizeof(staging_write_buffer));
@@ -380,7 +384,22 @@ FlashStagingResult FlashStaging_Begin(
     uint32_t file_size_bytes,
     const uint8_t expected_sha256[FLASH_STAGING_SHA256_SIZE])
 {
-    FlashStagingResult result;
+    FlashStagingResult result =
+        FlashStaging_PrepareStart(file_size_bytes, expected_sha256);
+
+    while (result == FLASH_STAGING_IN_PROGRESS)
+    {
+        result = FlashStaging_PrepareStep();
+    }
+
+    return result;
+}
+
+FlashStagingResult FlashStaging_PrepareStart(
+    uint32_t file_size_bytes,
+    const uint8_t expected_sha256[FLASH_STAGING_SHA256_SIZE])
+{
+    uint32_t sector_size;
 
     if (expected_sha256 == NULL)
     {
@@ -392,25 +411,63 @@ FlashStagingResult FlashStaging_Begin(
         return FLASH_STAGING_TOO_LARGE;
     }
 
-    if (staging_info.state == FLASH_STAGING_STATE_RECEIVING)
+    if ((staging_info.state == FLASH_STAGING_STATE_PREPARING) ||
+        (staging_info.state == FLASH_STAGING_STATE_RECEIVING))
     {
         return FLASH_STAGING_INVALID_STATE;
     }
 
-    FlashStaging_ResetRuntime(FLASH_STAGING_STATE_EMPTY);
-    result = FlashStaging_Erase(FLASH_STAGING_FIRST_SECTOR, FLASH_STAGING_SECTOR_COUNT);
+    FlashStaging_ResetRuntime(FLASH_STAGING_STATE_PREPARING);
+    staging_info.file_size_bytes = file_size_bytes;
+    memcpy(staging_info.expected_sha256,
+           expected_sha256,
+           FLASH_STAGING_SHA256_SIZE);
+
+    sector_size = FlashStaging_MetadataSize();
+    if (sector_size == 0U)
+    {
+        return FlashStaging_Fail(FLASH_STAGING_FLASH_ERROR);
+    }
+    staging_prepare_sector_count =
+        1U + ((file_size_bytes + sector_size - 1U) / sector_size);
+    if (staging_prepare_sector_count > FLASH_STAGING_SECTOR_COUNT)
+    {
+        return FlashStaging_Fail(FLASH_STAGING_TOO_LARGE);
+    }
+    return FLASH_STAGING_IN_PROGRESS;
+}
+
+FlashStagingResult FlashStaging_PrepareStep(void)
+{
+    FlashStagingResult result;
+    uint32_t sector_address;
+    uint32_t sector_size = FlashStaging_MetadataSize();
+
+    if (staging_info.state != FLASH_STAGING_STATE_PREPARING)
+    {
+        return FLASH_STAGING_INVALID_STATE;
+    }
+
+    result = FlashStaging_Erase(FLASH_STAGING_FIRST_SECTOR +
+                                    staging_prepare_sector,
+                                1U);
     if (result != FLASH_STAGING_OK)
     {
         return FlashStaging_Fail(result);
     }
 
-    FlashStaging_InvalidateCache(FlashStaging_MetadataAddress(),
-                                 FlashStaging_MetadataSize() + FlashStaging_DataCapacity());
-    if (!FlashStaging_RegionIsErased(FlashStaging_MetadataAddress(),
-                                     FlashStaging_MetadataSize() +
-                                         FlashStaging_DataCapacity()))
+    sector_address = FlashStaging_MetadataAddress() +
+                     (staging_prepare_sector * sector_size);
+    FlashStaging_InvalidateCache(sector_address, sector_size);
+    if (!FlashStaging_RegionIsErased(sector_address, sector_size))
     {
         return FlashStaging_Fail(FLASH_STAGING_FLASH_ERROR);
+    }
+
+    staging_prepare_sector++;
+    if (staging_prepare_sector < staging_prepare_sector_count)
+    {
+        return FLASH_STAGING_IN_PROGRESS;
     }
 
     mbedtls_sha256_init(&staging_sha256);
@@ -421,8 +478,6 @@ FlashStagingResult FlashStaging_Begin(
     }
 
     staging_info.state = FLASH_STAGING_STATE_RECEIVING;
-    staging_info.file_size_bytes = file_size_bytes;
-    memcpy(staging_info.expected_sha256, expected_sha256, FLASH_STAGING_SHA256_SIZE);
     return FLASH_STAGING_OK;
 }
 
@@ -536,12 +591,12 @@ FlashStagingResult FlashStaging_Finalize(void)
     }
 
     staging_info.state = FLASH_STAGING_STATE_READY;
-    result = FlashStaging_Verify();
-    if (result != FLASH_STAGING_OK)
-    {
-        return FlashStaging_Fail(result);
-    }
-
+    /*
+     * Each Flash word was read back after programming and the streaming
+     * SHA-256 was checked above. Rehashing the complete image here would stall
+     * MQTT for no additional runtime guarantee. Boot-time Init still performs
+     * the independent full-image verification.
+     */
     return FLASH_STAGING_OK;
 }
 
@@ -550,6 +605,20 @@ FlashStagingResult FlashStaging_Abort(void)
     FlashStagingResult result;
 
     FlashStaging_StopHash();
+
+    /*
+     * Once preparation erased sector 0, the committed metadata is already
+     * invalid. Avoid another full-sector erase on a retry or link loss.
+     */
+    if (((staging_info.state == FLASH_STAGING_STATE_PREPARING) &&
+         (staging_prepare_sector > 0U)) ||
+        (staging_info.state == FLASH_STAGING_STATE_RECEIVING) ||
+        (staging_info.state == FLASH_STAGING_STATE_EMPTY))
+    {
+        FlashStaging_ResetRuntime(FLASH_STAGING_STATE_EMPTY);
+        return FLASH_STAGING_OK;
+    }
+
     result = FlashStaging_Erase(FLASH_STAGING_METADATA_SECTOR, 1U);
     if (result != FLASH_STAGING_OK)
     {
@@ -630,6 +699,8 @@ const char *FlashStaging_StateName(FlashStagingState state)
     {
     case FLASH_STAGING_STATE_EMPTY:
         return "EMPTY";
+    case FLASH_STAGING_STATE_PREPARING:
+        return "PREPARING";
     case FLASH_STAGING_STATE_RECEIVING:
         return "RECEIVING";
     case FLASH_STAGING_STATE_READY:

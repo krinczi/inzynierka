@@ -56,8 +56,13 @@ volatile uint32_t eth_rx_alloc_fail_count = 0;
 /* Private define ------------------------------------------------------------*/
 /* The time to block waiting for input. */
 #define TIME_WAITING_FOR_INPUT ( portMAX_DELAY )
-/* Time to block waiting for transmissions to finish */
-#define ETHIF_TX_TIMEOUT (2000U)
+/*
+ * Do not let a congested DMA descriptor ring stop tcpip_thread indefinitely.
+ * TCP will retry after ERR_MEM/ERR_IF, while a blocked tcpip_thread would stop
+ * every LwIP socket, DNS request and MQTT/TLS connection.
+ */
+#define ETHIF_TX_WAIT_SLICE_MS       (20U)
+#define ETHIF_TX_MAX_BUSY_RETRIES    (3U)
 /* USER CODE BEGIN OS_THREAD_STACK_SIZE_WITH_RTOS */
 /* Stack size of the interface thread */
 #define INTERFACE_THREAD_STACK_SIZE ( 2048  )
@@ -409,6 +414,7 @@ static void low_level_init(struct netif *netif)
 static err_t low_level_output(struct netif *netif, struct pbuf *p)
 {
   uint32_t i = 0U;
+  uint32_t busy_retries = 0U;
   struct pbuf *q = NULL;
   err_t errval = ERR_OK;
   ETH_BufferTypeDef Txbuffer[ETH_TX_DESC_CNT] = {0};
@@ -472,7 +478,16 @@ static err_t low_level_output(struct netif *netif, struct pbuf *p)
       if(HAL_ETH_GetError(&heth) & HAL_ETH_ERROR_BUSY)
       {
         /* Wait for descriptors to become available */
-        osSemaphoreAcquire(TxPktSemaphore, ETHIF_TX_TIMEOUT);
+        if ((busy_retries >= ETHIF_TX_MAX_BUSY_RETRIES) ||
+            (osSemaphoreAcquire(TxPktSemaphore,
+                                ETHIF_TX_WAIT_SLICE_MS) != osOK))
+        {
+          HAL_ETH_ReleaseTxPacket(&heth);
+          pbuf_free(p);
+          return ERR_IF;
+        }
+
+        busy_retries++;
         HAL_ETH_ReleaseTxPacket(&heth);
         errval = ERR_BUF;
       }

@@ -9,6 +9,7 @@
 typedef enum
 {
     FLASH_STAGING_STATE_EMPTY = 0,
+    FLASH_STAGING_STATE_PREPARING,
     FLASH_STAGING_STATE_RECEIVING,
     FLASH_STAGING_STATE_READY,
     FLASH_STAGING_STATE_INVALID
@@ -16,6 +17,7 @@ typedef enum
 
 typedef enum
 {
+    FLASH_STAGING_IN_PROGRESS = 1,
     FLASH_STAGING_OK = 0,
     FLASH_STAGING_INVALID_ARGUMENT = -1,
     FLASH_STAGING_TOO_LARGE = -2,
@@ -45,6 +47,15 @@ FlashStagingResult FlashStaging_Init(void);
 FlashStagingResult FlashStaging_Begin(
     uint32_t file_size_bytes,
     const uint8_t expected_sha256[FLASH_STAGING_SHA256_SIZE]);
+
+/*
+ * Starts a transfer without erasing the whole region in one call. Each Step
+ * erases and verifies at most one sector and returns IN_PROGRESS until ready.
+ */
+FlashStagingResult FlashStaging_PrepareStart(
+    uint32_t file_size_bytes,
+    const uint8_t expected_sha256[FLASH_STAGING_SHA256_SIZE]);
+FlashStagingResult FlashStaging_PrepareStep(void);
 
 /* Accepts arbitrary chunk sizes. Chunks must be supplied in file order. */
 FlashStagingResult FlashStaging_Write(const uint8_t *data, size_t length);

@@ -19,9 +19,7 @@
 #include <sys/times.h>
 
 #include "debug_logger.h"
-#include "stm32h7xx_hal.h"
-
-#define SYSCALLS_TEST_UNIX_TIME_UTC 1783263600L
+#include "system_time.h"
 
 char *__env[1] = { 0 };
 char **environ = __env;
@@ -185,18 +183,5 @@ int _execve(char *name, char **argv, char **env)
 int _gettimeofday(struct timeval *tv, void *tzvp)
 {
     (void)tzvp;
-
-    if (tv != NULL)
-    {
-        uint32_t tick_ms = HAL_GetTick();
-
-        /*
-         * Testowy czas bazowy: 2026-07-05 15:00:00 UTC.
-         * Docelowo powinno to zostac zastapione RTC albo SNTP.
-         */
-        tv->tv_sec = SYSCALLS_TEST_UNIX_TIME_UTC + (time_t)(tick_ms / 1000U);
-        tv->tv_usec = (suseconds_t)((tick_ms % 1000U) * 1000U);
-    }
-
-    return 0;
+    return SystemTime_GetTimeval(tv);
 }

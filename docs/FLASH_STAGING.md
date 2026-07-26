@@ -11,15 +11,16 @@ STM32H753ZI provides 2 MiB of internal Flash split into two 1 MiB banks with
 
 | Range | Size | Purpose |
 | --- | ---: | --- |
-| `0x08000000-0x080FFFFF` | 1 MiB | Executable application (Bank 1) |
+| `0x08000000-0x080BFFFF` | 768 KiB | Executable application (Bank 1) |
+| `0x080C0000-0x080DFFFF` | 128 KiB | Credential log A (Bank 1) |
+| `0x080E0000-0x080FFFFF` | 128 KiB | Credential log B (Bank 1) |
 | `0x08100000-0x0811FFFF` | 128 KiB | Staging metadata (Bank 2, sector 0) |
 | `0x08120000-0x081BFFFF` | 640 KiB | Staged file data (Bank 2, sectors 1-5) |
 | `0x081C0000-0x081DFFFF` | 128 KiB | Configuration slot A |
 | `0x081E0000-0x081FFFFF` | 128 KiB | Configuration slot B |
 
-The Release firmware occupied approximately 288 KiB before this module was
-added, so restricting executable code to Bank 1 leaves substantial headroom.
-The linker fails the build if executable sections exceed 1 MiB.
+The linker fails the build if executable sections exceed the dedicated
+768 KiB application area.
 
 ## Safety properties
 
@@ -28,7 +29,8 @@ The linker fails the build if executable sections exceed 1 MiB.
 - Data is written sequentially in native 32-byte STM32H7 Flash words.
 - Every programmed Flash word is read back and compared.
 - The expected file size is checked before erase and before finalization.
-- SHA-256 is calculated while receiving and recalculated from Flash.
+- SHA-256 is calculated while receiving and independently recalculated from
+  Flash during the next boot.
 - Metadata is protected with CRC-32.
 - The metadata word containing the magic and committed state is written last.
 - A power loss before metadata commit leaves no valid staged file.
@@ -38,11 +40,14 @@ The linker fails the build if executable sections exceed 1 MiB.
 ## API lifecycle
 
 1. `FlashStaging_Init()` inspects and verifies an existing committed file.
-2. `FlashStaging_Begin(size, sha256)` erases staging and starts a transfer.
-3. `FlashStaging_Write(data, length)` accepts ordered chunks of any size.
-4. `FlashStaging_Finalize()` verifies and atomically commits the file.
-5. `FlashStaging_Read()` exposes only a READY file.
-6. `FlashStaging_Abort()` invalidates metadata; the next Begin erases data.
+2. `FlashStaging_PrepareStart(size, sha256)` validates the transfer.
+3. Repeated `FlashStaging_PrepareStep()` calls erase and verify at most one
+   required sector per service iteration.
+4. `FlashStaging_Write(data, length)` accepts ordered chunks of any size.
+5. `FlashStaging_Finalize()` verifies and atomically commits the file.
+6. `FlashStaging_Read()` exposes only a READY file.
+7. `FlashStaging_Abort()` invalidates metadata; the next preparation erases
+   only the sectors required by the new file.
 
 An interrupted download is deliberately restarted from byte zero in version 1.
 This provides deterministic retry without trusting partially written data.
@@ -79,8 +84,8 @@ The payload is `abc`, written as deliberately non-aligned chunks of one and
 two bytes. Its expected SHA-256 is the standard FIPS 180-4 test vector.
 
 Safety guard: the self-test refuses to erase staging when a different valid
-file is in state `READY`. It can be removed from production builds with
-`FLASH_STAGING_BUTTON_SELF_TEST_ENABLED=0`.
+file is in state `READY`. It is disabled by the default production profile and
+can be enabled explicitly with `FLASH_STAGING_BUTTON_SELF_TEST_ENABLED=1`.
 
 Further fault-injection tests for the AWS Jobs integration should reset the
 device during transfer and use an incorrect digest. After restart, an

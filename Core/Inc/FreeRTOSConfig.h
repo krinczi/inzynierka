@@ -58,6 +58,13 @@
 #endif /* CMSIS_device_header */
 
 #define configENABLE_FPU                         0
+/*
+ * This Cube package contains only the ARM_CM4F non-MPU FreeRTOS port.
+ * Hardware MPU protection for credential/staging/event Flash is configured
+ * independently by SecurityPosture_ConfigureMpu(). Per-task unprivileged
+ * isolation requires migration to a FreeRTOS MPU port and cannot be enabled
+ * safely by changing this flag alone.
+ */
 #define configENABLE_MPU                         0
 
 #define configUSE_PREEMPTION                     1

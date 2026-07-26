@@ -64,6 +64,7 @@ typedef enum
 
 void DeviceConfig_Init(void);
 const DeviceConfig *DeviceConfig_Get(void);
+void DeviceConfig_GetSnapshot(DeviceConfig *config);
 int DeviceConfig_IsValid(const DeviceConfig *config);
 int DeviceConfig_Equals(const DeviceConfig *left, const DeviceConfig *right);
 DeviceConfigApplyResult DeviceConfig_Apply(const DeviceConfig *candidate);

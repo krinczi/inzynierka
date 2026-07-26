@@ -1,5 +1,7 @@
 #include "device_config.h"
 #include "main.h"
+#include "FreeRTOS.h"
+#include "task.h"
 
 #include <stddef.h>
 #include <stdio.h>
@@ -9,8 +11,10 @@
  * The final two 128 KiB sectors of Bank 2 are reserved for configuration.
  * Application code is restricted to Bank 1 and the preceding Bank 2 sectors
  * are reserved for download staging, so neither configuration slot can
- * overlap executable or staged data. A new record is always written to the
- * inactive slot; the previous valid slot remains available if power is lost.
+ * overlap executable or staged data. Records are appended in alternating
+ * sectors; normal configuration updates program one Flash word and do not
+ * erase an entire sector. The previous valid generation remains available if
+ * power is lost.
  */
 #define DEVICE_CONFIG_SLOT_A_ADDRESS       0x081C0000UL
 #define DEVICE_CONFIG_SLOT_B_ADDRESS       0x081E0000UL
@@ -18,6 +22,7 @@
 #define DEVICE_CONFIG_SLOT_B_SECTOR        FLASH_SECTOR_7
 #define DEVICE_CONFIG_FLASH_MAGIC          0x43464731UL /* "CFG1" */
 #define DEVICE_CONFIG_STORAGE_FORMAT       1U
+#define DEVICE_CONFIG_SECTOR_SIZE          (128U * 1024U)
 
 typedef struct
 {
@@ -42,6 +47,12 @@ _Static_assert(sizeof(DeviceConfigFlashRecord) == 32U,
 static DeviceConfig current_config;
 static uint32_t current_generation;
 static uint32_t active_slot_address;
+
+static int DeviceConfig_AddressInSector(uint32_t address, uint32_t sector_base)
+{
+    return (address >= sector_base) &&
+           (address < (sector_base + DEVICE_CONFIG_SECTOR_SIZE));
+}
 
 static void DeviceConfig_SetDefaults(void)
 {
@@ -96,6 +107,39 @@ static void DeviceConfig_LoadRecord(uint32_t address, DeviceConfigFlashRecord *r
 {
     DeviceConfig_InvalidateCache(address);
     memcpy(record, (const void *)address, sizeof(*record));
+}
+
+static int DeviceConfig_RecordIsErased(const DeviceConfigFlashRecord *record)
+{
+    const uint32_t *word = (const uint32_t *)record;
+    size_t index;
+
+    for (index = 0U; index < (sizeof(*record) / sizeof(*word)); index++)
+    {
+        if (word[index] != 0xFFFFFFFFUL)
+        {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static uint32_t DeviceConfig_FindErasedRecord(uint32_t sector_base)
+{
+    uint32_t offset;
+    DeviceConfigFlashRecord record;
+
+    for (offset = 0U;
+         offset < DEVICE_CONFIG_SECTOR_SIZE;
+         offset += sizeof(DeviceConfigFlashRecord))
+    {
+        DeviceConfig_LoadRecord(sector_base + offset, &record);
+        if (DeviceConfig_RecordIsErased(&record))
+        {
+            return sector_base + offset;
+        }
+    }
+    return 0U;
 }
 
 static void DeviceConfig_RecordToConfig(const DeviceConfigFlashRecord *record,
@@ -159,19 +203,22 @@ static int DeviceConfig_Persist(const DeviceConfig *config)
     DeviceConfigFlashRecord record __attribute__((aligned(32)));
     DeviceConfigFlashRecord verify_record;
     FLASH_EraseInitTypeDef erase = { 0 };
-    uint32_t sector_error = 0U;
+    uint32_t sector_error = 0xFFFFFFFFUL;
     uint32_t target_address;
     uint32_t target_sector;
     HAL_StatusTypeDef status;
 
-    if (active_slot_address == DEVICE_CONFIG_SLOT_A_ADDRESS)
+    if (DeviceConfig_AddressInSector(active_slot_address,
+                                     DEVICE_CONFIG_SLOT_A_ADDRESS))
     {
-        target_address = DEVICE_CONFIG_SLOT_B_ADDRESS;
+        target_address =
+            DeviceConfig_FindErasedRecord(DEVICE_CONFIG_SLOT_B_ADDRESS);
         target_sector = DEVICE_CONFIG_SLOT_B_SECTOR;
     }
     else
     {
-        target_address = DEVICE_CONFIG_SLOT_A_ADDRESS;
+        target_address =
+            DeviceConfig_FindErasedRecord(DEVICE_CONFIG_SLOT_A_ADDRESS);
         target_sector = DEVICE_CONFIG_SLOT_A_SECTOR;
     }
 
@@ -189,7 +236,17 @@ static int DeviceConfig_Persist(const DeviceConfig *config)
     }
 
     __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS_BANK2);
-    status = HAL_FLASHEx_Erase(&erase, &sector_error);
+    if (target_address == 0U)
+    {
+        status = HAL_FLASHEx_Erase(&erase, &sector_error);
+        target_address = (target_sector == DEVICE_CONFIG_SLOT_A_SECTOR)
+                             ? DEVICE_CONFIG_SLOT_A_ADDRESS
+                             : DEVICE_CONFIG_SLOT_B_ADDRESS;
+    }
+    else
+    {
+        status = HAL_OK;
+    }
     if (status == HAL_OK)
     {
         DeviceConfig_InvalidateCache(target_address);
@@ -199,7 +256,7 @@ static int DeviceConfig_Persist(const DeviceConfig *config)
     }
 
     (void)HAL_FLASH_Lock();
-    if (status != HAL_OK)
+    if ((status != HAL_OK) || (sector_error != 0xFFFFFFFFUL))
     {
         return -1;
     }
@@ -218,37 +275,65 @@ static int DeviceConfig_Persist(const DeviceConfig *config)
 
 void DeviceConfig_Init(void)
 {
-    DeviceConfigFlashRecord slot_a;
-    DeviceConfigFlashRecord slot_b;
-    const DeviceConfigFlashRecord *selected = NULL;
+    DeviceConfigFlashRecord record;
+    DeviceConfigFlashRecord selected;
+    const uint32_t sector_bases[] = {
+        DEVICE_CONFIG_SLOT_A_ADDRESS,
+        DEVICE_CONFIG_SLOT_B_ADDRESS
+    };
+    size_t sector_index;
+    uint32_t offset;
+    int selected_valid = 0;
 
     DeviceConfig_SetDefaults();
-    DeviceConfig_LoadRecord(DEVICE_CONFIG_SLOT_A_ADDRESS, &slot_a);
-    DeviceConfig_LoadRecord(DEVICE_CONFIG_SLOT_B_ADDRESS, &slot_b);
-
-    if (DeviceConfig_RecordIsValid(&slot_a))
+    for (sector_index = 0U;
+         sector_index < (sizeof(sector_bases) / sizeof(sector_bases[0]));
+         sector_index++)
     {
-        selected = &slot_a;
-        active_slot_address = DEVICE_CONFIG_SLOT_A_ADDRESS;
+        for (offset = 0U;
+             offset < DEVICE_CONFIG_SECTOR_SIZE;
+             offset += sizeof(DeviceConfigFlashRecord))
+        {
+            uint32_t address = sector_bases[sector_index] + offset;
+
+            DeviceConfig_LoadRecord(address, &record);
+            if (DeviceConfig_RecordIsErased(&record))
+            {
+                break;
+            }
+            if (DeviceConfig_RecordIsValid(&record) &&
+                (!selected_valid ||
+                 (record.generation > selected.generation)))
+            {
+                selected = record;
+                selected_valid = 1;
+                active_slot_address = address;
+            }
+        }
     }
 
-    if (DeviceConfig_RecordIsValid(&slot_b) &&
-        ((selected == NULL) || (slot_b.generation > selected->generation)))
+    if (selected_valid)
     {
-        selected = &slot_b;
-        active_slot_address = DEVICE_CONFIG_SLOT_B_ADDRESS;
-    }
-
-    if (selected != NULL)
-    {
-        DeviceConfig_RecordToConfig(selected, &current_config);
-        current_generation = selected->generation;
+        DeviceConfig_RecordToConfig(&selected, &current_config);
+        current_generation = selected.generation;
     }
 }
 
 const DeviceConfig *DeviceConfig_Get(void)
 {
     return &current_config;
+}
+
+void DeviceConfig_GetSnapshot(DeviceConfig *config)
+{
+    if (config == NULL)
+    {
+        return;
+    }
+
+    taskENTER_CRITICAL();
+    *config = current_config;
+    taskEXIT_CRITICAL();
 }
 
 int DeviceConfig_IsValid(const DeviceConfig *config)
@@ -317,7 +402,9 @@ DeviceConfigApplyResult DeviceConfig_Apply(const DeviceConfig *candidate)
         return DEVICE_CONFIG_PERSISTENCE_ERROR;
     }
 
+    taskENTER_CRITICAL();
     current_config = *candidate;
+    taskEXIT_CRITICAL();
     return DEVICE_CONFIG_APPLIED;
 }
 
@@ -348,7 +435,9 @@ int DeviceConfig_SetProvisioned(void)
         return -1;
     }
 
+    taskENTER_CRITICAL();
     current_config = candidate;
+    taskEXIT_CRITICAL();
     return 0;
 }
 

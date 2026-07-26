@@ -48,6 +48,9 @@
 #include "FreeRTOS.h"
 #include "task.h"
 #include "stm32h7xx_it.h"
+#include "security_posture.h"
+#include "system_time.h"
+#include "system_watchdog.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -61,14 +64,25 @@
 #define NET_ENABLE_DNS_SELF_TEST 0
 #endif
 
+#ifndef FIRMWARE_PRODUCTION_PROFILE
+#define FIRMWARE_PRODUCTION_PROFILE 1U
+#endif
+
 #ifndef FLASH_STAGING_BUTTON_SELF_TEST_ENABLED
-#define FLASH_STAGING_BUTTON_SELF_TEST_ENABLED 1U
+#define FLASH_STAGING_BUTTON_SELF_TEST_ENABLED \
+    (FIRMWARE_PRODUCTION_PROFILE == 0U)
+#endif
+
+#ifndef RUNTIME_HEARTBEAT_LOGS_ENABLED
+#define RUNTIME_HEARTBEAT_LOGS_ENABLED \
+    (FIRMWARE_PRODUCTION_PROFILE == 0U)
 #endif
 
 #define FLASH_STAGING_BUTTON_HOLD_MS 1500U
 #define FLASH_STAGING_BUTTON_SAMPLE_MS 20U
 #define NET_DHCP_ACQUIRE_TIMEOUT_MS 30000U
 #define NET_DHCP_RETRY_DELAY_MS      5000U
+#define PWR_VOS_READY_TIMEOUT_MS       100U
 
 /* USER CODE END PD */
 
@@ -87,14 +101,23 @@ UART_HandleTypeDef huart3;
 osThreadId_t defaultTaskHandle;
 const osThreadAttr_t defaultTask_attributes = {
   .name = "defaultTask",
-  .stack_size = 65536,
+  .stack_size = 16384,
   .priority = (osPriority_t) osPriorityNormal,
 };
 /* USER CODE BEGIN PV */
+static osThreadId_t mqttServiceTaskHandle;
+static const osThreadAttr_t mqttServiceTask_attributes = {
+  .name = "mqttService",
+  .stack_size = 65536,
+  .priority = (osPriority_t) osPriorityBelowNormal,
+};
 extern struct netif gnetif;
 uint8_t tls_test_done = 0;
 uint32_t last_blink_ms = 0;
 uint32_t last_log_ms = 0;
+static volatile uint8_t network_ready = 0U;
+static volatile uint8_t tls_initialized = 0U;
+static volatile uint8_t mqtt_ready = 0U;
 #if FLASH_STAGING_BUTTON_SELF_TEST_ENABLED
 static uint8_t flash_staging_self_test_requested = 0U;
 #endif
@@ -123,6 +146,7 @@ void StartDefaultTask(void *argument);
 
 /* USER CODE BEGIN PFP */
 static void Print_ResetReason(void);
+static void StartMqttServiceTask(void *argument);
 #if FLASH_STAGING_BUTTON_SELF_TEST_ENABLED
 static uint8_t FlashStagingSelfTest_ButtonHeldAtBoot(void);
 #endif
@@ -187,6 +211,8 @@ int main(void)
 
   /* USER CODE BEGIN SysInit */
 
+  SecurityPosture_ConfigureMpu();
+
   /* Ethernet DMA descriptors, RX pool and the LwIP heap live in D2 SRAM. */
   __HAL_RCC_D2SRAM1_CLK_ENABLE();
   __HAL_RCC_D2SRAM2_CLK_ENABLE();
@@ -246,14 +272,18 @@ int main(void)
   /* Create the thread(s) */
   /* creation of defaultTask */
   defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
+  mqttServiceTaskHandle = osThreadNew(StartMqttServiceTask,
+                                      NULL,
+                                      &mqttServiceTask_attributes);
 
-  if (defaultTaskHandle == NULL)
+  if ((defaultTaskHandle == NULL) || (mqttServiceTaskHandle == NULL))
   {
-      SYS_LOG("RTOS: defaultTask create FAILED");
+      SYS_LOG("RTOS: service task create FAILED");
+      Error_Handler();
   }
   else
   {
-      SYS_LOG("RTOS: defaultTask create OK");
+      SYS_LOG("RTOS: service tasks create OK");
   }
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
@@ -266,34 +296,8 @@ int main(void)
   /* Start scheduler */
   osKernelStart();
 
-  /* We should never get here as control is now taken by the scheduler */
-
-  /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
-  while (1)
-  {
-      //to zakomentowalam to check that
-      //    MX_LWIP_Process();
-    /* USER CODE END WHILE */
-
-    /* USER CODE BEGIN 3 */
-
-      uint32_t now = HAL_GetTick();
-
-      if ((now - last_blink_ms) >= 500)
-      {
-          last_blink_ms = now;
-          HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
-      }
-
-      if ((now - last_log_ms) >= 5000)
-      {
-          last_log_ms = now;
-          SYS_LOG("LOOP: lwip alive");
-      }
-
-      NetDebugServer_Process();
-  }
+  /* Returning from osKernelStart means the scheduler could not start. */
+  Error_Handler();
 
   /* USER CODE END 3 */
 }
@@ -306,6 +310,7 @@ void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+  uint32_t vos_wait_started_ms;
 
   /** Supply configuration update enable
   */
@@ -315,7 +320,14 @@ void SystemClock_Config(void)
   */
   __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE2);
 
-  while(!__HAL_PWR_GET_FLAG(PWR_FLAG_VOSRDY)) {}
+  vos_wait_started_ms = HAL_GetTick();
+  while(!__HAL_PWR_GET_FLAG(PWR_FLAG_VOSRDY))
+  {
+    if ((HAL_GetTick() - vos_wait_started_ms) >= PWR_VOS_READY_TIMEOUT_MS)
+    {
+      NVIC_SystemReset();
+    }
+  }
 
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
@@ -564,6 +576,8 @@ static int Net_WaitForLink(void)
 
     while (!netif_is_link_up(&gnetif))
     {
+        SystemWatchdog_Heartbeat(SYSTEM_WATCHDOG_SUPERVISOR);
+        SystemWatchdog_Service();
         if ((HAL_GetTick() - start) > 15000)
         {
             NET_LOG("NET: Ethernet link TIMEOUT");
@@ -757,6 +771,8 @@ static int Net_ConfigureConnectedInterface(void)
     {
         uint32_t now = HAL_GetTick();
 
+        SystemWatchdog_Heartbeat(SYSTEM_WATCHDOG_SUPERVISOR);
+        SystemWatchdog_Service();
         if (!netif_is_link_up(&gnetif))
         {
             NET_LOG("NET: link lost while waiting for DHCP");
@@ -787,6 +803,18 @@ static int Net_ConfigureConnectedInterface(void)
     NET_LOG(buf);
     snprintf(buf, sizeof(buf), "NET: DNS1=%s", ipaddr_ntoa(dns_getserver(1)));
     NET_LOG(buf);
+
+    if (SystemTime_SyncNetwork() != 0)
+    {
+        if (!SystemTime_IsValid())
+        {
+            NET_LOG("TIME: no valid RTC/SNTP time; TLS is blocked");
+            return -1;
+        }
+        NET_LOG("TIME: using validated RTC holdover");
+    }
+    NET_LOGF("TIME: state=%s",
+             SystemTime_StateName(SystemTime_GetState()));
 
 #if NET_ENABLE_DNS_SELF_TEST
     NET_LOG("NET: ready for DNS-only test");
@@ -825,6 +853,100 @@ static void FlashStaging_LogSnapshot(const char *source)
              (unsigned long)info->capacity_bytes,
              (unsigned long)info->file_size_bytes,
              source);
+}
+
+/*
+ * This is the sole owner of all mbedTLS/MQTT contexts.  Bounded waits during
+ * DNS, TCP, TLS, Fleet Provisioning and MQTT setup therefore cannot stop the
+ * Ethernet link supervisor in defaultTask.
+ */
+static void StartMqttServiceTask(void *argument)
+{
+    uint32_t retry_after_ms = 0U;
+
+    (void)argument;
+    SYS_LOG("RTOS: mqttService start");
+
+    for (;;)
+    {
+        uint32_t now = HAL_GetTick();
+        SystemWatchdog_Heartbeat(SYSTEM_WATCHDOG_MQTT);
+        uint8_t usable_network =
+            (tls_initialized != 0U) &&
+            (network_ready != 0U) &&
+            netif_is_link_up(&gnetif) &&
+            netif_is_up(&gnetif) &&
+            (netif_ip4_addr(&gnetif)->addr != 0U);
+
+        if (usable_network == 0U)
+        {
+            if (mqtt_ready != 0U)
+            {
+                TlsClient_Disconnect();
+                mqtt_ready = 0U;
+            }
+            osDelay(50U);
+            continue;
+        }
+
+        if ((mqtt_ready == 0U) &&
+            ((int32_t)(now - retry_after_ms) >= 0))
+        {
+            tls_test_done = 1U;
+            retry_after_ms = now + 5000U;
+            TlsClient_ClearCancel();
+            SYS_LOG("TLS TEST: start");
+
+            if (TlsClient_Connect() == 0)
+            {
+                SYS_LOG("TLS TEST: HANDSHAKE OK");
+                SYS_LOG("MQTT TEST: start");
+
+                if (TlsClient_MqttTest() == 0)
+                {
+                    SYS_LOG("MQTT TEST: OK");
+                    mqtt_ready = 1U;
+                }
+                else
+                {
+                    SYS_LOG("MQTT TEST: FAIL");
+                    (void)IotEvents_QueueAlert(
+                        IOT_ALERT_WARNING,
+                        "MQTT_CONNECT_FAILED",
+                        "MQTT session could not be established");
+                    TlsClient_Disconnect();
+                }
+            }
+            else
+            {
+                SYS_LOG("TLS TEST: HANDSHAKE FAIL");
+                (void)IotEvents_QueueAlert(
+                    IOT_ALERT_WARNING,
+                    "TLS_HANDSHAKE_FAILED",
+                    "TLS handshake with AWS IoT failed");
+            }
+        }
+
+        if (mqtt_ready != 0U)
+        {
+            if ((network_ready == 0U) ||
+                !netif_is_link_up(&gnetif) ||
+                !netif_is_up(&gnetif) ||
+                (TlsClient_MqttProcess() != 0))
+            {
+                SYS_LOG("MQTT: session lost, reconnect scheduled");
+                (void)IotEvents_QueueAlert(
+                    IOT_ALERT_WARNING,
+                    "MQTT_SESSION_LOST",
+                    "MQTT session was lost; reconnect scheduled");
+                TlsClient_Disconnect();
+                mqtt_ready = 0U;
+                retry_after_ms = HAL_GetTick() + 5000U;
+            }
+        }
+
+        osDelay(10U);
+    }
 }
 /* USER CODE END 4 */
 
@@ -871,28 +993,44 @@ void StartDefaultTask(void *argument)
              gnetif.hwaddr[4],
              gnetif.hwaddr[5]);
 
-    int network_ready = 0;
-    int tls_initialized = 0;
-    int mqtt_ready = 0;
-    uint32_t mqtt_retry_after_ms = 0U;
     uint32_t network_retry_after_ms = 0U;
 
     /* Local persistent services must be available even when Ethernet is down. */
     SYS_LOG("RTOS: local services init start");
+    if (SystemTime_Init() == 0)
+    {
+        SYS_LOGF("TIME: RTC initialized state=%s",
+                 SystemTime_StateName(SystemTime_GetState()));
+    }
+    else
+    {
+        SYS_LOG("TIME: RTC initialization FAILED");
+    }
+
     if (TlsClient_Init() == 0)
     {
-        tls_initialized = 1;
+        tls_initialized = 1U;
         SYS_LOG("RTOS: local services init OK, TLS handshake available");
     }
     else
     {
-        tls_initialized = 0;
+        tls_initialized = 0U;
         SYS_LOG("RTOS: local services init FAILED");
+    }
+
+    SecurityPosture_Report();
+    if (SystemWatchdog_InitAndStart() == 0)
+    {
+        SYS_LOG("WATCHDOG: IWDG started timeout~32s");
+    }
+    else
+    {
+        SYS_LOG("WATCHDOG: IWDG initialization FAILED");
     }
 
     if (Net_WaitForLink() == 0)
     {
-        network_ready = (Net_ConfigureConnectedInterface() == 0);
+        network_ready = (Net_ConfigureConnectedInterface() == 0) ? 1U : 0U;
         if (!network_ready)
         {
             network_retry_after_ms = HAL_GetTick() + NET_DHCP_RETRY_DELAY_MS;
@@ -901,7 +1039,7 @@ void StartDefaultTask(void *argument)
     else
     {
         NET_LOG("NET: no link, skipping DNS/TCP/TLS");
-        network_ready = 0;
+        network_ready = 0U;
     }
 
     if (network_ready)
@@ -919,13 +1057,16 @@ void StartDefaultTask(void *argument)
     {
         uint32_t now = HAL_GetTick();
 
+        SystemWatchdog_Heartbeat(SYSTEM_WATCHDOG_SUPERVISOR);
+        SystemWatchdog_Service();
         if (!mqtt_ready && ((now - last_blink_ms) >= 500U))
         {
             last_blink_ms = now;
             HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
         }
 
-        if ((now - last_log_ms) >= 5000)
+#if RUNTIME_HEARTBEAT_LOGS_ENABLED
+        if ((now - last_log_ms) >= 5000U)
         {
             last_log_ms = now;
             char buf[160];
@@ -944,23 +1085,21 @@ void StartDefaultTask(void *argument)
 
             NET_LOG(buf);
         }
+#endif
 
         if (!netif_is_link_up(&gnetif))
         {
             NET_LOG("NET: link DOWN, waiting again...");
-            network_ready = 0;
-            if (mqtt_ready)
-            {
-                TlsClient_Disconnect();
-                mqtt_ready = 0;
-            }
+            network_ready = 0U;
+            TlsClient_RequestCancel();
             (void)IotEvents_QueueAlert(IOT_ALERT_WARNING,
                                        "ETHERNET_LINK_LOST",
                                        "Ethernet link was lost");
 
             if (Net_WaitForLink() == 0)
             {
-                network_ready = (Net_ConfigureConnectedInterface() == 0);
+                network_ready =
+                    (Net_ConfigureConnectedInterface() == 0) ? 1U : 0U;
 
                 if (network_ready)
                 {
@@ -982,7 +1121,7 @@ void StartDefaultTask(void *argument)
             }
             else
             {
-                network_ready = 0;
+                network_ready = 0U;
             }
         }
 
@@ -990,74 +1129,13 @@ void StartDefaultTask(void *argument)
             (!network_ready || (netif_ip4_addr(&gnetif)->addr == 0U)) &&
             ((int32_t)(HAL_GetTick() - network_retry_after_ms) >= 0))
         {
-            if (mqtt_ready)
-            {
-                TlsClient_Disconnect();
-                mqtt_ready = 0;
-            }
-
-            network_ready = (Net_ConfigureConnectedInterface() == 0);
+            network_ready = 0U;
+            TlsClient_RequestCancel();
+            network_ready =
+                (Net_ConfigureConnectedInterface() == 0) ? 1U : 0U;
             network_retry_after_ms = network_ready
                                          ? 0U
                                          : HAL_GetTick() + NET_DHCP_RETRY_DELAY_MS;
-        }
-
-        if (!mqtt_ready &&
-            ((int32_t)(now - mqtt_retry_after_ms) >= 0) &&
-            network_ready &&
-            tls_initialized &&
-            netif_is_link_up(&gnetif) &&
-            netif_is_up(&gnetif) &&
-            netif_ip4_addr(&gnetif)->addr != 0)
-        {
-            tls_test_done = 1;
-            mqtt_retry_after_ms = now + 5000U;
-
-            SYS_LOG("TLS TEST: start");
-
-            if (TlsClient_Connect() == 0)
-            {
-                SYS_LOG("TLS TEST: HANDSHAKE OK");
-
-                SYS_LOG("MQTT TEST: start");
-
-                if (TlsClient_MqttTest() == 0)
-                {
-                    SYS_LOG("MQTT TEST: OK");
-                    mqtt_ready = 1;
-                }
-                else
-                {
-                    SYS_LOG("MQTT TEST: FAIL");
-                    (void)IotEvents_QueueAlert(IOT_ALERT_WARNING,
-                                               "MQTT_CONNECT_FAILED",
-                                               "MQTT session could not be established");
-                    TlsClient_Disconnect();
-                }
-            }
-            else
-            {
-                SYS_LOG("TLS TEST: HANDSHAKE FAIL");
-                (void)IotEvents_QueueAlert(IOT_ALERT_WARNING,
-                                           "TLS_HANDSHAKE_FAILED",
-                                           "TLS handshake with AWS IoT failed");
-            }
-        }
-
-        if (mqtt_ready)
-        {
-            if (!netif_is_link_up(&gnetif) ||
-                !netif_is_up(&gnetif) ||
-                (TlsClient_MqttProcess() != 0))
-            {
-                SYS_LOG("MQTT: session lost, reconnect scheduled");
-                (void)IotEvents_QueueAlert(IOT_ALERT_WARNING,
-                                           "MQTT_SESSION_LOST",
-                                           "MQTT session was lost; reconnect scheduled");
-                TlsClient_Disconnect();
-                mqtt_ready = 0;
-                mqtt_retry_after_ms = HAL_GetTick() + 5000U;
-            }
         }
 
         osDelay(10);

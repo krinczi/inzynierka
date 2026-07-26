@@ -1,0 +1,505 @@
+#include "system_time.h"
+
+#include "debug_logger.h"
+#include "main.h"
+
+#include "lwip/inet.h"
+#include "lwip/netdb.h"
+#include "lwip/sockets.h"
+
+#include "stm32h7xx_hal_rtc.h"
+#include "stm32h7xx_hal_rtc_ex.h"
+
+#include <errno.h>
+#include <string.h>
+
+#define SYSTEM_TIME_BACKUP_MAGIC            0x54494D45UL
+#define SYSTEM_TIME_BACKUP_MAGIC_REGISTER   RTC_BKP_DR0
+#define SYSTEM_TIME_NTP_PACKET_SIZE         48U
+#define SYSTEM_TIME_NTP_UNIX_OFFSET         2208988800UL
+#define SYSTEM_TIME_MIN_UNIX                1704067200UL /* 2024-01-01 */
+#define SYSTEM_TIME_MAX_UNIX                4102444799UL /* 2099-12-31 */
+#define SYSTEM_TIME_NTP_PORT                123U
+#define SYSTEM_TIME_NTP_TIMEOUT_MS          3000U
+#define SYSTEM_TIME_REBASE_INTERVAL_MS      43200000U
+
+static RTC_HandleTypeDef system_rtc;
+static SystemTimeState system_time_state = SYSTEM_TIME_INVALID;
+static uint32_t system_time_base_unix;
+static uint32_t system_time_base_tick;
+
+static const char *const system_time_servers[] = {
+    "time.cloudflare.com",
+    "time.google.com",
+    "pool.ntp.org"
+};
+
+static int SystemTime_IsLeapYear(uint32_t year)
+{
+    return ((year % 4U) == 0U) &&
+           (((year % 100U) != 0U) || ((year % 400U) == 0U));
+}
+
+static uint32_t SystemTime_DaysBeforeYear(uint32_t year)
+{
+    uint32_t previous = year - 1U;
+    return (365U * (year - 1970U)) +
+           (previous / 4U - 1969U / 4U) -
+           (previous / 100U - 1969U / 100U) +
+           (previous / 400U - 1969U / 400U);
+}
+
+static uint32_t SystemTime_DaysBeforeMonth(uint32_t year, uint32_t month)
+{
+    static const uint16_t cumulative_days[] = {
+        0U, 31U, 59U, 90U, 120U, 151U,
+        181U, 212U, 243U, 273U, 304U, 334U
+    };
+    uint32_t days;
+
+    if ((month < 1U) || (month > 12U))
+    {
+        return UINT32_MAX;
+    }
+
+    days = cumulative_days[month - 1U];
+    if ((month > 2U) && SystemTime_IsLeapYear(year))
+    {
+        days++;
+    }
+    return days;
+}
+
+static int SystemTime_CalendarToUnix(const RTC_DateTypeDef *date,
+                                     const RTC_TimeTypeDef *time,
+                                     uint32_t *unix_time)
+{
+    uint32_t year;
+    uint32_t month_days;
+    uint32_t days;
+    uint64_t seconds;
+
+    if ((date == NULL) || (time == NULL) || (unix_time == NULL))
+    {
+        return -1;
+    }
+
+    year = 2000U + date->Year;
+    month_days = SystemTime_DaysBeforeMonth(year, date->Month);
+    if ((year < 2024U) || (year > 2099U) ||
+        (month_days == UINT32_MAX) ||
+        (date->Date < 1U) || (date->Date > 31U) ||
+        (time->Hours > 23U) || (time->Minutes > 59U) ||
+        (time->Seconds > 59U))
+    {
+        return -1;
+    }
+
+    days = SystemTime_DaysBeforeYear(year) +
+           month_days + (uint32_t)date->Date - 1U;
+    seconds = ((uint64_t)days * 86400ULL) +
+              ((uint64_t)time->Hours * 3600ULL) +
+              ((uint64_t)time->Minutes * 60ULL) +
+              time->Seconds;
+    if ((seconds < SYSTEM_TIME_MIN_UNIX) ||
+        (seconds > SYSTEM_TIME_MAX_UNIX))
+    {
+        return -1;
+    }
+
+    *unix_time = (uint32_t)seconds;
+    return 0;
+}
+
+static int SystemTime_UnixToCalendar(uint32_t unix_time,
+                                     RTC_DateTypeDef *date,
+                                     RTC_TimeTypeDef *time)
+{
+    static const uint8_t month_lengths[] = {
+        31U, 28U, 31U, 30U, 31U, 30U,
+        31U, 31U, 30U, 31U, 30U, 31U
+    };
+    uint32_t days;
+    uint32_t seconds;
+    uint32_t year = 1970U;
+    uint32_t month = 1U;
+
+    if ((date == NULL) || (time == NULL) ||
+        (unix_time < SYSTEM_TIME_MIN_UNIX) ||
+        (unix_time > SYSTEM_TIME_MAX_UNIX))
+    {
+        return -1;
+    }
+
+    days = unix_time / 86400U;
+    seconds = unix_time % 86400U;
+    while (days >= (SystemTime_IsLeapYear(year) ? 366U : 365U))
+    {
+        days -= SystemTime_IsLeapYear(year) ? 366U : 365U;
+        year++;
+    }
+
+    while (month <= 12U)
+    {
+        uint32_t length = month_lengths[month - 1U];
+        if ((month == 2U) && SystemTime_IsLeapYear(year))
+        {
+            length++;
+        }
+        if (days < length)
+        {
+            break;
+        }
+        days -= length;
+        month++;
+    }
+
+    memset(date, 0, sizeof(*date));
+    memset(time, 0, sizeof(*time));
+    date->Year = (uint8_t)(year - 2000U);
+    date->Month = (uint8_t)month;
+    date->Date = (uint8_t)(days + 1U);
+    date->WeekDay = (uint8_t)(((unix_time / 86400U + 3U) % 7U) + 1U);
+    time->Hours = (uint8_t)(seconds / 3600U);
+    seconds %= 3600U;
+    time->Minutes = (uint8_t)(seconds / 60U);
+    time->Seconds = (uint8_t)(seconds % 60U);
+    time->DayLightSaving = RTC_DAYLIGHTSAVING_NONE;
+    time->StoreOperation = RTC_STOREOPERATION_RESET;
+    return 0;
+}
+
+static int SystemTime_ReadRtc(uint32_t *unix_time)
+{
+    RTC_TimeTypeDef time;
+    RTC_DateTypeDef date;
+
+    if ((HAL_RTC_GetTime(&system_rtc, &time, RTC_FORMAT_BIN) != HAL_OK) ||
+        (HAL_RTC_GetDate(&system_rtc, &date, RTC_FORMAT_BIN) != HAL_OK))
+    {
+        return -1;
+    }
+    return SystemTime_CalendarToUnix(&date, &time, unix_time);
+}
+
+static int SystemTime_SetRtc(uint32_t unix_time)
+{
+    RTC_TimeTypeDef time;
+    RTC_DateTypeDef date;
+
+    if (SystemTime_UnixToCalendar(unix_time, &date, &time) != 0)
+    {
+        return -1;
+    }
+
+    if ((HAL_RTC_SetTime(&system_rtc, &time, RTC_FORMAT_BIN) != HAL_OK) ||
+        (HAL_RTC_SetDate(&system_rtc, &date, RTC_FORMAT_BIN) != HAL_OK))
+    {
+        return -1;
+    }
+
+    HAL_RTCEx_BKUPWrite(&system_rtc,
+                        SYSTEM_TIME_BACKUP_MAGIC_REGISTER,
+                        SYSTEM_TIME_BACKUP_MAGIC);
+    system_time_base_unix = unix_time;
+    system_time_base_tick = HAL_GetTick();
+    return 0;
+}
+
+static int SystemTime_EnableRtcClock(uint32_t *source)
+{
+    RCC_OscInitTypeDef oscillator = { 0 };
+    uint32_t selected = __HAL_RCC_GET_RTC_SOURCE();
+
+    HAL_PWR_EnableBkUpAccess();
+
+    if (selected == RCC_RTCCLKSOURCE_LSE)
+    {
+        oscillator.OscillatorType = RCC_OSCILLATORTYPE_LSE;
+        oscillator.LSEState = RCC_LSE_ON;
+        oscillator.PLL.PLLState = RCC_PLL_NONE;
+        if (HAL_RCC_OscConfig(&oscillator) != HAL_OK)
+        {
+            return -1;
+        }
+    }
+    else if (selected == RCC_RTCCLKSOURCE_LSI)
+    {
+        oscillator.OscillatorType = RCC_OSCILLATORTYPE_LSI;
+        oscillator.LSIState = RCC_LSI_ON;
+        oscillator.PLL.PLLState = RCC_PLL_NONE;
+        if (HAL_RCC_OscConfig(&oscillator) != HAL_OK)
+        {
+            return -1;
+        }
+    }
+    else
+    {
+        oscillator.OscillatorType = RCC_OSCILLATORTYPE_LSE;
+        oscillator.LSEState = RCC_LSE_ON;
+        oscillator.PLL.PLLState = RCC_PLL_NONE;
+        if (HAL_RCC_OscConfig(&oscillator) == HAL_OK)
+        {
+            selected = RCC_RTCCLKSOURCE_LSE;
+        }
+        else
+        {
+            memset(&oscillator, 0, sizeof(oscillator));
+            oscillator.OscillatorType = RCC_OSCILLATORTYPE_LSI;
+            oscillator.LSIState = RCC_LSI_ON;
+            oscillator.PLL.PLLState = RCC_PLL_NONE;
+            if (HAL_RCC_OscConfig(&oscillator) != HAL_OK)
+            {
+                return -1;
+            }
+            selected = RCC_RTCCLKSOURCE_LSI;
+        }
+
+        __HAL_RCC_RTC_CONFIG(selected);
+    }
+
+    __HAL_RCC_RTC_ENABLE();
+    *source = selected;
+    return 0;
+}
+
+int SystemTime_Init(void)
+{
+    uint32_t source;
+    uint32_t unix_time = 0U;
+
+    memset(&system_rtc, 0, sizeof(system_rtc));
+    system_time_state = SYSTEM_TIME_INVALID;
+    system_time_base_unix = 0U;
+    system_time_base_tick = HAL_GetTick();
+
+    if (SystemTime_EnableRtcClock(&source) != 0)
+    {
+        return -1;
+    }
+
+    system_rtc.Instance = RTC;
+    system_rtc.Init.HourFormat = RTC_HOURFORMAT_24;
+    system_rtc.Init.AsynchPrediv = 127U;
+    system_rtc.Init.SynchPrediv =
+        (source == RCC_RTCCLKSOURCE_LSE) ? 255U : 249U;
+    system_rtc.Init.OutPut = RTC_OUTPUT_DISABLE;
+    system_rtc.Init.OutPutRemap = RTC_OUTPUT_REMAP_NONE;
+    system_rtc.Init.OutPutPolarity = RTC_OUTPUT_POLARITY_HIGH;
+    system_rtc.Init.OutPutType = RTC_OUTPUT_TYPE_OPENDRAIN;
+
+    if (HAL_RTC_Init(&system_rtc) != HAL_OK)
+    {
+        return -1;
+    }
+
+    if ((HAL_RTCEx_BKUPRead(&system_rtc,
+                            SYSTEM_TIME_BACKUP_MAGIC_REGISTER) ==
+         SYSTEM_TIME_BACKUP_MAGIC) &&
+        (SystemTime_ReadRtc(&unix_time) == 0))
+    {
+        system_time_base_unix = unix_time;
+        system_time_base_tick = HAL_GetTick();
+        system_time_state = SYSTEM_TIME_RTC_HOLDOVER;
+    }
+
+    return 0;
+}
+
+static int SystemTime_QueryServer(const char *hostname, uint32_t *unix_time)
+{
+    struct addrinfo hints;
+    struct addrinfo *addresses = NULL;
+    struct addrinfo *address;
+    uint8_t request[SYSTEM_TIME_NTP_PACKET_SIZE] = { 0 };
+    uint8_t response[SYSTEM_TIME_NTP_PACKET_SIZE];
+    uint32_t nonce = HAL_GetTick() ^ HAL_GetUIDw0() ^ HAL_GetUIDw2();
+    int socket_fd = -1;
+    int result = -1;
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+
+    if (lwip_getaddrinfo(hostname, "123", &hints, &addresses) != 0)
+    {
+        return -1;
+    }
+
+    request[0] = 0x23U; /* LI=0, NTPv4, client mode. */
+    request[40] = (uint8_t)(nonce >> 24U);
+    request[41] = (uint8_t)(nonce >> 16U);
+    request[42] = (uint8_t)(nonce >> 8U);
+    request[43] = (uint8_t)nonce;
+    request[44] = 0x53U;
+    request[45] = 0x54U;
+    request[46] = 0x4DU;
+    request[47] = 0x33U;
+
+    for (address = addresses; address != NULL; address = address->ai_next)
+    {
+        fd_set read_set;
+        struct timeval timeout;
+        int selected;
+        int received;
+        uint32_t ntp_seconds;
+        uint8_t mode;
+        uint8_t stratum;
+
+        socket_fd = lwip_socket(address->ai_family, SOCK_DGRAM, IPPROTO_UDP);
+        if (socket_fd < 0)
+        {
+            continue;
+        }
+
+        if (lwip_sendto(socket_fd,
+                        request,
+                        sizeof(request),
+                        0,
+                        address->ai_addr,
+                        address->ai_addrlen) != (int)sizeof(request))
+        {
+            (void)lwip_close(socket_fd);
+            socket_fd = -1;
+            continue;
+        }
+
+        FD_ZERO(&read_set);
+        FD_SET(socket_fd, &read_set);
+        timeout.tv_sec = SYSTEM_TIME_NTP_TIMEOUT_MS / 1000U;
+        timeout.tv_usec =
+            (SYSTEM_TIME_NTP_TIMEOUT_MS % 1000U) * 1000U;
+        selected = lwip_select(socket_fd + 1,
+                               &read_set,
+                               NULL,
+                               NULL,
+                               &timeout);
+        if ((selected <= 0) || !FD_ISSET(socket_fd, &read_set))
+        {
+            (void)lwip_close(socket_fd);
+            socket_fd = -1;
+            continue;
+        }
+
+        received = lwip_recv(socket_fd, response, sizeof(response), 0);
+        (void)lwip_close(socket_fd);
+        socket_fd = -1;
+        if (received < (int)sizeof(response))
+        {
+            continue;
+        }
+
+        mode = response[0] & 0x07U;
+        stratum = response[1];
+        if (((response[0] >> 6U) == 3U) ||
+            ((mode != 4U) && (mode != 5U)) ||
+            (stratum == 0U) || (stratum > 15U) ||
+            (memcmp(&response[24], &request[40], 8U) != 0))
+        {
+            continue;
+        }
+
+        ntp_seconds = ((uint32_t)response[40] << 24U) |
+                      ((uint32_t)response[41] << 16U) |
+                      ((uint32_t)response[42] << 8U) |
+                      response[43];
+        if (ntp_seconds <= SYSTEM_TIME_NTP_UNIX_OFFSET)
+        {
+            continue;
+        }
+
+        *unix_time = ntp_seconds - SYSTEM_TIME_NTP_UNIX_OFFSET;
+        if ((*unix_time >= SYSTEM_TIME_MIN_UNIX) &&
+            (*unix_time <= SYSTEM_TIME_MAX_UNIX))
+        {
+            result = 0;
+            break;
+        }
+    }
+
+    if (socket_fd >= 0)
+    {
+        (void)lwip_close(socket_fd);
+    }
+    lwip_freeaddrinfo(addresses);
+    return result;
+}
+
+int SystemTime_SyncNetwork(void)
+{
+    size_t index;
+    uint32_t unix_time = 0U;
+
+    for (index = 0U;
+         index < (sizeof(system_time_servers) / sizeof(system_time_servers[0]));
+         index++)
+    {
+        if ((SystemTime_QueryServer(system_time_servers[index],
+                                    &unix_time) == 0) &&
+            (SystemTime_SetRtc(unix_time) == 0))
+        {
+            system_time_state = SYSTEM_TIME_SNTP_SYNCHRONIZED;
+            Debug_Logf(DEBUG_SRC_NET,
+                       "TIME: synchronized server=%s unix=%lu",
+                       system_time_servers[index],
+                       (unsigned long)unix_time);
+            return 0;
+        }
+    }
+
+    Debug_LogLine(DEBUG_SRC_NET, "TIME: SNTP synchronization failed");
+    return -1;
+}
+
+int SystemTime_GetTimeval(struct timeval *value)
+{
+    uint32_t now;
+    uint32_t elapsed;
+
+    if ((value == NULL) || (system_time_state == SYSTEM_TIME_INVALID))
+    {
+        errno = ENODATA;
+        return -1;
+    }
+
+    now = HAL_GetTick();
+    elapsed = now - system_time_base_tick;
+    if (elapsed >= SYSTEM_TIME_REBASE_INTERVAL_MS)
+    {
+        uint32_t rtc_unix;
+        if (SystemTime_ReadRtc(&rtc_unix) == 0)
+        {
+            system_time_base_unix = rtc_unix;
+            system_time_base_tick = now;
+            elapsed = 0U;
+        }
+    }
+
+    value->tv_sec = (time_t)(system_time_base_unix + (elapsed / 1000U));
+    value->tv_usec = (suseconds_t)((elapsed % 1000U) * 1000U);
+    return 0;
+}
+
+int SystemTime_IsValid(void)
+{
+    return system_time_state != SYSTEM_TIME_INVALID;
+}
+
+SystemTimeState SystemTime_GetState(void)
+{
+    return system_time_state;
+}
+
+const char *SystemTime_StateName(SystemTimeState state)
+{
+    switch (state)
+    {
+        case SYSTEM_TIME_RTC_HOLDOVER:
+            return "RTC_HOLDOVER";
+        case SYSTEM_TIME_SNTP_SYNCHRONIZED:
+            return "SNTP_SYNCHRONIZED";
+        case SYSTEM_TIME_INVALID:
+        default:
+            return "INVALID";
+    }
+}

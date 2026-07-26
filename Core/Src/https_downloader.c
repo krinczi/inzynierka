@@ -35,6 +35,7 @@
      HTTPS_REQUEST_FIXED_OVERHEAD)
 #define HTTPS_HEADER_MAX_LENGTH          2048U
 #define HTTPS_IO_BUFFER_SIZE             1024U
+#define HTTPS_FLASH_SERVICE_CHUNK_SIZE    256U
 #define HTTPS_PORT                        443U
 #define HTTPS_DNS_TIMEOUT_MS            15000U
 #define HTTPS_TCP_TIMEOUT_MS            10000U
@@ -56,6 +57,7 @@ typedef enum
     DOWNLOADER_STATE_TLS_SETUP,
     DOWNLOADER_STATE_TLS_HANDSHAKE,
     DOWNLOADER_STATE_SEND_REQUEST,
+    DOWNLOADER_STATE_FLASH_PREPARE,
     DOWNLOADER_STATE_READ_RESPONSE,
     DOWNLOADER_STATE_SUCCEEDED,
     DOWNLOADER_STATE_FAILED
@@ -94,6 +96,8 @@ typedef struct
     uint8_t io_buffer[HTTPS_IO_BUFFER_SIZE];
     uint8_t header_buffer[HTTPS_HEADER_MAX_LENGTH];
     size_t header_length;
+    size_t pending_body_offset;
+    size_t pending_body_length;
     uint8_t headers_complete;
     char last_error[48];
 } HttpsDownloaderContext;
@@ -163,6 +167,8 @@ static void Downloader_ResetAttemptBuffers(void)
     downloader.request_length = 0U;
     downloader.request_sent = 0U;
     downloader.header_length = 0U;
+    downloader.pending_body_offset = 0U;
+    downloader.pending_body_length = 0U;
     downloader.headers_complete = 0U;
     downloader.bytes_received = 0U;
     downloader.next_progress_bytes = HTTPS_PROGRESS_STEP_BYTES;
@@ -913,15 +919,16 @@ static int Downloader_ParseHeaders(size_t header_bytes)
         return -1;
     }
 
-    if (FlashStaging_Begin(downloader.expected_size,
-                           downloader.expected_sha256) != FLASH_STAGING_OK)
+    if (FlashStaging_PrepareStart(downloader.expected_size,
+                                  downloader.expected_sha256) !=
+        FLASH_STAGING_IN_PROGRESS)
     {
         Downloader_Fail("flash_begin_failed", 0);
         return -1;
     }
     downloader.flash_started = 1U;
-    downloader.headers_complete = 1U;
-    Downloader_Logf("HTTPS: response accepted size=%lu",
+    downloader.state = DOWNLOADER_STATE_FLASH_PREPARE;
+    Downloader_Logf("HTTPS: response validated, Flash preparation size=%lu",
                     (unsigned long)downloader.expected_size);
     return 0;
 }
@@ -981,6 +988,39 @@ static int Downloader_WriteBody(const uint8_t *data, size_t length)
     return 0;
 }
 
+static int Downloader_PrepareFlash(void)
+{
+    FlashStagingResult result = FlashStaging_PrepareStep();
+    int write_result = 0;
+
+    if (result == FLASH_STAGING_IN_PROGRESS)
+    {
+        return 0;
+    }
+    if (result != FLASH_STAGING_OK)
+    {
+        Downloader_Fail("flash_begin_failed", 0);
+        return -1;
+    }
+
+    downloader.headers_complete = 1U;
+    downloader.state = DOWNLOADER_STATE_READ_RESPONSE;
+    Downloader_Logf("HTTPS: response accepted size=%lu",
+                    (unsigned long)downloader.expected_size);
+
+    if (downloader.pending_body_length > 0U)
+    {
+        write_result = Downloader_WriteBody(
+            &downloader.header_buffer[downloader.pending_body_offset],
+            downloader.pending_body_length);
+    }
+
+    downloader.pending_body_offset = 0U;
+    downloader.pending_body_length = 0U;
+    downloader.header_length = 0U;
+    return write_result;
+}
+
 static int Downloader_HandleReceived(const uint8_t *data, size_t length)
 {
     size_t index;
@@ -1013,12 +1053,8 @@ static int Downloader_HandleReceived(const uint8_t *data, size_t length)
             {
                 return -1;
             }
-            if (body_bytes > 0U)
-            {
-                return Downloader_WriteBody(
-                    &downloader.header_buffer[header_bytes],
-                    body_bytes);
-            }
+            downloader.pending_body_offset = header_bytes;
+            downloader.pending_body_length = body_bytes;
             return 0;
         }
     }
@@ -1028,9 +1064,10 @@ static int Downloader_HandleReceived(const uint8_t *data, size_t length)
 
 static int Downloader_ReadResponse(void)
 {
+    size_t read_length = HTTPS_FLASH_SERVICE_CHUNK_SIZE;
     int result = mbedtls_ssl_read(&downloader.ssl,
                                   downloader.io_buffer,
-                                  sizeof(downloader.io_buffer));
+                                  read_length);
 
     if (result > 0)
     {
@@ -1102,6 +1139,8 @@ void HttpsDownloader_Init(mbedtls_x509_crt *root_ca,
     downloader.request_length = 0U;
     downloader.request_sent = 0U;
     downloader.header_length = 0U;
+    downloader.pending_body_offset = 0U;
+    downloader.pending_body_length = 0U;
     downloader.headers_complete = 0U;
     memset(downloader.expected_sha256, 0, sizeof(downloader.expected_sha256));
     Downloader_SetError("none");
@@ -1223,6 +1262,9 @@ int HttpsDownloader_Process(void)
     case DOWNLOADER_STATE_SEND_REQUEST:
         Downloader_SendRequest();
         break;
+
+    case DOWNLOADER_STATE_FLASH_PREPARE:
+        return Downloader_PrepareFlash();
 
     case DOWNLOADER_STATE_READ_RESPONSE:
         return Downloader_ReadResponse();

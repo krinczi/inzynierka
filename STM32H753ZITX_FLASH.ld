@@ -47,7 +47,8 @@ MEMORY
    * Application code is restricted to Bank 1. Bank 2 is reserved for
    * download staging and the existing dual-slot configuration store.
    */
-  FLASH (rx)              : ORIGIN = 0x08000000, LENGTH = 768K
+  FLASH (rx)              : ORIGIN = 0x08000000, LENGTH = 640K
+  FLASH_EVENT_JOURNAL (r) : ORIGIN = 0x080A0000, LENGTH = 128K
   FLASH_CREDENTIALS_A (r) : ORIGIN = 0x080C0000, LENGTH = 128K
   FLASH_CREDENTIALS_B (r) : ORIGIN = 0x080E0000, LENGTH = 128K
   FLASH_STAGING_META (r)  : ORIGIN = 0x08100000, LENGTH = 128K
@@ -64,9 +65,13 @@ __flash_staging_metadata_start__ = ORIGIN(FLASH_STAGING_META);
 __flash_staging_metadata_end__ = ORIGIN(FLASH_STAGING_META) + LENGTH(FLASH_STAGING_META);
 __flash_staging_data_start__ = ORIGIN(FLASH_STAGING_DATA);
 __flash_staging_data_end__ = ORIGIN(FLASH_STAGING_DATA) + LENGTH(FLASH_STAGING_DATA);
+__iot_event_journal_start__ = ORIGIN(FLASH_EVENT_JOURNAL);
+__iot_event_journal_end__ = ORIGIN(FLASH_EVENT_JOURNAL) + LENGTH(FLASH_EVENT_JOURNAL);
 
-ASSERT(ORIGIN(FLASH) + LENGTH(FLASH) <= ORIGIN(FLASH_STAGING_META),
-       "Application overlaps Flash staging metadata")
+ASSERT(ORIGIN(FLASH) + LENGTH(FLASH) <= ORIGIN(FLASH_EVENT_JOURNAL),
+       "Application overlaps persistent event journal")
+ASSERT(ORIGIN(FLASH_EVENT_JOURNAL) + LENGTH(FLASH_EVENT_JOURNAL) <= ORIGIN(FLASH_CREDENTIALS_A),
+       "Persistent event journal overlaps credential slot A")
 ASSERT(ORIGIN(FLASH) + LENGTH(FLASH) <= ORIGIN(FLASH_CREDENTIALS_A),
        "Application overlaps credential slot A")
 ASSERT(ORIGIN(FLASH_CREDENTIALS_A) + LENGTH(FLASH_CREDENTIALS_A) <= ORIGIN(FLASH_CREDENTIALS_B),

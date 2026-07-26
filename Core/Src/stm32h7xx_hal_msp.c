@@ -216,4 +216,23 @@ void HAL_UART_MspDeInit(UART_HandleTypeDef* huart)
 
 /* USER CODE BEGIN 1 */
 
+void HAL_ADC_MspInit(ADC_HandleTypeDef *hadc)
+{
+  if ((hadc != NULL) && (hadc->Instance == ADC3))
+  {
+    __HAL_RCC_ADC3_CLK_ENABLE();
+    __HAL_RCC_ADC_CONFIG(RCC_ADCCLKSOURCE_CLKP);
+  }
+}
+
+void HAL_ADC_MspDeInit(ADC_HandleTypeDef *hadc)
+{
+  if ((hadc != NULL) && (hadc->Instance == ADC3))
+  {
+    __HAL_RCC_ADC3_FORCE_RESET();
+    __HAL_RCC_ADC3_RELEASE_RESET();
+    __HAL_RCC_ADC3_CLK_DISABLE();
+  }
+}
+
 /* USER CODE END 1 */

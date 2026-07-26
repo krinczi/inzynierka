@@ -5,7 +5,7 @@
 #include <stdint.h>
 
 #define IOT_EVENT_SCHEMA_VERSION       1U
-#define IOT_EVENT_QUEUE_CAPACITY       8U
+#define IOT_EVENT_QUEUE_CAPACITY       16U
 #define IOT_EVENT_ID_CAPACITY          32U
 #define IOT_EVENT_CODE_CAPACITY        40U
 #define IOT_EVENT_SOURCE_CAPACITY      24U
@@ -64,10 +64,15 @@ IotEventResult IotEvents_QueueDiagnostic(IotDiagnosticLevel level,
                                          const char *source,
                                          const char *code,
                                          const char *message);
-const IotEventMessage *IotEvents_Peek(void);
-void IotEvents_Pop(void);
+int IotEvents_PeekCopy(IotEventMessage *event);
+/*
+ * Removes the event only after a durable acknowledgement has been written.
+ * Returns 0 when removed or not matched, -1 on persistent journal failure.
+ */
+int IotEvents_PopIfMatch(const char *message_id);
 size_t IotEvents_PendingCount(void);
 uint32_t IotEvents_DroppedCount(void);
+uint32_t IotEvents_PersistenceFailureCount(void);
 const char *IotEvents_SeverityName(uint8_t severity);
 const char *IotEvents_DiagnosticLevelName(uint8_t level);
 
