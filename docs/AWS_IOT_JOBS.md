@@ -1,8 +1,8 @@
 # AWS IoT Jobs control plane
 
-Status: MQTT Jobs discovery, document validation, HTTPS download to Flash
-staging, integrity verification, retry, and terminal status reporting
-implemented.
+Status: MQTT Jobs discovery, document validation, bounded HTTPS download,
+service-file staging, signed firmware installation, retry, and durable terminal
+status reporting implemented.
 
 ## Device workflow
 
@@ -16,9 +16,14 @@ implemented.
 7. Publish `SUCCEEDED` for a valid `validate-only` document or start a bounded
    HTTPS transfer for `download` mode. `start-next` has already moved the AWS
    execution to `IN_PROGRESS`.
-8. For a download, validate HTTP metadata, stream the body into Flash staging,
-   and verify SHA-256 before publishing `SUCCEEDED` or `FAILED`.
-9. Wait for `update/accepted`; then request the next execution.
+8. For a download, validate HTTP metadata, stream the body into the secondary
+   Flash slot, and verify the complete-package SHA-256.
+9. For `service-file`, publish the terminal status after staging. For
+   `firmware`, verify the embedded signed manifest, persist the Job identity,
+   mark the candidate ready, and reset for bootloader installation.
+10. Publish firmware `SUCCEEDED` only after the trial image confirms healthy.
+    Candidate rejection or automatic rollback is reported after MQTT reconnect.
+11. Wait for `update/accepted`; then request the next execution.
 
 After a disconnect, local state is cleared. On reconnect, `start-next` asks AWS
 for the current in-progress execution first, making recovery deterministic.
@@ -61,7 +66,7 @@ The same payload is stored in
 `example.invalid` is deliberate: this stage validates metadata and never opens
 the URL.
 
-For a real download, change only the mode and URL:
+For a real non-executable service-file download, set the mode and URL:
 
 ```json
 {
@@ -69,6 +74,7 @@ For a real download, change only the mode and URL:
   "operation": "stage-file",
   "mode": "download",
   "artifact": {
+    "artifactType": "service-file",
     "url": "https://presigned-s3-url",
     "size": 21,
     "sha256": "0b3ebe7968f366ae0a7e257a483dc6c27e7f19776c775c3aa1af6ac82f35dab4"
@@ -80,6 +86,29 @@ The URL must be a real, unexpired HTTPS URL. It is retained only for the
 duration of the transfer and is never written to UART logs. The matching
 `docs/examples/aws-job-download-template.json` intentionally contains an
 invalid placeholder URL and must not be submitted unchanged.
+
+For a signed executable package:
+
+```json
+{
+  "schemaVersion": 1,
+  "operation": "stage-file",
+  "mode": "download",
+  "artifact": {
+    "artifactType": "firmware",
+    "version": 2,
+    "url": "https://presigned-s3-url",
+    "size": 329980,
+    "sha256": "<sha256-of-complete-ota-package>"
+  }
+}
+```
+
+`version` must match the signed version in the embedded `OTA3` header and must
+be greater than the confirmed anti-rollback floor. The `sha256` in the Job
+protects transport of the whole package; the package also contains a signed
+payload digest verified independently by the application and bootloader. See
+`docs/FULL_OTA.md`.
 
 ## Validation and safety limits
 
@@ -102,7 +131,12 @@ invalid placeholder URL and must not be submitted unchanged.
   decoded payload of 3839 bytes. This accommodates the AWS execution envelope
   plus the supported 2048-character URL while still rejecting oversized job
   responses before copying them to the parser stack.
-- Artifact size must be from 1 byte through the actual Flash staging capacity.
+- Artifact size must be from 1 byte through the secondary-slot capacity.
+- `artifactType` may be `service-file` or `firmware`. An omitted type is
+  treated as a service file for compatibility with existing Jobs.
+- A firmware artifact requires a nonzero monotonic `version`.
+- Firmware package size includes the fixed 1024-byte signed header and cannot
+  exceed the 512 KiB secondary slot.
 - SHA-256 must contain exactly 64 hexadecimal characters and is decoded into
   32 bytes during validation.
 - The URL is never written to UART logs because a future presigned URL contains
@@ -116,6 +150,9 @@ invalid placeholder URL and must not be submitted unchanged.
 - Flash erase starts only after the HTTP status and exact length are valid.
 - Network/DNS/TLS/truncated-transfer failures are retried from byte zero up to
   three attempts with backoff. A reconnect also restarts safely from zero.
+- Firmware is not reported as successful merely because the download
+  completed. Job identity and execution version survive reset; terminal status
+  follows trial confirmation, candidate rejection, or rollback.
 - Each network/TLS/Flash call is bounded; MQTT processing and keep-alive run
   between downloader steps.
 - Total download time is limited to eight minutes, below the ten-minute Jobs
@@ -176,9 +213,25 @@ JOBS: status=SUCCEEDED published job=stm32-download-...
 JOBS: status=SUCCEEDED accepted job=stm32-download-...
 ```
 
-AWS should show the job execution as `SUCCEEDED`. For `validate-only`, Flash
-staging and device configuration remain unchanged. For `download`, staging
-changes to `READY` only after the exact size and SHA-256 have been verified.
+With a valid signed firmware package, the download phase ends by scheduling a
+bootloader installation. After reset and local health confirmation, the
+reconnected application reports:
+
+```text
+JOBS: firmware candidate ready job=stm32-firmware-... version=2
+OTA: trial image confirmed version=2
+JOBS: status=SUCCEEDED published job=stm32-firmware-...
+JOBS: status=SUCCEEDED accepted job=stm32-firmware-...
+```
+
+If the candidate is invalid, the terminal detail is `candidate_rejected`. If
+the trial never becomes healthy and the previous image is restored, it is
+`trial_health_failed`.
+
+For `validate-only`, Flash staging and device configuration remain unchanged.
+For a service-file download, staging changes to `READY` only after exact size
+and SHA-256 verification. For firmware, AWS should show `SUCCEEDED` only after
+the newly installed image has passed the local trial health gate.
 
 ## End-to-end S3 test from AWS CloudShell
 

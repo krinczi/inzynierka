@@ -1,9 +1,8 @@
 # Production hardening status
 
-This document separates mechanisms implemented in the application firmware
-from controls that require board hardware, AWS operations, a middleware
-migration, or a separate bootloader. It intentionally avoids calling secure
-artifact staging a complete OTA update.
+This document separates mechanisms implemented in the application and
+bootloader from controls that require board hardware, AWS operations, or a
+middleware migration.
 
 ## Implemented in the application
 
@@ -90,21 +89,30 @@ For stronger extraction resistance, use a secure element and override the
 credential backend. CRC and MPU do not encrypt private keys against invasive
 physical access.
 
-### Signed firmware contract
+### Complete signed OTA boot chain
 
-Jobs remain compatible with `service-file` staging. A job whose
-`artifactType` is `firmware` must also contain a Base64 `signature` over the
-artifact SHA-256 digest. The signature is verified before download. Firmware
-is rejected when the public trust anchor is missing or verification fails.
+- A separate bootloader occupies a dedicated 128 KiB sector.
+- Primary and secondary 512 KiB slots hold complete signed OTA packages.
+- Every package contains an `OTA3` manifest, payload SHA-256, target ID,
+  monotonic version, vector metadata, and raw ECDSA-P256 signature.
+- The application and bootloader independently verify the package.
+- Installation uses a power-loss-resumable sector swap and dedicated scratch
+  sector.
+- Trial images are confirmed only after local persistent services and IWDG are
+  operational.
+- Three unconfirmed trial boots trigger automatic restoration of the previous
+  image.
+- The confirmed version is a monotonic anti-rollback floor.
+- AWS Job completion is retained across reset and reported only after
+  confirmation, rejection, or rollback.
 
-The board integration supplies only a public key by overriding:
+Jobs remain compatible with non-executable `service-file` staging. The
+firmware signing private key is never stored in the repository or device; only
+the public P-256 trust anchor is compiled into the boot chain. The complete
+format, release commands, state machine, and hardware evidence are documented
+in `docs/FULL_OTA.md`.
 
-`FirmwareTrustAnchor_GetPublicKeyPem`
-
-The offline signing private key must never be stored in this repository or on
-the device.
-
-## Separate production deliverables
+## Remaining production deliverables
 
 ### Middleware migration
 
@@ -123,22 +131,14 @@ must include:
 Until that migration is complete, the runtime emits an explicit legacy
 dependency warning and the image must not be classified as production-ready.
 
-### Complete OTA boot chain
+### Boot-chain deployment controls
 
-The application securely downloads, hashes, authenticates, and stages an
-artifact. A complete production OTA still requires a separately reviewed
-bootloader that provides:
-
-- immutable or protected root of trust;
-- image signature verification during every boot;
-- A/B installation or a recoverable swap procedure;
-- monotonic anti-rollback version/counter;
-- trial boot and application health confirmation;
-- automatic rollback after failed confirmation;
-- power-loss tests for every state transition.
-
-Without that bootloader, the supported capability name is **secure firmware
-artifact staging**, not production OTA.
+The OTA software path is implemented. Production manufacturing must still
+write-protect the bootloader, apply the approved RDP/PCROP/WRP option-byte
+policy, move release signing to an HSM or protected CI service, define signing
+key rotation/revocation, and execute repeated power-cut qualification at every
+Flash transition. These controls deliberately remain outside normal
+application firmware.
 
 ## Claim-certificate operations
 

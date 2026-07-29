@@ -32,8 +32,7 @@ void HttpsDownloader_Init(mbedtls_x509_crt *root_ca,
 /* Copies all arguments. The URL is deliberately never exposed through logs. */
 int HttpsDownloader_Start(
     const char *url,
-    uint32_t expected_size,
-    const uint8_t expected_sha256[FLASH_STAGING_SHA256_SIZE]);
+    const FlashStagingRequest *request);
 
 /*
  * Advances at most one bounded network/TLS/Flash step. Returns 1 after a

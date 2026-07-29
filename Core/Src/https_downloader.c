@@ -87,6 +87,7 @@ typedef struct
     uint32_t bytes_received;
     uint32_t next_progress_bytes;
     uint8_t expected_sha256[FLASH_STAGING_SHA256_SIZE];
+    FlashStagingRequest staging_request;
     char host[HTTPS_HOST_MAX_LENGTH + 1U];
     char target[HTTPS_TARGET_MAX_LENGTH + 1U];
     char resolved_ip[48];
@@ -919,8 +920,7 @@ static int Downloader_ParseHeaders(size_t header_bytes)
         return -1;
     }
 
-    if (FlashStaging_PrepareStart(downloader.expected_size,
-                                  downloader.expected_sha256) !=
+    if (FlashStaging_PrepareArtifact(&downloader.staging_request) !=
         FLASH_STAGING_IN_PROGRESS)
     {
         Downloader_Fail("flash_begin_failed", 0);
@@ -1148,15 +1148,15 @@ void HttpsDownloader_Init(mbedtls_x509_crt *root_ca,
 
 int HttpsDownloader_Start(
     const char *url,
-    uint32_t expected_size,
-    const uint8_t expected_sha256[FLASH_STAGING_SHA256_SIZE])
+    const FlashStagingRequest *request)
 {
     const FlashStagingInfo *staging = FlashStaging_GetInfo();
 
     if ((downloader.root_ca == NULL) || (downloader.rng == NULL) ||
-        (url == NULL) || (expected_sha256 == NULL) ||
+        (url == NULL) || (request == NULL) ||
         (strlen(url) > HTTPS_URL_MAX_LENGTH) ||
-        (expected_size == 0U) || (expected_size > staging->capacity_bytes) ||
+        (request->file_size_bytes == 0U) ||
+        (request->file_size_bytes > staging->capacity_bytes) ||
         (downloader.status == HTTPS_DOWNLOADER_RUNNING))
     {
         return -1;
@@ -1171,9 +1171,10 @@ int HttpsDownloader_Start(
         return -1;
     }
 
-    downloader.expected_size = expected_size;
+    downloader.staging_request = *request;
+    downloader.expected_size = request->file_size_bytes;
     memcpy(downloader.expected_sha256,
-           expected_sha256,
+           request->expected_sha256,
            sizeof(downloader.expected_sha256));
     downloader.attempt = 1U;
     downloader.total_deadline_ms = HAL_GetTick() + HTTPS_TOTAL_TIMEOUT_MS;
@@ -1182,7 +1183,7 @@ int HttpsDownloader_Start(
     downloader.status = HTTPS_DOWNLOADER_RUNNING;
     Downloader_SetError("none");
     Downloader_Logf("HTTPS: download started size=%lu attempt=1/%u",
-                    (unsigned long)expected_size,
+                    (unsigned long)request->file_size_bytes,
                     (unsigned int)HTTPS_MAX_ATTEMPTS);
     return 0;
 }
@@ -1301,6 +1302,8 @@ void HttpsDownloader_Reset(void)
     downloader.host[0] = '\0';
     downloader.target[0] = '\0';
     memset(downloader.expected_sha256, 0, sizeof(downloader.expected_sha256));
+    memset(&downloader.staging_request, 0,
+           sizeof(downloader.staging_request));
     Downloader_SetError("none");
 }
 

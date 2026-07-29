@@ -51,6 +51,7 @@
 #include "security_posture.h"
 #include "system_time.h"
 #include "system_watchdog.h"
+#include "ota_manager.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -871,6 +872,7 @@ static void StartMqttServiceTask(void *argument)
     {
         uint32_t now = HAL_GetTick();
         SystemWatchdog_Heartbeat(SYSTEM_WATCHDOG_MQTT);
+        OtaManager_Process(now);
         uint8_t usable_network =
             (tls_initialized != 0U) &&
             (network_ready != 0U) &&
@@ -994,6 +996,7 @@ void StartDefaultTask(void *argument)
              gnetif.hwaddr[5]);
 
     uint32_t network_retry_after_ms = 0U;
+    uint8_t watchdog_ready = 0U;
 
     /* Local persistent services must be available even when Ethernet is down. */
     SYS_LOG("RTOS: local services init start");
@@ -1021,11 +1024,32 @@ void StartDefaultTask(void *argument)
     SecurityPosture_Report();
     if (SystemWatchdog_InitAndStart() == 0)
     {
+        watchdog_ready = 1U;
         SYS_LOG("WATCHDOG: IWDG started timeout~32s");
     }
     else
     {
         SYS_LOG("WATCHDOG: IWDG initialization FAILED");
+    }
+
+    /*
+     * A trial image is healthy once persistent local services and the
+     * independent watchdog are operational. Cloud connectivity is not a
+     * health prerequisite: an Ethernet outage must not roll back good code.
+     * The AWS Jobs terminal report remains pending until MQTT reconnects.
+     */
+    if ((tls_initialized != 0U) &&
+        (watchdog_ready != 0U) &&
+        (OtaManager_IsTrial() != 0))
+    {
+        if (OtaManager_ConfirmHealthy() == 0)
+        {
+            SYS_LOG("OTA: local health gate passed, image confirmed");
+        }
+        else
+        {
+            SYS_LOG("OTA: local health confirmation failed");
+        }
     }
 
     if (Net_WaitForLink() == 0)

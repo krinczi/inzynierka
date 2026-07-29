@@ -1,8 +1,8 @@
 # Flash staging for AWS IoT Jobs
 
-Status: storage foundation, AWS IoT Jobs control plane, and bounded HTTPS
-artifact download implemented. Firmware installation/bootloader OTA remains
-outside this stage.
+Status: bounded HTTPS artifact download, service-file staging, and signed
+dual-slot firmware OTA implemented. See `docs/FULL_OTA.md` for installation,
+trial boot, anti-rollback, and automatic rollback.
 
 ## Memory layout
 
@@ -11,16 +11,19 @@ STM32H753ZI provides 2 MiB of internal Flash split into two 1 MiB banks with
 
 | Range | Size | Purpose |
 | --- | ---: | --- |
-| `0x08000000-0x080BFFFF` | 768 KiB | Executable application (Bank 1) |
+| `0x08000000-0x0801FFFF` | 128 KiB | Bootloader (Bank 1) |
+| `0x08020000-0x0809FFFF` | 512 KiB | Primary signed-image slot |
+| `0x080A0000-0x080BFFFF` | 128 KiB | Durable critical-event journal |
 | `0x080C0000-0x080DFFFF` | 128 KiB | Credential log A (Bank 1) |
 | `0x080E0000-0x080FFFFF` | 128 KiB | Credential log B (Bank 1) |
-| `0x08100000-0x0811FFFF` | 128 KiB | Staging metadata (Bank 2, sector 0) |
-| `0x08120000-0x081BFFFF` | 640 KiB | Staged file data (Bank 2, sectors 1-5) |
+| `0x08100000-0x0811FFFF` | 128 KiB | OTA control journal (Bank 2) |
+| `0x08120000-0x0819FFFF` | 512 KiB | Secondary signed-image/staging slot |
+| `0x081A0000-0x081BFFFF` | 128 KiB | Swap scratch and journal backup |
 | `0x081C0000-0x081DFFFF` | 128 KiB | Configuration slot A |
 | `0x081E0000-0x081FFFFF` | 128 KiB | Configuration slot B |
 
 The linker fails the build if executable sections exceed the dedicated
-768 KiB application area.
+primary payload area (`512 KiB - 1024 bytes`).
 
 ## Safety properties
 
@@ -35,7 +38,10 @@ The linker fails the build if executable sections exceed the dedicated
 - The metadata word containing the magic and committed state is written last.
 - A power loss before metadata commit leaves no valid staged file.
 - On boot, committed metadata and the complete file SHA-256 are verified.
-- Application code executes from Bank 1 while staging writes target Bank 2.
+- Application code executes from Bank 1 while download writes target Bank 2.
+- Firmware packages contain a signed `OTA3` header and are revalidated by the
+  bootloader before installation.
+- Service files remain non-executable and are never selected by the bootloader.
 
 ## API lifecycle
 
@@ -49,7 +55,7 @@ The linker fails the build if executable sections exceed the dedicated
 7. `FlashStaging_Abort()` invalidates metadata; the next preparation erases
    only the sectors required by the new file.
 
-An interrupted download is deliberately restarted from byte zero in version 1.
+An interrupted download is deliberately restarted from byte zero.
 This provides deterministic retry without trusting partially written data.
 
 ## Hardware self-test for this stage

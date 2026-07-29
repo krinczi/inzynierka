@@ -2,9 +2,9 @@
 
 #include "debug_logger.h"
 #include "flash_staging.h"
-#include "firmware_authenticity.h"
 #include "https_downloader.h"
 #include "main.h"
+#include "ota_manager.h"
 #include <stdint.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -15,7 +15,6 @@
 #define AWS_JOBS_MODE_MAX_LENGTH         24U
 #define AWS_JOBS_URL_MAX_LENGTH         HTTPS_DOWNLOADER_URL_MAX_LENGTH
 #define AWS_JOBS_SHA256_HEX_LENGTH       64U
-#define AWS_JOBS_SIGNATURE_MAX_LENGTH   700U
 #define AWS_JOBS_JSON_MAX_DEPTH          8U
 #define AWS_JOBS_STEP_TIMEOUT_MINUTES    10U
 #define AWS_JOBS_RETRY_BASE_MS            5000U
@@ -56,6 +55,7 @@ typedef struct
     char url[AWS_JOBS_URL_MAX_LENGTH + 1U];
     uint32_t size_bytes;
     uint8_t sha256[FLASH_STAGING_SHA256_SIZE];
+    uint32_t image_version;
     AwsJobsDocumentMode mode;
     AwsJobsArtifactType type;
 } AwsJobsArtifact;
@@ -70,6 +70,8 @@ typedef struct
     uint32_t retry_after_ms;
     uint32_t response_deadline_ms;
     uint8_t retry_attempt;
+    uint8_t pending_install;
+    uint8_t pending_ota_report;
     char active_job_id[AWS_JOBS_JOB_ID_MAX_LENGTH + 1U];
     char pending_status[16];
     char base_topic[AWS_JOBS_TOPIC_MAX_LENGTH];
@@ -714,7 +716,6 @@ static int Jobs_ValidateDocument(JsonSlice document,
     char mode[AWS_JOBS_MODE_MAX_LENGTH + 1U];
     char sha256_hex[AWS_JOBS_SHA256_HEX_LENGTH + 1U];
     char artifact_type[24];
-    char signature[AWS_JOBS_SIGNATURE_MAX_LENGTH + 1U];
     const FlashStagingInfo *staging_info = FlashStaging_GetInfo();
 
     if ((Json_GetRequiredUInt32(document, "schemaVersion", &schema_version) != 0) ||
@@ -825,26 +826,13 @@ static int Jobs_ValidateDocument(JsonSlice document,
 
             if (strcmp(artifact_type, "firmware") == 0)
             {
-                FirmwareAuthenticityResult auth_result;
-
                 artifact->type = AWS_JOBS_ARTIFACT_FIRMWARE;
-                if (Json_GetRequiredString(artifact_object,
-                                           "signature",
-                                           signature,
-                                           sizeof(signature)) != 0)
+                if ((Json_GetRequiredUInt32(artifact_object,
+                                            "version",
+                                            &artifact->image_version) != 0) ||
+                    (artifact->image_version == 0U))
                 {
-                    *reason = "firmware_signature_required";
-                    return -1;
-                }
-
-                auth_result =
-                    FirmwareAuthenticity_VerifySha256(artifact->sha256,
-                                                       signature);
-                if (auth_result != FIRMWARE_AUTH_OK)
-                {
-                    Jobs_Logf("JOBS: firmware authenticity rejected reason=%s",
-                              FirmwareAuthenticity_ResultName(auth_result));
-                    *reason = "firmware_signature_invalid";
+                    *reason = "firmware_version_required";
                     return -1;
                 }
             }
@@ -999,6 +987,7 @@ static int Jobs_HandleStartNextAccepted(const char *payload)
     JsonSlice execution;
     JsonSlice document;
     AwsJobsArtifact artifact;
+    FlashStagingRequest download_request;
     const char *reason;
     int member_result;
 
@@ -1077,10 +1066,26 @@ static int Jobs_HandleStartNextAccepted(const char *payload)
                    : -1;
     }
 
+    memset(&download_request, 0, sizeof(download_request));
+    download_request.type =
+        artifact.type == AWS_JOBS_ARTIFACT_FIRMWARE
+            ? FLASH_STAGING_ARTIFACT_FIRMWARE
+            : FLASH_STAGING_ARTIFACT_SERVICE_FILE;
+    download_request.file_size_bytes = artifact.size_bytes;
+    memcpy(download_request.expected_sha256,
+           artifact.sha256,
+           sizeof(download_request.expected_sha256));
+    download_request.expected_image_version = artifact.image_version;
+    (void)snprintf(download_request.job_id,
+                   sizeof(download_request.job_id),
+                   "%s",
+                   jobs_context.active_job_id);
+    download_request.job_execution_version =
+        jobs_context.execution_version;
+
     if ((jobs_context.download_start == NULL) ||
         (jobs_context.download_start(artifact.url,
-                                     artifact.size_bytes,
-                                     artifact.sha256) != 0))
+                                     &download_request) != 0))
     {
         Jobs_Logf("JOBS: download start failed job=%s",
                   jobs_context.active_job_id);
@@ -1227,11 +1232,57 @@ const char *AwsJobs_SubscriptionTopic(size_t index)
 
 int AwsJobs_OnMqttConnected(void)
 {
+    OtaPendingJob ota_job;
+
     jobs_context.state = AWS_JOBS_STATE_IDLE;
     jobs_context.retry_attempt = 0U;
     jobs_context.retry_after_ms = 0U;
     jobs_context.response_deadline_ms = 0U;
     Jobs_ClearActiveExecution();
+
+    if (OtaManager_ConfirmHealthy() != 0)
+    {
+        Jobs_Log("JOBS: OTA health confirmation failed");
+        return -1;
+    }
+
+    if (OtaManager_GetReadyInstallJob(&ota_job) != 0)
+    {
+        (void)snprintf(jobs_context.active_job_id,
+                       sizeof(jobs_context.active_job_id),
+                       "%s",
+                       ota_job.job_id);
+        jobs_context.execution_version = ota_job.execution_version;
+        jobs_context.state = AWS_JOBS_STATE_EXECUTION_ACTIVE;
+        jobs_context.pending_install = 1U;
+        return Jobs_PublishTerminalStatus("IN_PROGRESS",
+                                          "REBOOTING",
+                                          "candidate_verified");
+    }
+
+    if (OtaManager_GetPendingJob(&ota_job) != 0)
+    {
+        const char *phase =
+            ota_job.succeeded ? "HEALTHY"
+                              : (ota_job.rejected ? "REJECTED"
+                                                  : "ROLLED_BACK");
+        const char *detail =
+            ota_job.succeeded ? "image_confirmed"
+                              : (ota_job.rejected ? "candidate_rejected"
+                                                  : "trial_health_failed");
+
+        (void)snprintf(jobs_context.active_job_id,
+                       sizeof(jobs_context.active_job_id),
+                       "%s",
+                       ota_job.job_id);
+        jobs_context.execution_version = ota_job.execution_version;
+        jobs_context.state = AWS_JOBS_STATE_EXECUTION_ACTIVE;
+        jobs_context.pending_ota_report = 1U;
+        return Jobs_PublishTerminalStatus(
+            ota_job.succeeded ? "SUCCEEDED" : "FAILED",
+            phase,
+            detail);
+    }
     return Jobs_RequestNext();
 }
 
@@ -1241,6 +1292,8 @@ void AwsJobs_OnMqttDisconnected(void)
     jobs_context.retry_attempt = 0U;
     jobs_context.retry_after_ms = 0U;
     jobs_context.response_deadline_ms = 0U;
+    jobs_context.pending_install = 0U;
+    jobs_context.pending_ota_report = 0U;
     Jobs_ClearActiveExecution();
 }
 
@@ -1256,6 +1309,36 @@ int AwsJobs_Process(void)
     if ((jobs_context.state == AWS_JOBS_STATE_PAUSED) &&
         ((int32_t)(HAL_GetTick() - jobs_context.retry_after_ms) >= 0))
     {
+        if (jobs_context.pending_install != 0U)
+        {
+            jobs_context.state = AWS_JOBS_STATE_EXECUTION_ACTIVE;
+            return Jobs_PublishTerminalStatus("IN_PROGRESS",
+                                              "REBOOTING",
+                                              "candidate_verified");
+        }
+        if (jobs_context.pending_ota_report != 0U)
+        {
+            OtaPendingJob ota_job;
+            if (OtaManager_GetPendingJob(&ota_job) != 0)
+            {
+                const char *phase =
+                    ota_job.succeeded
+                        ? "HEALTHY"
+                        : (ota_job.rejected ? "REJECTED"
+                                            : "ROLLED_BACK");
+                const char *detail =
+                    ota_job.succeeded
+                        ? "image_confirmed"
+                        : (ota_job.rejected ? "candidate_rejected"
+                                            : "trial_health_failed");
+
+                jobs_context.state = AWS_JOBS_STATE_EXECUTION_ACTIVE;
+                return Jobs_PublishTerminalStatus(
+                    ota_job.succeeded ? "SUCCEEDED" : "FAILED",
+                    phase,
+                    detail);
+            }
+        }
         jobs_context.state = AWS_JOBS_STATE_IDLE;
         Jobs_ClearActiveExecution();
         return Jobs_RequestNext();
@@ -1288,6 +1371,7 @@ static int Jobs_IsSafeDetail(const char *detail)
 
 int AwsJobs_OnDownloadComplete(int succeeded, const char *detail)
 {
+    const FlashStagingInfo *staging = FlashStaging_GetInfo();
     const char *safe_detail = Jobs_IsSafeDetail(detail)
                                   ? detail
                                   : "download_failed";
@@ -1303,6 +1387,15 @@ int AwsJobs_OnDownloadComplete(int succeeded, const char *detail)
               jobs_context.active_job_id,
               succeeded ? "success" : "failure",
               safe_detail);
+    if (succeeded &&
+        (staging->artifact_type == FLASH_STAGING_ARTIFACT_FIRMWARE))
+    {
+        jobs_context.pending_install = 1U;
+        return Jobs_PublishTerminalStatus("IN_PROGRESS",
+                                          "REBOOTING",
+                                          "candidate_verified");
+    }
+
     return Jobs_PublishTerminalStatus(succeeded ? "SUCCEEDED" : "FAILED",
                                       succeeded ? "STAGED" : "DOWNLOAD_FAILED",
                                       succeeded ? "artifact_staged" : safe_detail);
@@ -1346,6 +1439,22 @@ int AwsJobs_HandleMessage(const char *topic, const char *payload)
             Jobs_Logf("JOBS: status=%s accepted job=%s",
                       jobs_context.pending_status,
                       jobs_context.active_job_id);
+            if (jobs_context.pending_install != 0U)
+            {
+                jobs_context.pending_install = 0U;
+                jobs_context.state = AWS_JOBS_STATE_IDLE;
+                jobs_context.response_deadline_ms = 0U;
+                return OtaManager_RequestInstall() == 0 ? 1 : -1;
+            }
+            if (jobs_context.pending_ota_report != 0U)
+            {
+                if (OtaManager_MarkJobReported() != 0)
+                {
+                    Jobs_Log("JOBS: OTA completion marker clear failed");
+                    return -1;
+                }
+                jobs_context.pending_ota_report = 0U;
+            }
             jobs_context.state = AWS_JOBS_STATE_IDLE;
             jobs_context.retry_attempt = 0U;
             jobs_context.response_deadline_ms = 0U;

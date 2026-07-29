@@ -4,7 +4,25 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define FLASH_STAGING_SHA256_SIZE 32U
+#include "ota_control.h"
+
+#define FLASH_STAGING_SHA256_SIZE OTA_SHA256_SIZE
+
+typedef enum
+{
+    FLASH_STAGING_ARTIFACT_SERVICE_FILE = 0,
+    FLASH_STAGING_ARTIFACT_FIRMWARE = 1
+} FlashStagingArtifactType;
+
+typedef struct
+{
+    FlashStagingArtifactType type;
+    uint32_t file_size_bytes;
+    uint8_t expected_sha256[FLASH_STAGING_SHA256_SIZE];
+    uint32_t expected_image_version;
+    char job_id[OTA_CONTROL_JOB_ID_SIZE];
+    uint32_t job_execution_version;
+} FlashStagingRequest;
 
 typedef enum
 {
@@ -35,6 +53,8 @@ typedef struct
     uint32_t file_size_bytes;
     uint32_t bytes_received;
     uint8_t expected_sha256[FLASH_STAGING_SHA256_SIZE];
+    FlashStagingArtifactType artifact_type;
+    uint32_t image_version;
 } FlashStagingInfo;
 
 /*
@@ -55,6 +75,8 @@ FlashStagingResult FlashStaging_Begin(
 FlashStagingResult FlashStaging_PrepareStart(
     uint32_t file_size_bytes,
     const uint8_t expected_sha256[FLASH_STAGING_SHA256_SIZE]);
+FlashStagingResult FlashStaging_PrepareArtifact(
+    const FlashStagingRequest *request);
 FlashStagingResult FlashStaging_PrepareStep(void);
 
 /* Accepts arbitrary chunk sizes. Chunks must be supplied in file order. */

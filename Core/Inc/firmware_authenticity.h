@@ -14,19 +14,28 @@ typedef enum
 } FirmwareAuthenticityResult;
 
 /*
- * Verifies a signature over the 32-byte SHA-256 artifact digest. Firmware
- * artifacts are rejected unless the board integration supplies a trust anchor.
+ * Verifies a raw ECDSA-P256 signature (r||s, 64 bytes) over a 32-byte digest.
+ * Firmware artifacts are rejected unless the board integration supplies the
+ * uncompressed 65-byte P-256 public point (0x04 || X || Y).
  */
-FirmwareAuthenticityResult FirmwareAuthenticity_VerifySha256(
-    const uint8_t sha256[32],
-    const char *signature_base64);
+FirmwareAuthenticityResult FirmwareAuthenticity_VerifyDigest(
+    const uint8_t digest[32],
+    const uint8_t signature[64]);
 
 /*
- * Override in a board-specific, non-generated source. This is a public trust
- * anchor, never a signing private key. The default returns NULL and fails
- * closed.
+ * Decodes a Base64 raw P-256 signature, verifies it and optionally returns the
+ * decoded bytes for durable OTA metadata.
  */
-const unsigned char *FirmwareTrustAnchor_GetPublicKeyPem(size_t *length);
+FirmwareAuthenticityResult FirmwareAuthenticity_DecodeAndVerifyDigest(
+    const uint8_t digest[32],
+    const char *signature_base64,
+    uint8_t decoded_signature[64]);
+
+/*
+ * Override in a board-specific source. This is only a public trust anchor,
+ * never the signing private key. The default returns NULL and fails closed.
+ */
+const uint8_t *FirmwareTrustAnchor_GetPublicKey(size_t *length);
 
 const char *FirmwareAuthenticity_ResultName(
     FirmwareAuthenticityResult result);

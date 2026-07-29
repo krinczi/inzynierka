@@ -44,15 +44,17 @@ _Min_Stack_Size = 0x400; /* required amount of stack */
 MEMORY
 {
   /*
-   * Application code is restricted to Bank 1. Bank 2 is reserved for
-   * download staging and the existing dual-slot configuration store.
+   * Sector 0 contains the immutable bootloader. Each executable slot starts
+   * with a signed 1 KiB OTA header; the application vector follows at +0x400.
    */
-  FLASH (rx)              : ORIGIN = 0x08000000, LENGTH = 640K
+  FLASH_APP_HEADER (r)    : ORIGIN = 0x08020000, LENGTH = 1K
+  FLASH (rx)              : ORIGIN = 0x08020400, LENGTH = 511K
   FLASH_EVENT_JOURNAL (r) : ORIGIN = 0x080A0000, LENGTH = 128K
   FLASH_CREDENTIALS_A (r) : ORIGIN = 0x080C0000, LENGTH = 128K
   FLASH_CREDENTIALS_B (r) : ORIGIN = 0x080E0000, LENGTH = 128K
-  FLASH_STAGING_META (r)  : ORIGIN = 0x08100000, LENGTH = 128K
-  FLASH_STAGING_DATA (r)  : ORIGIN = 0x08120000, LENGTH = 640K
+  FLASH_OTA_CONTROL (r)   : ORIGIN = 0x08100000, LENGTH = 128K
+  FLASH_STAGING_DATA (r)  : ORIGIN = 0x08120000, LENGTH = 512K
+  FLASH_OTA_SCRATCH (r)   : ORIGIN = 0x081A0000, LENGTH = 128K
   FLASH_CONFIG (r)        : ORIGIN = 0x081C0000, LENGTH = 256K
   DTCMRAM (xrw)  : ORIGIN = 0x20000000, LENGTH = 128K
   RAM_D1 (xrw)   : ORIGIN = 0x24000000, LENGTH = 512K
@@ -61,13 +63,17 @@ MEMORY
   ITCMRAM (xrw)  : ORIGIN = 0x00000000, LENGTH = 64K
 }
 
-__flash_staging_metadata_start__ = ORIGIN(FLASH_STAGING_META);
-__flash_staging_metadata_end__ = ORIGIN(FLASH_STAGING_META) + LENGTH(FLASH_STAGING_META);
+__ota_control_start__ = ORIGIN(FLASH_OTA_CONTROL);
+__ota_control_end__ = ORIGIN(FLASH_OTA_CONTROL) + LENGTH(FLASH_OTA_CONTROL);
 __flash_staging_data_start__ = ORIGIN(FLASH_STAGING_DATA);
 __flash_staging_data_end__ = ORIGIN(FLASH_STAGING_DATA) + LENGTH(FLASH_STAGING_DATA);
+__ota_scratch_start__ = ORIGIN(FLASH_OTA_SCRATCH);
+__ota_scratch_end__ = ORIGIN(FLASH_OTA_SCRATCH) + LENGTH(FLASH_OTA_SCRATCH);
 __iot_event_journal_start__ = ORIGIN(FLASH_EVENT_JOURNAL);
 __iot_event_journal_end__ = ORIGIN(FLASH_EVENT_JOURNAL) + LENGTH(FLASH_EVENT_JOURNAL);
 
+ASSERT(ORIGIN(FLASH_APP_HEADER) + LENGTH(FLASH_APP_HEADER) == ORIGIN(FLASH),
+       "OTA image header must end at the application vector")
 ASSERT(ORIGIN(FLASH) + LENGTH(FLASH) <= ORIGIN(FLASH_EVENT_JOURNAL),
        "Application overlaps persistent event journal")
 ASSERT(ORIGIN(FLASH_EVENT_JOURNAL) + LENGTH(FLASH_EVENT_JOURNAL) <= ORIGIN(FLASH_CREDENTIALS_A),
@@ -76,10 +82,14 @@ ASSERT(ORIGIN(FLASH) + LENGTH(FLASH) <= ORIGIN(FLASH_CREDENTIALS_A),
        "Application overlaps credential slot A")
 ASSERT(ORIGIN(FLASH_CREDENTIALS_A) + LENGTH(FLASH_CREDENTIALS_A) <= ORIGIN(FLASH_CREDENTIALS_B),
        "Credential slots overlap")
-ASSERT(ORIGIN(FLASH_CREDENTIALS_B) + LENGTH(FLASH_CREDENTIALS_B) <= ORIGIN(FLASH_STAGING_META),
-       "Credential slot B overlaps Bank 2 staging metadata")
-ASSERT(ORIGIN(FLASH_STAGING_DATA) + LENGTH(FLASH_STAGING_DATA) <= ORIGIN(FLASH_CONFIG),
-       "Flash staging data overlaps device configuration")
+ASSERT(ORIGIN(FLASH_CREDENTIALS_B) + LENGTH(FLASH_CREDENTIALS_B) <= ORIGIN(FLASH_OTA_CONTROL),
+       "Credential slot B overlaps Bank 2 OTA control log")
+ASSERT(ORIGIN(FLASH_OTA_CONTROL) + LENGTH(FLASH_OTA_CONTROL) <= ORIGIN(FLASH_STAGING_DATA),
+       "OTA control log overlaps secondary slot")
+ASSERT(ORIGIN(FLASH_STAGING_DATA) + LENGTH(FLASH_STAGING_DATA) <= ORIGIN(FLASH_OTA_SCRATCH),
+       "Secondary slot overlaps OTA scratch")
+ASSERT(ORIGIN(FLASH_OTA_SCRATCH) + LENGTH(FLASH_OTA_SCRATCH) <= ORIGIN(FLASH_CONFIG),
+       "OTA scratch overlaps device configuration")
 
 /* Define output sections */
 SECTIONS

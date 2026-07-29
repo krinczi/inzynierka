@@ -1,0 +1,116 @@
+#!/usr/bin/env node
+
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
+
+const IMAGE_MAGIC = 0x3341544f;
+const DESCRIPTOR_MAGIC = 0x494d4732;
+const CONTROL_MAGIC = 0x4f544132;
+const CONTROL_FORMAT = 2;
+const CONTROL_RECORD_SIZE = 512;
+const CONTROL_COMMITTED = 0xc01db007;
+const STATE_CANDIDATE_READY = 4;
+const SWAP_DIRECTION_FORWARD = 1;
+const SLOT_SIZE = 512 * 1024;
+
+function usage() {
+  console.error(
+    "Usage: node prepare-local-ota-test.mjs --primary <v1.ota.bin> " +
+      "--candidate <v2.ota.bin> --slot-output <secondary-slot.bin> " +
+      "--control-output <candidate-control.bin> " +
+      "--bank2-output <candidate-bank2.bin>",
+  );
+  process.exit(2);
+}
+
+function argument(name) {
+  const index = process.argv.indexOf(name);
+  if (index === -1 || index + 1 >= process.argv.length) {
+    usage();
+  }
+  return process.argv[index + 1];
+}
+
+function crc32(bytes) {
+  let crc = 0xffffffff;
+  for (const value of bytes) {
+    crc ^= value;
+    for (let bit = 0; bit < 8; bit += 1) {
+      const mask = -(crc & 1);
+      crc = (crc >>> 1) ^ (0xedb88320 & mask);
+    }
+  }
+  return (~crc) >>> 0;
+}
+
+function assertPackage(image, label) {
+  if (
+    image.length < 1032 ||
+    image.length > SLOT_SIZE ||
+    image.readUInt32LE(0) !== IMAGE_MAGIC ||
+    image.readUInt32LE(16) + 1024 !== image.length
+  ) {
+    throw new Error(`${label} is not a complete OTA3 package.`);
+  }
+}
+
+function copyDescriptor(image, destination, offset) {
+  destination.writeUInt32LE(DESCRIPTOR_MAGIC, offset);
+  destination.writeUInt32LE(image.readUInt32LE(16), offset + 4);
+  destination.writeUInt32LE(image.readUInt32LE(12), offset + 8);
+  image.copy(destination, offset + 12, 32, 64);
+  image.copy(destination, offset + 44, 64, 128);
+}
+
+const primary = await readFile(resolve(argument("--primary")));
+const candidate = await readFile(resolve(argument("--candidate")));
+const slotOutput = resolve(argument("--slot-output"));
+const controlOutput = resolve(argument("--control-output"));
+const bank2Output = resolve(argument("--bank2-output"));
+assertPackage(primary, "Primary image");
+assertPackage(candidate, "Candidate image");
+
+const primaryVersion = primary.readUInt32LE(12);
+const candidateVersion = candidate.readUInt32LE(12);
+if (candidateVersion <= primaryVersion) {
+  throw new Error("Candidate version must be newer than primary version.");
+}
+
+const secondarySlot = Buffer.alloc(SLOT_SIZE, 0xff);
+candidate.copy(secondarySlot);
+
+const control = Buffer.alloc(CONTROL_RECORD_SIZE, 0);
+control.writeUInt32LE(CONTROL_MAGIC, 0);
+control.writeUInt16LE(CONTROL_FORMAT, 4);
+control.writeUInt16LE(CONTROL_RECORD_SIZE, 6);
+control.writeUInt32LE(1, 8);
+control.writeUInt32LE(STATE_CANDIDATE_READY, 12);
+control.writeUInt32LE(SWAP_DIRECTION_FORWARD, 16);
+control.writeUInt32LE(0, 20);
+control.writeUInt32LE(0, 24);
+control.writeUInt32LE(0, 28);
+control.writeUInt32LE(primaryVersion, 32);
+copyDescriptor(primary, control, 36);
+copyDescriptor(candidate, control, 144);
+control.write("local-ota-test", 252, 65, "ascii");
+control.writeUInt32LE(1, 317);
+control.writeUInt32LE(1, 321);
+control.writeUInt32LE(crc32(control.subarray(0, 504)), 504);
+control.writeUInt32LE(CONTROL_COMMITTED, 508);
+
+const bank2 = Buffer.alloc(128 * 1024 + SLOT_SIZE, 0xff);
+control.copy(bank2, 0);
+secondarySlot.copy(bank2, 128 * 1024);
+
+await mkdir(dirname(slotOutput), { recursive: true });
+await mkdir(dirname(controlOutput), { recursive: true });
+await mkdir(dirname(bank2Output), { recursive: true });
+await writeFile(slotOutput, secondarySlot);
+await writeFile(controlOutput, control);
+await writeFile(bank2Output, bank2);
+console.log(
+  `Local OTA test prepared: primary v${primaryVersion} -> candidate v${candidateVersion}`,
+);
+console.log(`Secondary slot image: ${slotOutput}`);
+console.log(`Candidate control record: ${controlOutput}`);
+console.log(`Combined Bank 2 test image: ${bank2Output}`);

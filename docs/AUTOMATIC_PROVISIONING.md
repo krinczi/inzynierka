@@ -66,11 +66,14 @@ chwilowe błędy nie tworzą nieograniczonej pętli wywołań AWS.
 
 | Obszar | Adres | Rozmiar | Przeznaczenie |
 | --- | ---: | ---: | --- |
-| Firmware | `0x08000000` | 768 KiB | kod i dane tylko do odczytu |
+| Bootloader | `0x08000000` | 128 KiB | weryfikacja, instalacja i rollback OTA |
+| Primary firmware slot | `0x08020000` | 512 KiB | aktywny podpisany obraz |
+| Event journal | `0x080A0000` | 128 KiB | trwałe alarmy i zdarzenia krytyczne |
 | Credential slot A | `0x080C0000` | 128 KiB | aktywny lub zapasowy rekord |
 | Credential slot B | `0x080E0000` | 128 KiB | aktywny lub zapasowy rekord |
-| Staging metadata | `0x08100000` | 128 KiB | metadane pobranego artefaktu |
-| Staging data | `0x08120000` | 640 KiB | plik pobrany przez AWS Job |
+| OTA control journal | `0x08100000` | 128 KiB | stan instalacji i anti-rollback |
+| Secondary firmware slot | `0x08120000` | 512 KiB | kandydat lub poprzedni obraz |
+| OTA scratch | `0x081A0000` | 128 KiB | bezpieczna wymiana sektorów |
 | Device config | `0x081C0000` | 256 KiB | dual-slot konfiguracji |
 
 Rekord poświadczeń ma stałe 8 KiB i zawiera nagłówek, numer generacji, stan,
@@ -78,8 +81,9 @@ długości pól oraz CRC32 całego rekordu. Zapis zawsze kasuje i programuje slo
 nieaktywny, weryfikuje odczyt, a dopiero potem przełącza aktywną generację. Format
 programowania jest zgodny z 32-bajtowym Flash word STM32H753.
 
-Linker ogranicza obszar wykonywalny do 768 KiB i zawiera asercje wykrywające
-nakładanie się firmware’u, credential store, stagingu i konfiguracji.
+Linker ogranicza obraz aplikacji do `512 KiB - 1024 B` i zawiera asercje
+wykrywające nakładanie się bootloadera, slotów OTA, dziennika zdarzeń,
+credential store i konfiguracji. Szczegóły znajdują się w `docs/FULL_OTA.md`.
 
 ## Interfejsy firmware’u
 

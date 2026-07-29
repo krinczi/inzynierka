@@ -2,6 +2,7 @@
 #include "aws_jobs.h"
 #include "aws_iot_config.h"
 #include "mqtt_topics.h"
+#include "ota_manager.h"
 #include "aws_certs.h"
 #include "credential_store.h"
 #include "debug_logger.h"
@@ -421,7 +422,7 @@ int TlsClient_Init(void)
     FlashStagingResult staging_result;
 
     tls_log("TLS: init");
-    tls_log("TLS BUILD: fleet_auto_v3 shadow_v1 hw_telemetry_v1 rtc_sntp_v1 iwdg_mpu_v1 durable_events_v1 signed_staging_v1");
+    tls_log("TLS BUILD: fleet_auto_v3 shadow_v1 hw_telemetry_v1 rtc_sntp_v1 iwdg_mpu_v1 durable_events_v1 full_ota_v1");
     tls_connected = 0;
     tls_ctx_ready = 0;
     mqtt_interaction_active = 0U;
@@ -468,6 +469,12 @@ int TlsClient_Init(void)
         (void)IotEvents_QueueAlert(IOT_ALERT_WARNING,
                                    "FLASH_STAGING_INVALID",
                                    "Staged file metadata or integrity is invalid");
+    }
+    if (OtaManager_Init() != 0)
+    {
+        (void)IotEvents_QueueAlert(IOT_ALERT_ALARM,
+                                   "OTA_CONTROL_INVALID",
+                                   "OTA boot control state could not be loaded");
     }
     config = DeviceConfig_Get();
     tls_logf("CONFIG: loaded version=%lu telemetry=%lus keepalive=%lus",
@@ -3451,6 +3458,7 @@ int TlsClient_MqttProcess(void)
     }
 
     now = HAL_GetTick();
+    OtaManager_Process(now);
     if (mqtt_process_interaction(now) != 0)
     {
         mqtt_ready = 0;
