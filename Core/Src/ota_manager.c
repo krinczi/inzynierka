@@ -195,6 +195,27 @@ int OtaManager_GetReadyInstallJob(OtaPendingJob *job)
     return 1;
 }
 
+int OtaManager_UpdateJobExecutionVersion(uint32_t execution_version)
+{
+    OtaControlRecord record;
+
+    if ((execution_version == 0U) ||
+        (OtaControl_LoadLatest(&record) != OTA_CONTROL_OK) ||
+        (record.state != OTA_CONTROL_STATE_CANDIDATE_READY) ||
+        (record.job_id[0] == '\0') ||
+        (execution_version < record.job_execution_version))
+    {
+        return -1;
+    }
+    if (execution_version == record.job_execution_version)
+    {
+        return 0;
+    }
+
+    record.job_execution_version = execution_version;
+    return OtaControl_Append(&record) == OTA_CONTROL_OK ? 0 : -1;
+}
+
 int OtaManager_MarkJobReported(void)
 {
     OtaControlRecord record;

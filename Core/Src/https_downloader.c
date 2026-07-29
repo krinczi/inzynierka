@@ -938,10 +938,14 @@ static int Downloader_CompleteSuccess(void)
     FlashStagingResult result = FlashStaging_Finalize();
     if (result != FLASH_STAGING_OK)
     {
-        Downloader_Fail(result == FLASH_STAGING_INTEGRITY_ERROR
-                            ? "sha256_mismatch"
-                            : "flash_finalize_failed",
-                        result == FLASH_STAGING_INTEGRITY_ERROR);
+        const char *error =
+            result == FLASH_STAGING_HASH_MISMATCH
+                ? "sha256_mismatch"
+                : result == FLASH_STAGING_INTEGRITY_ERROR
+                      ? "firmware_validation_failed"
+                      : "flash_finalize_failed";
+        Downloader_Fail(error,
+                        result == FLASH_STAGING_HASH_MISMATCH);
         return downloader.status == HTTPS_DOWNLOADER_FAILED ? -1 : 0;
     }
 

@@ -607,6 +607,97 @@ static int Json_GetRequiredUInt32(JsonSlice object,
                : -1;
 }
 
+static int Jobs_GetAcceptedExecutionVersion(const char *payload,
+                                             uint32_t *execution_version)
+{
+    JsonSlice root;
+    JsonSlice execution_state;
+
+    if ((payload == NULL) || (execution_version == NULL))
+    {
+        return -1;
+    }
+
+    root.start = payload;
+    root.end = payload + strlen(payload);
+    if (!Json_SliceIsObject(root) ||
+        (Json_GetRequiredObjectMember(root,
+                                      "executionState",
+                                      &execution_state) != 0))
+    {
+        return -1;
+    }
+
+    return Json_GetRequiredUInt32(execution_state,
+                                  "versionNumber",
+                                  execution_version);
+}
+
+static int Jobs_IsTerminalExecutionStatus(const char *status)
+{
+    return (strcmp(status, "SUCCEEDED") == 0) ||
+           (strcmp(status, "FAILED") == 0) ||
+           (strcmp(status, "TIMED_OUT") == 0) ||
+           (strcmp(status, "REJECTED") == 0) ||
+           (strcmp(status, "REMOVED") == 0) ||
+           (strcmp(status, "CANCELED") == 0);
+}
+
+static int Jobs_DurableReportIsObsolete(const char *payload,
+                                        char *error_code,
+                                        size_t error_code_size,
+                                        char *execution_status,
+                                        size_t execution_status_size)
+{
+    JsonSlice root;
+    JsonSlice execution_state;
+
+    if ((payload == NULL) || (error_code == NULL) ||
+        (error_code_size == 0U) || (execution_status == NULL) ||
+        (execution_status_size == 0U))
+    {
+        return 0;
+    }
+
+    (void)snprintf(error_code, error_code_size, "%s", "unknown");
+    execution_status[0] = '\0';
+    root.start = payload;
+    root.end = payload + strlen(payload);
+    if (!Json_SliceIsObject(root) ||
+        (Json_GetRequiredString(root,
+                                "code",
+                                error_code,
+                                error_code_size) != 0))
+    {
+        return 0;
+    }
+
+    if ((strcmp(error_code, "ResourceNotFound") == 0) ||
+        (strcmp(error_code, "TerminalStateReached") == 0))
+    {
+        return 1;
+    }
+
+    if ((strcmp(error_code, "InvalidStateTransition") != 0) &&
+        (strcmp(error_code, "VersionMismatch") != 0))
+    {
+        return 0;
+    }
+
+    if ((Json_GetRequiredObjectMember(root,
+                                      "executionState",
+                                      &execution_state) != 0) ||
+        (Json_GetRequiredString(execution_state,
+                                "status",
+                                execution_status,
+                                execution_status_size) != 0))
+    {
+        return 0;
+    }
+
+    return Jobs_IsTerminalExecutionStatus(execution_status);
+}
+
 static int Jobs_IsValidJobId(const char *job_id)
 {
     size_t index;
@@ -941,18 +1032,41 @@ static int Jobs_PublishTerminalStatus(const char *status,
                              "%s/%s/update",
                              jobs_context.base_topic,
                              jobs_context.active_job_id);
-    payload_written = snprintf(payload,
-                               sizeof(payload),
-                               "{\"status\":\"%s\",\"statusDetails\":{"
-                               "\"phase\":\"%s\",\"detail\":\"%s\"},"
-                               "\"expectedVersion\":%lu,"
-                               "\"includeJobExecutionState\":true,"
-                               "\"clientToken\":\"stm32-update-%lu\"}",
-                               status,
-                               phase,
-                               detail,
-                               (unsigned long)jobs_context.execution_version,
-                               (unsigned long)jobs_context.token_counter);
+    if (jobs_context.pending_ota_report != 0U)
+    {
+        /*
+         * A pre-fix image may have rebooted after AWS advanced the execution
+         * version but before that value was persisted. expectedVersion is
+         * optional; omit it only for the durable post-reset terminal report.
+         * The job id, device identity and pending marker still bind the update
+         * to the exact execution.
+         */
+        payload_written = snprintf(payload,
+                                   sizeof(payload),
+                                   "{\"status\":\"%s\",\"statusDetails\":{"
+                                   "\"phase\":\"%s\",\"detail\":\"%s\"},"
+                                   "\"includeJobExecutionState\":true,"
+                                   "\"clientToken\":\"stm32-update-%lu\"}",
+                                   status,
+                                   phase,
+                                   detail,
+                                   (unsigned long)jobs_context.token_counter);
+    }
+    else
+    {
+        payload_written = snprintf(payload,
+                                   sizeof(payload),
+                                   "{\"status\":\"%s\",\"statusDetails\":{"
+                                   "\"phase\":\"%s\",\"detail\":\"%s\"},"
+                                   "\"expectedVersion\":%lu,"
+                                   "\"includeJobExecutionState\":true,"
+                                   "\"clientToken\":\"stm32-update-%lu\"}",
+                                   status,
+                                   phase,
+                                   detail,
+                                   (unsigned long)jobs_context.execution_version,
+                                   (unsigned long)jobs_context.token_counter);
+    }
 
     if ((topic_written < 0) || ((size_t)topic_written >= sizeof(topic)) ||
         (payload_written < 0) || ((size_t)payload_written >= sizeof(payload)))
@@ -1441,6 +1555,23 @@ int AwsJobs_HandleMessage(const char *topic, const char *payload)
                       jobs_context.active_job_id);
             if (jobs_context.pending_install != 0U)
             {
+                uint32_t accepted_execution_version;
+
+                if ((Jobs_GetAcceptedExecutionVersion(
+                         payload,
+                         &accepted_execution_version) != 0) ||
+                    (accepted_execution_version <=
+                     jobs_context.execution_version) ||
+                    (OtaManager_UpdateJobExecutionVersion(
+                         accepted_execution_version) != 0))
+                {
+                    Jobs_Log("JOBS: accepted execution version persist failed");
+                    Jobs_ScheduleRetry("execution_version_persist_failed");
+                    return 1;
+                }
+
+                jobs_context.execution_version =
+                    accepted_execution_version;
                 jobs_context.pending_install = 0U;
                 jobs_context.state = AWS_JOBS_STATE_IDLE;
                 jobs_context.response_deadline_ms = 0U;
@@ -1470,8 +1601,40 @@ int AwsJobs_HandleMessage(const char *topic, const char *payload)
     {
         if (Jobs_TopicMatchesActiveUpdate(topic, "/update/rejected"))
         {
-            Jobs_Logf("JOBS: status update rejected job=%s",
-                      jobs_context.active_job_id);
+            char error_code[40];
+            char execution_status[16];
+
+            if ((jobs_context.pending_ota_report != 0U) &&
+                Jobs_DurableReportIsObsolete(payload,
+                                             error_code,
+                                             sizeof(error_code),
+                                             execution_status,
+                                             sizeof(execution_status)))
+            {
+                Jobs_Logf("JOBS: obsolete completion rejected job=%s code=%s",
+                          jobs_context.active_job_id,
+                          error_code);
+                if (OtaManager_MarkJobReported() != 0)
+                {
+                    Jobs_Log("JOBS: obsolete completion marker clear failed");
+                    Jobs_ScheduleRetry("completion_marker_clear_failed");
+                    return 1;
+                }
+
+                jobs_context.pending_ota_report = 0U;
+                jobs_context.state = AWS_JOBS_STATE_IDLE;
+                jobs_context.retry_attempt = 0U;
+                jobs_context.retry_after_ms = 0U;
+                jobs_context.response_deadline_ms = 0U;
+                Jobs_ClearActiveExecution();
+                Jobs_Log("JOBS: obsolete completion cleared, requesting next");
+                return Jobs_RequestNext() == 0 ? 1 : -1;
+            }
+
+            Jobs_Logf("JOBS: status update rejected job=%s code=%s state=%s",
+                      jobs_context.active_job_id,
+                      error_code,
+                      execution_status[0] != '\0' ? execution_status : "unknown");
             Jobs_ScheduleRetry("status_update_rejected");
         }
         else

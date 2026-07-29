@@ -17,8 +17,6 @@ extern uint8_t __flash_staging_data_end__[];
 
 static FlashStagingInfo staging_info;
 static FlashStagingRequest staging_request;
-static mbedtls_sha256_context staging_sha256;
-static int staging_sha256_active;
 static uint32_t staging_prepare_sector;
 static uint32_t staging_prepare_sector_count;
 static uint32_t staging_programmed_bytes;
@@ -55,18 +53,8 @@ static void FlashStaging_InvalidateCache(uint32_t address, size_t length)
     __ISB();
 }
 
-static void FlashStaging_StopHash(void)
-{
-    if (staging_sha256_active != 0)
-    {
-        mbedtls_sha256_free(&staging_sha256);
-        staging_sha256_active = 0;
-    }
-}
-
 static void FlashStaging_ResetRuntime(FlashStagingState state)
 {
-    FlashStaging_StopHash();
     memset(&staging_info, 0, sizeof(staging_info));
     memset(&staging_request, 0, sizeof(staging_request));
     staging_info.state = state;
@@ -80,7 +68,6 @@ static void FlashStaging_ResetRuntime(FlashStagingState state)
 
 static FlashStagingResult FlashStaging_Fail(FlashStagingResult result)
 {
-    FlashStaging_StopHash();
     staging_info.state = FLASH_STAGING_STATE_INVALID;
     return result;
 }
@@ -397,12 +384,6 @@ FlashStagingResult FlashStaging_PrepareStep(void)
         return FLASH_STAGING_IN_PROGRESS;
     }
 
-    mbedtls_sha256_init(&staging_sha256);
-    staging_sha256_active = 1;
-    if (mbedtls_sha256_starts_ret(&staging_sha256, 0) != 0)
-    {
-        return FlashStaging_Fail(FLASH_STAGING_CRYPTO_ERROR);
-    }
     staging_info.state = FLASH_STAGING_STATE_RECEIVING;
     return FLASH_STAGING_OK;
 }
@@ -429,11 +410,6 @@ FlashStagingResult FlashStaging_Write(const uint8_t *data, size_t length)
     {
         return FLASH_STAGING_OK;
     }
-    if (mbedtls_sha256_update_ret(&staging_sha256, data, length) != 0)
-    {
-        return FlashStaging_Fail(FLASH_STAGING_CRYPTO_ERROR);
-    }
-
     while (offset < length)
     {
         size_t available =
@@ -562,16 +538,17 @@ FlashStagingResult FlashStaging_Finalize(void)
         }
     }
 
-    if (mbedtls_sha256_finish_ret(&staging_sha256, calculated) != 0)
+    result = FlashStaging_CalculateSha256(staging_info.file_size_bytes,
+                                          calculated);
+    if (result != FLASH_STAGING_OK)
     {
-        return FlashStaging_Fail(FLASH_STAGING_CRYPTO_ERROR);
+        return FlashStaging_Fail(result);
     }
-    FlashStaging_StopHash();
     if (memcmp(calculated,
                staging_info.expected_sha256,
                sizeof(calculated)) != 0)
     {
-        return FlashStaging_Fail(FLASH_STAGING_INTEGRITY_ERROR);
+        return FlashStaging_Fail(FLASH_STAGING_HASH_MISMATCH);
     }
 
     result = FlashStaging_CommitReady();
@@ -587,7 +564,6 @@ FlashStagingResult FlashStaging_Abort(void)
 {
     OtaControlRecord record;
 
-    FlashStaging_StopHash();
     if ((OtaControl_LoadLatest(&record) == OTA_CONTROL_OK) &&
         (record.state == OTA_CONTROL_STATE_DOWNLOAD_IN_PROGRESS))
     {
@@ -627,7 +603,7 @@ FlashStagingResult FlashStaging_Verify(void)
                   staging_info.expected_sha256,
                   sizeof(calculated)) == 0
                ? FLASH_STAGING_OK
-               : FLASH_STAGING_INTEGRITY_ERROR;
+               : FLASH_STAGING_HASH_MISMATCH;
 }
 
 FlashStagingResult FlashStaging_Read(uint32_t offset,

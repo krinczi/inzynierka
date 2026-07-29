@@ -32,8 +32,16 @@ primary payload area (`512 KiB - 1024 bytes`).
 - Data is written sequentially in native 32-byte STM32H7 Flash words.
 - Every programmed Flash word is read back and compared.
 - The expected file size is checked before erase and before finalization.
-- SHA-256 is calculated while receiving and independently recalculated from
-  Flash during the next boot.
+- SHA-256 is calculated from the programmed Bank 2 bytes after the complete
+  transfer and independently recalculated during the next boot. The final
+  acceptance check therefore covers transport, Flash programming, and cache
+  coherency rather than trusting only an in-RAM streaming context.
+- A digest mismatch has a dedicated `FLASH_STAGING_HASH_MISMATCH` result.
+  Signature, image-version, anti-rollback, and primary-image validation
+  failures remain `FLASH_STAGING_INTEGRITY_ERROR`. AWS therefore receives
+  `sha256_mismatch` only for a real digest mismatch and
+  `firmware_validation_failed` for an invalid image; only the former is
+  retried.
 - Metadata is protected with CRC-32.
 - The metadata word containing the magic and committed state is written last.
 - A power loss before metadata commit leaves no valid staged file.

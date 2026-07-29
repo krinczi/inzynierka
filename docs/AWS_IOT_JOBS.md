@@ -158,7 +158,20 @@ payload digest verified independently by the application and bootloader. See
 - Total download time is limited to eight minutes, below the ten-minute Jobs
   step timer requested by the device.
 - AWS update requests use the returned execution `versionNumber` as
-  `expectedVersion`.
+  `expectedVersion`. Before the reboot that installs firmware, the
+  `versionNumber` returned in the accepted `REBOOTING` response is appended to
+  the durable OTA control log. A terminal report restored after reset omits the
+  optional `expectedVersion`, allowing one safe migration from older firmware
+  that could not persist the accepted version. The persisted job id, mutual-TLS
+  device identity and durable pending marker still bind that report to the
+  exact device execution.
+- A restored terminal report is not retried forever when AWS has already moved
+  the execution to a terminal state. `ResourceNotFound`,
+  `TerminalStateReached`, or a terminal `executionState` returned with
+  `InvalidStateTransition`/`VersionMismatch` clears only the durable report
+  marker and immediately requests the next pending execution. Transient
+  rejections such as `InternalError` and `RequestThrottled` retain the marker
+  and continue through bounded backoff.
 - Rejected control-plane requests use exponential retry delays of 5, 10, 20,
   and then at most 60 seconds, preventing a tight publish loop.
 - A missing `start-next` or `update` response times out after 15 seconds and

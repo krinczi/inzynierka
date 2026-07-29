@@ -33,6 +33,11 @@ void OtaManager_Process(uint32_t now_ms);
 
 int OtaManager_GetPendingJob(OtaPendingJob *job);
 int OtaManager_GetReadyInstallJob(OtaPendingJob *job);
+/*
+ * Persists the execution version returned by AWS for the accepted REBOOTING
+ * update. The terminal report after reset must use this newer version.
+ */
+int OtaManager_UpdateJobExecutionVersion(uint32_t execution_version);
 int OtaManager_MarkJobReported(void);
 int OtaManager_IsTrial(void);
 
