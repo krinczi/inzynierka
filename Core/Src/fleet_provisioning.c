@@ -4,6 +4,7 @@
 #include "debug_logger.h"
 #include "device_config.h"
 #include "main.h"
+#include "mbedtls_platform_rng.h"
 
 #include "mbedtls/pk.h"
 #include "mbedtls/version.h"
@@ -188,7 +189,14 @@ static int Fleet_ValidateCertificatePair(const char *certificate_pem,
     if (result == 0)
     {
 #if MBEDTLS_VERSION_NUMBER >= 0x03000000
-        result = -1;
+        result = mbedtls_pk_parse_key(
+            &private_key,
+            (const unsigned char *)private_key_pem,
+            strlen(private_key_pem) + 1U,
+            NULL,
+            0U,
+            MbedtlsPlatform_Random,
+            NULL);
 #else
         result = mbedtls_pk_parse_key(
             &private_key,
@@ -200,7 +208,14 @@ static int Fleet_ValidateCertificatePair(const char *certificate_pem,
     }
     if (result == 0)
     {
+#if MBEDTLS_VERSION_NUMBER >= 0x03000000
+        result = mbedtls_pk_check_pair(&certificate.pk,
+                                       &private_key,
+                                       MbedtlsPlatform_Random,
+                                       NULL);
+#else
         result = mbedtls_pk_check_pair(&certificate.pk, &private_key);
+#endif
     }
     mbedtls_pk_free(&private_key);
     mbedtls_x509_crt_free(&certificate);
@@ -219,6 +234,16 @@ static void Fleet_ScheduleRetry(FleetRuntimeState request_state, const char *rea
     fleet_attempts++;
     if (fleet_attempts >= FLEET_MAX_ATTEMPTS)
     {
+        if (CredentialStore_IsRotationInProgress() &&
+            (CredentialStore_RollbackRotation() == 0))
+        {
+            fleet_state = FLEET_STATE_COMPLETE;
+            fleet_reconnect_required = 1U;
+            Fleet_Logf("FLEET: rotation rolled back after %u attempts reason=%s",
+                       (unsigned int)fleet_attempts,
+                       reason);
+            return;
+        }
         fleet_state = FLEET_STATE_FAILED;
         Fleet_Logf("FLEET: failed after %u attempts reason=%s",
                    (unsigned int)fleet_attempts,
@@ -343,6 +368,7 @@ static int Fleet_HandleCreateAccepted(const char *payload)
 static int Fleet_HandleRegisterAccepted(const char *payload)
 {
     char thing_name[CREDENTIAL_STORE_THING_NAME_MAX_LENGTH + 1U];
+    int rotation;
 
     fleet_response_deadline_ms = 0U;
     if ((Fleet_JsonGetString(payload, "thingName", thing_name, sizeof(thing_name)) != 0) ||
@@ -353,6 +379,7 @@ static int Fleet_HandleRegisterAccepted(const char *payload)
         return -1;
     }
 
+    rotation = CredentialStore_GetState() == CREDENTIAL_STORE_ROTATION_PENDING;
     if (CredentialStore_CommitProvisioned(thing_name) != 0)
     {
         Fleet_Log("FLEET: final credential commit failed");
@@ -367,7 +394,9 @@ static int Fleet_HandleRegisterAccepted(const char *payload)
 
     fleet_state = FLEET_STATE_COMPLETE;
     fleet_reconnect_required = 1U;
-    Fleet_Logf("FLEET: PROVISIONED thing=%s reconnect=unique_credentials",
+    Fleet_Logf(rotation
+                   ? "FLEET: ROTATION_VALIDATING thing=%s reconnect=new_credentials"
+                   : "FLEET: PROVISIONED thing=%s reconnect=unique_credentials",
                thing_name);
     return 1;
 }
@@ -393,6 +422,18 @@ static int Fleet_HandleRejected(FleetRuntimeState request_state,
         ((strstr(error_message, "expired") != NULL) ||
          (strstr(error_message, "Expired") != NULL)))
     {
+        if (CredentialStore_IsRotationInProgress())
+        {
+            if (CredentialStore_RollbackRotation() != 0)
+            {
+                fleet_state = FLEET_STATE_FAILED;
+                return -1;
+            }
+            fleet_state = FLEET_STATE_COMPLETE;
+            fleet_reconnect_required = 1U;
+            Fleet_Log("FLEET: expired rotation token, previous credentials restored");
+            return 1;
+        }
         if (CredentialStore_Erase() != 0)
         {
             fleet_state = FLEET_STATE_FAILED;
@@ -450,7 +491,7 @@ void FleetProvisioning_Init(FleetProvisioningPublishCallback publish_callback,
 
 int FleetProvisioning_IsRequired(void)
 {
-    return CredentialStore_GetState() != CREDENTIAL_STORE_PROVISIONED;
+    return CredentialStore_IsProvisioningRequired();
 }
 
 size_t FleetProvisioning_SubscriptionCount(void)
@@ -480,7 +521,10 @@ int FleetProvisioning_OnMqttConnected(void)
     fleet_connected = 1U;
     fleet_retry_after_ms = HAL_GetTick();
     fleet_response_deadline_ms = 0U;
-    fleet_state = CredentialStore_GetState() == CREDENTIAL_STORE_PENDING_REGISTRATION
+    fleet_state = ((CredentialStore_GetState() ==
+                    CREDENTIAL_STORE_PENDING_REGISTRATION) ||
+                   (CredentialStore_GetState() ==
+                    CREDENTIAL_STORE_ROTATION_PENDING))
                       ? FLEET_STATE_REQUEST_REGISTRATION
                       : FLEET_STATE_REQUEST_CERTIFICATE;
     return FleetProvisioning_Process(HAL_GetTick());
@@ -489,11 +533,8 @@ int FleetProvisioning_OnMqttConnected(void)
 void FleetProvisioning_OnMqttDisconnected(void)
 {
     fleet_connected = 0U;
-    if ((CredentialStore_GetState() == CREDENTIAL_STORE_PROVISIONED) &&
-        fleet_reconnect_required)
-    {
-        fleet_reconnect_required = 0U;
-    }
+    /* A disconnect consumes the requested credential-source transition. */
+    fleet_reconnect_required = 0U;
 }
 
 int FleetProvisioning_HandleMessage(const char *topic, const char *payload)
@@ -560,4 +601,26 @@ int FleetProvisioning_Process(uint32_t now_ms)
 int FleetProvisioning_ReconnectRequired(void)
 {
     return fleet_reconnect_required != 0U;
+}
+
+int FleetProvisioning_RequestRotation(void)
+{
+    if (CredentialStore_GetState() != CREDENTIAL_STORE_PROVISIONED)
+    {
+        return -1;
+    }
+
+    if (CredentialStore_RequestRotation() != 0)
+    {
+        Fleet_Log("FLEET: credential rotation request persistence failed");
+        return -1;
+    }
+
+    fleet_state = FLEET_STATE_IDLE;
+    fleet_attempts = 0U;
+    fleet_retry_after_ms = 0U;
+    fleet_response_deadline_ms = 0U;
+    fleet_reconnect_required = 1U;
+    Fleet_Log("FLEET: credential rotation requested, reconnect=claim_credentials");
+    return 0;
 }

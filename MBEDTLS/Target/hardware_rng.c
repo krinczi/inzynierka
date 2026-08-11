@@ -23,36 +23,57 @@
   */
 /* USER CODE END Header */
 
-#include "mbedtls_config.h"
+#include "mbedtls/build_info.h"
+#include "mbedtls_platform_rng.h"
 
 #ifdef MBEDTLS_ENTROPY_HARDWARE_ALT
 
 #include "main.h"
 #include "string.h"
 #include "stm32h7xx_hal.h"
-#include "mbedtls/entropy_poll.h"
+#include "mbedtls/entropy.h"
 
 extern RNG_HandleTypeDef hrng;
 
 int mbedtls_hardware_poll( void *Data, unsigned char *Output, size_t Len, size_t *oLen )
 {
-  uint32_t index;
+  size_t produced = 0U;
   uint32_t randomValue;
 
-  for (index = 0; index < Len/4; index++)
+  (void)Data;
+  if ((Output == NULL) || (oLen == NULL))
   {
-    if (HAL_RNG_GenerateRandomNumber(&hrng, &randomValue) == HAL_OK)
-    {
-      *oLen += 4;
-      memset(&(Output[index * 4]), (int)randomValue, 4);
-    }
-    else
-    {
-      Error_Handler();
-    }
+    return MBEDTLS_ERR_ENTROPY_SOURCE_FAILED;
   }
 
+  *oLen = 0U;
+  while (produced < Len)
+  {
+    size_t remaining = Len - produced;
+    size_t chunk = remaining < sizeof(randomValue)
+                       ? remaining
+                       : sizeof(randomValue);
+    if (HAL_RNG_GenerateRandomNumber(&hrng, &randomValue) != HAL_OK)
+    {
+      return MBEDTLS_ERR_ENTROPY_SOURCE_FAILED;
+    }
+    memcpy(Output + produced, &randomValue, chunk);
+    produced += chunk;
+  }
+
+  *oLen = produced;
   return 0;
+}
+
+int MbedtlsPlatform_Random(void *context,
+                           unsigned char *output,
+                           size_t length)
+{
+  size_t produced = 0U;
+  int result = mbedtls_hardware_poll(context, output, length, &produced);
+  return (result == 0) && (produced == length)
+             ? 0
+             : MBEDTLS_ERR_ENTROPY_SOURCE_FAILED;
 }
 
 #endif /*MBEDTLS_ENTROPY_HARDWARE_ALT*/

@@ -24,8 +24,10 @@ hash is correct.
    completed sub-step is appended to the control journal, so an interrupted
    swap resumes instead of guessing the Flash state.
 7. The new primary image starts in `TRIAL`. The application confirms it only
-   after persistent local services and the independent watchdog are operating.
-   AWS and Ethernet availability are not part of this local health gate.
+   after persistent local services and the independent watchdog are operating,
+   and after the MQTT session has remained healthy for at least 30 seconds.
+   A trial that cannot establish stable cloud communication is not promoted to
+   the confirmed anti-rollback baseline.
 8. A confirmed trial advances the monotonic version floor. If the application
    fails to confirm in three boots, the bootloader swaps the previous image back
    and records a rollback result for later AWS Jobs reporting.
@@ -188,6 +190,23 @@ These tests cover installation, confirmation, rollback, slot exchange, and
 control-journal state transitions. Release qualification should additionally
 run repeated power-cut fault injection at every erase/program transition and a
 long-duration update campaign.
+
+The repository includes a guarded reset-recovery harness:
+
+```powershell
+.\tools\ota\test-reset-recovery.ps1 `
+  -ProgrammerCli '<path-to-STM32_Programmer_CLI.exe>' `
+  -StLinkSerial '<serial>' `
+  -ConfirmStLinkSerial '<serial>'
+```
+
+Its default mode is a dry run. `-ExecuteResets` requires PowerShell
+confirmation, targets one exact ST-LINK serial number, performs hardware
+resets, reads the OTA control journal without programming it, and validates
+every snapshot with `inspect-control-log.mjs`. Run it only while a newly signed
+candidate matching the current source is active. A hardware reset verifies
+reset recovery; qualification against an actual loss of power additionally
+requires a controllable power supply or USB relay.
 
 ## Manufacturing and operations
 

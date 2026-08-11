@@ -9,6 +9,10 @@ MBEDTLS_LIB := ../Middlewares/Third_Party/mbedTLS/library
 C_SOURCES := \
 	bootloader.c \
 	$(MBEDTLS_LIB)/bignum.c \
+	$(MBEDTLS_LIB)/bignum_core.c \
+	$(MBEDTLS_LIB)/bignum_mod.c \
+	$(MBEDTLS_LIB)/bignum_mod_raw.c \
+	$(MBEDTLS_LIB)/constant_time.c \
 	$(MBEDTLS_LIB)/ecp.c \
 	$(MBEDTLS_LIB)/ecp_curves.c \
 	$(MBEDTLS_LIB)/ecdsa.c \

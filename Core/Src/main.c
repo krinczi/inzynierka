@@ -52,6 +52,7 @@
 #include "system_time.h"
 #include "system_watchdog.h"
 #include "ota_manager.h"
+#include "credential_store.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -83,6 +84,10 @@
 #define FLASH_STAGING_BUTTON_SAMPLE_MS 20U
 #define NET_DHCP_ACQUIRE_TIMEOUT_MS 30000U
 #define NET_DHCP_RETRY_DELAY_MS      5000U
+#define NET_TIME_SYNC_INTERVAL_MS    (6UL * 60UL * 60UL * 1000UL)
+#define NET_TIME_SYNC_RETRY_MS       (15UL * 60UL * 1000UL)
+#define OTA_TRIAL_MQTT_STABLE_MS     30000U
+#define CREDENTIAL_ROTATION_MQTT_STABLE_MS 30000U
 #define PWR_VOS_READY_TIMEOUT_MS       100U
 
 /* USER CODE END PD */
@@ -856,6 +861,39 @@ static void FlashStaging_LogSnapshot(const char *source)
              source);
 }
 
+static void CredentialRotation_RecordConnectionFailure(const char *stage)
+{
+    int result;
+
+    if (CredentialStore_GetState() != CREDENTIAL_STORE_ROTATION_VALIDATING)
+    {
+        return;
+    }
+
+    result = CredentialStore_RecordRotationFailure();
+    if (result > 0)
+    {
+        SYS_LOGF("FLEET: rotated credential validation failed at %s, previous credentials restored",
+                 stage);
+        (void)IotEvents_QueueAlert(
+            IOT_ALERT_WARNING,
+            "CREDENTIAL_ROTATION_ROLLED_BACK",
+            "New credentials failed validation; previous credentials restored");
+    }
+    else if (result == 0)
+    {
+        SYS_LOGF("FLEET: rotated credential validation retry stage=%s", stage);
+    }
+    else
+    {
+        SYS_LOG("FLEET: rotated credential validation state persistence failed");
+        (void)IotEvents_QueueAlert(
+            IOT_ALERT_CRITICAL,
+            "CREDENTIAL_ROTATION_RECOVERY_FAILED",
+            "Credential validation failure could not be persisted or rolled back");
+    }
+}
+
 /*
  * This is the sole owner of all mbedTLS/MQTT contexts.  Bounded waits during
  * DNS, TCP, TLS, Fleet Provisioning and MQTT setup therefore cannot stop the
@@ -864,6 +902,9 @@ static void FlashStaging_LogSnapshot(const char *source)
 static void StartMqttServiceTask(void *argument)
 {
     uint32_t retry_after_ms = 0U;
+    uint32_t mqtt_healthy_since_ms = 0U;
+    uint32_t connectivity_outage_started_ms = 0U;
+    uint8_t connectivity_outage_active = 0U;
 
     (void)argument;
     SYS_LOG("RTOS: mqttService start");
@@ -884,8 +925,18 @@ static void StartMqttServiceTask(void *argument)
         {
             if (mqtt_ready != 0U)
             {
+                if (connectivity_outage_active == 0U)
+                {
+                    connectivity_outage_active = 1U;
+                    connectivity_outage_started_ms = now;
+                    (void)IotEvents_QueueAlert(
+                        IOT_ALERT_WARNING,
+                        "NETWORK_CONNECTION_LOST",
+                        "Network became unavailable; MQTT reconnect is deferred");
+                }
                 TlsClient_Disconnect();
                 mqtt_ready = 0U;
+                mqtt_healthy_since_ms = 0U;
             }
             osDelay(50U);
             continue;
@@ -906,12 +957,33 @@ static void StartMqttServiceTask(void *argument)
 
                 if (TlsClient_MqttTest() == 0)
                 {
+                    if (connectivity_outage_active != 0U)
+                    {
+                        char recovery_message[128];
+                        uint32_t outage_seconds =
+                            (HAL_GetTick() - connectivity_outage_started_ms +
+                             999U) / 1000U;
+
+                        (void)snprintf(
+                            recovery_message,
+                            sizeof(recovery_message),
+                            "MQTT connectivity restored after %lu second(s)",
+                            (unsigned long)outage_seconds);
+                        (void)IotEvents_QueueDiagnosticDurable(
+                            IOT_DIAGNOSTIC_INFO,
+                            "NETWORK",
+                            "NETWORK_CONNECTION_RESTORED",
+                            recovery_message);
+                        connectivity_outage_active = 0U;
+                    }
                     SYS_LOG("MQTT TEST: OK");
                     mqtt_ready = 1U;
+                    mqtt_healthy_since_ms = HAL_GetTick();
                 }
                 else
                 {
                     SYS_LOG("MQTT TEST: FAIL");
+                    CredentialRotation_RecordConnectionFailure("mqtt");
                     (void)IotEvents_QueueAlert(
                         IOT_ALERT_WARNING,
                         "MQTT_CONNECT_FAILED",
@@ -922,6 +994,7 @@ static void StartMqttServiceTask(void *argument)
             else
             {
                 SYS_LOG("TLS TEST: HANDSHAKE FAIL");
+                CredentialRotation_RecordConnectionFailure("tls");
                 (void)IotEvents_QueueAlert(
                     IOT_ALERT_WARNING,
                     "TLS_HANDSHAKE_FAILED",
@@ -937,13 +1010,64 @@ static void StartMqttServiceTask(void *argument)
                 (TlsClient_MqttProcess() != 0))
             {
                 SYS_LOG("MQTT: session lost, reconnect scheduled");
+                if (connectivity_outage_active == 0U)
+                {
+                    connectivity_outage_active = 1U;
+                    connectivity_outage_started_ms = now;
+                }
                 (void)IotEvents_QueueAlert(
                     IOT_ALERT_WARNING,
                     "MQTT_SESSION_LOST",
                     "MQTT session was lost; reconnect scheduled");
                 TlsClient_Disconnect();
                 mqtt_ready = 0U;
+                mqtt_healthy_since_ms = 0U;
                 retry_after_ms = HAL_GetTick() + 5000U;
+            }
+        }
+
+        if ((mqtt_ready != 0U) &&
+            (mqtt_healthy_since_ms != 0U) &&
+            (CredentialStore_GetState() ==
+             CREDENTIAL_STORE_ROTATION_VALIDATING) &&
+            ((HAL_GetTick() - mqtt_healthy_since_ms) >=
+             CREDENTIAL_ROTATION_MQTT_STABLE_MS))
+        {
+            if (CredentialStore_CommitRotationValidated() == 0)
+            {
+                SYS_LOG("FLEET: rotated credentials validated and committed");
+                (void)IotEvents_QueueDiagnostic(
+                    IOT_DIAGNOSTIC_INFO,
+                    "SECURITY",
+                    "CREDENTIAL_ROTATION_SUCCEEDED",
+                    "New credentials passed the stable MQTT health gate");
+                if (TlsClient_PublishStatus() != 0)
+                {
+                    SYS_LOG("FLEET: committed credential status publish deferred");
+                }
+            }
+            else
+            {
+                SYS_LOG("FLEET: rotated credential commit failed");
+                mqtt_healthy_since_ms = HAL_GetTick();
+            }
+        }
+
+        if ((mqtt_ready != 0U) &&
+            (mqtt_healthy_since_ms != 0U) &&
+            (OtaManager_IsTrial() != 0) &&
+            (SystemWatchdog_IsStarted() != 0) &&
+            ((HAL_GetTick() - mqtt_healthy_since_ms) >=
+             OTA_TRIAL_MQTT_STABLE_MS))
+        {
+            if (OtaManager_ConfirmHealthy() == 0)
+            {
+                SYS_LOG("OTA: MQTT stability gate passed, image confirmed");
+            }
+            else
+            {
+                SYS_LOG("OTA: MQTT stability confirmation failed");
+                mqtt_healthy_since_ms = HAL_GetTick();
             }
         }
 
@@ -996,7 +1120,7 @@ void StartDefaultTask(void *argument)
              gnetif.hwaddr[5]);
 
     uint32_t network_retry_after_ms = 0U;
-    uint8_t watchdog_ready = 0U;
+    uint32_t next_time_sync_ms = HAL_GetTick() + NET_TIME_SYNC_INTERVAL_MS;
 
     /* Local persistent services must be available even when Ethernet is down. */
     SYS_LOG("RTOS: local services init start");
@@ -1024,7 +1148,6 @@ void StartDefaultTask(void *argument)
     SecurityPosture_Report();
     if (SystemWatchdog_InitAndStart() == 0)
     {
-        watchdog_ready = 1U;
         SYS_LOG("WATCHDOG: IWDG started timeout~32s");
     }
     else
@@ -1033,24 +1156,9 @@ void StartDefaultTask(void *argument)
     }
 
     /*
-     * A trial image is healthy once persistent local services and the
-     * independent watchdog are operational. Cloud connectivity is not a
-     * health prerequisite: an Ethernet outage must not roll back good code.
-     * The AWS Jobs terminal report remains pending until MQTT reconnects.
+     * A TRIAL image is confirmed by mqttService only after the signed image,
+     * persistent services, IWDG and a stable AWS MQTT session are all proven.
      */
-    if ((tls_initialized != 0U) &&
-        (watchdog_ready != 0U) &&
-        (OtaManager_IsTrial() != 0))
-    {
-        if (OtaManager_ConfirmHealthy() == 0)
-        {
-            SYS_LOG("OTA: local health gate passed, image confirmed");
-        }
-        else
-        {
-            SYS_LOG("OTA: local health confirmation failed");
-        }
-    }
 
     if (Net_WaitForLink() == 0)
     {
@@ -1160,6 +1268,22 @@ void StartDefaultTask(void *argument)
             network_retry_after_ms = network_ready
                                          ? 0U
                                          : HAL_GetTick() + NET_DHCP_RETRY_DELAY_MS;
+        }
+
+        if (network_ready &&
+            ((int32_t)(HAL_GetTick() - next_time_sync_ms) >= 0))
+        {
+            if (SystemTime_SyncNetwork() == 0)
+            {
+                next_time_sync_ms =
+                    HAL_GetTick() + NET_TIME_SYNC_INTERVAL_MS;
+                NET_LOG("TIME: periodic SNTP synchronization OK");
+            }
+            else
+            {
+                next_time_sync_ms = HAL_GetTick() + NET_TIME_SYNC_RETRY_MS;
+                NET_LOG("TIME: periodic SNTP synchronization deferred");
+            }
         }
 
         osDelay(10);

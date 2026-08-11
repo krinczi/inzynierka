@@ -54,6 +54,12 @@ typedef struct
 
 _Static_assert(sizeof(IotEventJournalRecord) == IOT_EVENT_JOURNAL_RECORD_SIZE,
                "Persistent event journal record must be exactly 1024 bytes");
+_Static_assert(sizeof(IotEventMessage) == 496U,
+               "Changing the event layout requires a journal migration");
+_Static_assert(offsetof(IotEventMessage, flags) == 2U,
+               "Durability flags must remain in the former v1 padding byte");
+_Static_assert(offsetof(IotEventMessage, uptime_ms) == 4U,
+               "Journal v1 event offsets must remain backward compatible");
 
 static IotEventMessage event_queue[IOT_EVENT_QUEUE_CAPACITY];
 static IotThrottleEntry throttle_entries[IOT_THROTTLE_CAPACITY];
@@ -104,11 +110,25 @@ static uint32_t IotEvents_Crc32(const uint8_t *data, size_t length)
     return ~crc;
 }
 
-static int IotEvents_IsImportant(const IotEventMessage *event)
+int IotEvents_IsDurable(const IotEventMessage *event)
 {
-    return (event != NULL) &&
-           (event->type == IOT_MESSAGE_ALERT) &&
-           (event->level >= (uint8_t)IOT_ALERT_ALARM);
+    if (event == NULL)
+    {
+        return 0;
+    }
+
+    if ((event->flags & IOT_EVENT_FLAG_DURABLE) != 0U)
+    {
+        return 1;
+    }
+
+    if (event->type == IOT_MESSAGE_ALERT)
+    {
+        return event->level >= (uint8_t)IOT_ALERT_WARNING;
+    }
+
+    return (event->type == IOT_MESSAGE_DIAGNOSTIC) &&
+           (event->level <= (uint8_t)IOT_DIAGNOSTIC_WARN);
 }
 
 static void IotEvents_InvalidateJournalCache(void)
@@ -269,7 +289,7 @@ static int IotEvents_JournalCompact(void)
         IotEventJournalRecord record
             __attribute__((aligned(IOT_EVENT_FLASHWORD_SIZE)));
 
-        if (!IotEvents_IsImportant(&event_queue[index]))
+        if (!IotEvents_IsDurable(&event_queue[index]))
         {
             continue;
         }
@@ -446,19 +466,25 @@ static void IotEvents_RemoveAt(size_t index)
     memset(&event_queue[queue_count], 0, sizeof(event_queue[queue_count]));
 }
 
-static int IotEvents_MakeRoom(IotMessageType type, uint8_t level)
+static int IotEvents_MakeRoom(IotMessageType type,
+                              uint8_t level,
+                              uint8_t flags)
 {
     size_t index;
-    int important = (type == IOT_MESSAGE_ALERT) &&
-                    ((level == (uint8_t)IOT_ALERT_ALARM) ||
-                     (level == (uint8_t)IOT_ALERT_CRITICAL));
+    IotEventMessage candidate = { 0 };
+    int durable;
+
+    candidate.type = type;
+    candidate.level = level;
+    candidate.flags = flags;
+    durable = IotEvents_IsDurable(&candidate);
 
     if (queue_count < IOT_EVENT_QUEUE_CAPACITY)
     {
         return 0;
     }
 
-    if (!important)
+    if (!durable)
     {
         dropped_count++;
         return -1;
@@ -466,8 +492,7 @@ static int IotEvents_MakeRoom(IotMessageType type, uint8_t level)
 
     for (index = 0U; index < queue_count; index++)
     {
-        if ((event_queue[index].type == IOT_MESSAGE_DIAGNOSTIC) ||
-            (event_queue[index].level < (uint8_t)IOT_ALERT_ALARM))
+        if (!IotEvents_IsDurable(&event_queue[index]))
         {
             IotEvents_RemoveAt(index);
             dropped_count++;
@@ -476,8 +501,8 @@ static int IotEvents_MakeRoom(IotMessageType type, uint8_t level)
     }
 
     /*
-     * Never discard an already persisted ALARM/CRITICAL to make room for a
-     * newer one. The producer receives QUEUE_FULL and can retry later.
+     * Never discard an event covered by the durability policy to make room
+     * for a newer one. The producer receives QUEUE_FULL and can retry later.
      */
     dropped_count++;
     return -1;
@@ -485,6 +510,7 @@ static int IotEvents_MakeRoom(IotMessageType type, uint8_t level)
 
 static IotEventResult IotEvents_Queue(IotMessageType type,
                                       uint8_t level,
+                                      uint8_t flags,
                                       const char *source,
                                       const char *code,
                                       const char *message)
@@ -511,7 +537,9 @@ static IotEventResult IotEvents_Queue(IotMessageType type,
     }
 
     DeviceConfig_GetSnapshot(&config);
-    if ((type == IOT_MESSAGE_DIAGNOSTIC) && (level > config.log_level))
+    if ((type == IOT_MESSAGE_DIAGNOSTIC) &&
+        ((flags & IOT_EVENT_FLAG_DURABLE) == 0U) &&
+        (level > config.log_level))
     {
         return IOT_EVENT_FILTERED;
     }
@@ -530,7 +558,7 @@ static IotEventResult IotEvents_Queue(IotMessageType type,
     }
 
     suppressed_count = throttle->used ? throttle->suppressed_count : 0U;
-    if (IotEvents_MakeRoom(type, level) != 0)
+    if (IotEvents_MakeRoom(type, level, flags) != 0)
     {
         IotEvents_Unlock();
         return IOT_EVENT_QUEUE_FULL;
@@ -540,6 +568,7 @@ static IotEventResult IotEvents_Queue(IotMessageType type,
     memset(entry, 0, sizeof(*entry));
     entry->type = type;
     entry->level = level;
+    entry->flags = flags;
     entry->uptime_ms = now;
     entry->suppressed_count = suppressed_count;
     IotEvents_CopyToken(entry->code, sizeof(entry->code), normalized_code, "UNSPECIFIED");
@@ -559,7 +588,7 @@ static IotEventResult IotEvents_Queue(IotMessageType type,
                    (unsigned long)message_sequence);
     entry->message_id[sizeof(entry->message_id) - 1U] = '\0';
 
-    if (IotEvents_IsImportant(entry) &&
+    if (IotEvents_IsDurable(entry) &&
         (IotEvents_JournalAppend(IOT_EVENT_JOURNAL_KIND_PUT,
                                  entry) != 0))
     {
@@ -630,7 +659,7 @@ void IotEvents_Init(void)
         if (record->kind == IOT_EVENT_JOURNAL_KIND_PUT)
         {
             int duplicate = 0;
-            if (!IotEvents_IsImportant(&record->event))
+            if (!IotEvents_IsDurable(&record->event))
             {
                 continue;
             }
@@ -682,6 +711,7 @@ IotEventResult IotEvents_QueueAlert(IotAlertSeverity severity,
 {
     return IotEvents_Queue(IOT_MESSAGE_ALERT,
                            (uint8_t)severity,
+                           0U,
                            "SYSTEM",
                            code,
                            message);
@@ -694,6 +724,20 @@ IotEventResult IotEvents_QueueDiagnostic(IotDiagnosticLevel level,
 {
     return IotEvents_Queue(IOT_MESSAGE_DIAGNOSTIC,
                            (uint8_t)level,
+                           0U,
+                           source,
+                           code,
+                           message);
+}
+
+IotEventResult IotEvents_QueueDiagnosticDurable(IotDiagnosticLevel level,
+                                                const char *source,
+                                                const char *code,
+                                                const char *message)
+{
+    return IotEvents_Queue(IOT_MESSAGE_DIAGNOSTIC,
+                           (uint8_t)level,
+                           IOT_EVENT_FLAG_DURABLE,
                            source,
                            code,
                            message);
@@ -731,7 +775,7 @@ int IotEvents_PopIfMatch(const char *message_id)
                  message_id,
                  sizeof(event_queue[0].message_id)) == 0))
     {
-        if (IotEvents_IsImportant(&event_queue[0]) &&
+        if (IotEvents_IsDurable(&event_queue[0]) &&
             (IotEvents_JournalAppend(IOT_EVENT_JOURNAL_KIND_ACK,
                                      &event_queue[0]) != 0))
         {
@@ -751,6 +795,23 @@ size_t IotEvents_PendingCount(void)
 
     IotEvents_Lock();
     count = queue_count;
+    IotEvents_Unlock();
+    return count;
+}
+
+size_t IotEvents_DurablePendingCount(void)
+{
+    size_t count = 0U;
+    size_t index;
+
+    IotEvents_Lock();
+    for (index = 0U; index < queue_count; index++)
+    {
+        if (IotEvents_IsDurable(&event_queue[index]))
+        {
+            count++;
+        }
+    }
     IotEvents_Unlock();
     return count;
 }

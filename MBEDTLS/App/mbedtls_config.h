@@ -3291,7 +3291,17 @@
 #elif defined(MBEDTLS_USER_CONFIG_FILE)
     #include MBEDTLS_USER_CONFIG_FILE
 #endif
+/* Mbed TLS 3.x finalizes and validates configuration from build_info.h. */
+#if defined(MBEDTLS_VERSION_MAJOR) && (MBEDTLS_VERSION_MAJOR >= 3)
+/* Removed upstream; neither option is needed by AWS IoT TLS 1.2. */
+#undef MBEDTLS_SSL_TRUNCATED_HMAC_COMPAT
+#undef MBEDTLS_SSL_TRUNCATED_HMAC
+/* Bare-metal monotonic milliseconds are supplied by mbedtls_platform_time.c. */
+#define MBEDTLS_PLATFORM_MS_TIME_ALT
+#endif
+#if !defined(MBEDTLS_VERSION_MAJOR) || (MBEDTLS_VERSION_MAJOR < 3)
 #include "mbedtls/check_config.h"
+#endif
 
 /* USER CODE END 1 */
 

@@ -15,6 +15,4 @@
 #define MBEDTLS_ECP_WINDOW_SIZE 2
 #define MBEDTLS_ECP_FIXED_POINT_OPTIM 0
 
-#include "mbedtls/check_config.h"
-
 #endif /* BOOT_MBEDTLS_CONFIG_H_ */

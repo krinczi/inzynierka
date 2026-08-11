@@ -57,7 +57,8 @@ int DeviceIdentity_Refresh(void)
     DeviceConfig_GetHardwareUid(identity_context.hardware_uid,
                                 sizeof(identity_context.hardware_uid));
 
-    if (CredentialStore_GetState() == CREDENTIAL_STORE_PROVISIONED)
+    if (CredentialStore_UsesDeviceCredentials() ||
+        CredentialStore_IsRotationInProgress())
     {
         if ((credentials == NULL) ||
             !DeviceIdentity_IsValidThingName(credentials->thing_name))

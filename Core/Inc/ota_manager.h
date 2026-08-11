@@ -19,9 +19,9 @@ typedef struct
 int OtaManager_Init(void);
 
 /*
- * Confirms a TRIAL image after local persistent services and the independent
- * watchdog are operational. Confirmation advances the anti-rollback floor;
- * cloud connectivity is deliberately not a health prerequisite.
+ * Confirms a TRIAL image after the caller has established the production
+ * health gate: persistent services, IWDG and a stable MQTT session.
+ * Confirmation advances the anti-rollback floor.
  */
 int OtaManager_ConfirmHealthy(void);
 

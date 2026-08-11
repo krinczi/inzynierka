@@ -1,4 +1,5 @@
 #include "https_downloader.h"
+#include "mbedtls_compat.h"
 
 #include "debug_logger.h"
 #include "main.h"
@@ -640,7 +641,7 @@ static void Downloader_TlsHandshake(void)
 
     if (result == 0)
     {
-        if (downloader.ssl.state == MBEDTLS_SSL_HANDSHAKE_OVER)
+        if (MbedtlsCompat_HandshakeOver(&downloader.ssl))
         {
             if (mbedtls_ssl_get_verify_result(&downloader.ssl) != 0U)
             {

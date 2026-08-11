@@ -1,4 +1,5 @@
 #include "tls_client.h"
+#include "mbedtls_compat.h"
 #include "aws_jobs.h"
 #include "aws_iot_config.h"
 #include "mqtt_topics.h"
@@ -81,6 +82,7 @@
     (5U + 2U + (MQTT_TOPIC_BUFFER_SIZE - 1U) + 2U)
 #define MQTT_JSON_BUFFER_SIZE          768U
 #define MQTT_SHADOW_JSON_BUFFER_SIZE   1024U
+#define MQTT_LWT_PAYLOAD_SIZE          192U
 
 #define INTERACTION_DURATION_DEFAULT_SECONDS 300U
 #define INTERACTION_DURATION_MIN_SECONDS      30U
@@ -143,22 +145,38 @@ static uint8_t mqtt_interaction_active = 0U;
 static uint8_t mqtt_interaction_expiry_pending = 0U;
 static uint32_t mqtt_interaction_deadline_ms = 0U;
 static uint32_t mqtt_last_interaction_diagnostic_ms = 0U;
-static uint32_t mqtt_interaction_sequence = 0U;
 static uint8_t mqtt_provisioning_failed_attempts = 0U;
 static uint32_t mqtt_provisioning_next_attempt_ms = 0U;
 static uint8_t mqtt_shadow_get_pending = 0U;
 static uint8_t mqtt_rx_buffer[MQTT_RX_BUFFER_SIZE];
+/* The current packet is detached before dispatch so nested MQTT I/O cannot
+ * process the same bytes recursively while a handler publishes a response. */
+static uint8_t mqtt_packet_buffer[MQTT_RX_BUFFER_SIZE];
 static size_t mqtt_rx_length = 0U;
 static uint16_t mqtt_expected_suback_packet_id = 0U;
 static int mqtt_suback_result = 0;
 static uint16_t mqtt_expected_puback_packet_id = 0U;
 static uint16_t mqtt_next_publish_packet_id = 100U;
 static int mqtt_puback_result = 0;
+static uint8_t mqtt_command_processing = 0U;
+static char mqtt_last_command_id[96];
+static char mqtt_last_command_status[16];
+static char mqtt_last_command_message[128];
+/*
+ * Some deployed AWS IoT policies authorize the normal device topics but do
+ * not authorize a retained Last Will during CONNECT.  AWS closes such a
+ * connection before CONNACK.  Try the production LWT once, then remember the
+ * broker capability for the rest of this boot and reconnect in compatibility
+ * mode instead of entering an endless reconnect loop.
+ */
+static uint8_t mqtt_retained_status_enabled = 1U;
 
 static int mqtt_process_rx_buffer(void);
 static int mqtt_read_available(void);
 static int mqtt_publish_json(const char *topic, const char *payload);
 static int mqtt_publish_json_qos1(const char *topic, const char *payload);
+static int mqtt_publish_json_qos1_retained(const char *topic,
+                                           const char *payload);
 
 static int Tls_CancelRequested(void)
 {
@@ -422,14 +440,13 @@ int TlsClient_Init(void)
     FlashStagingResult staging_result;
 
     tls_log("TLS: init");
-    tls_log("TLS BUILD: fleet_auto_v3 shadow_v1 hw_telemetry_v1 rtc_sntp_v1 iwdg_mpu_v1 durable_events_v1 full_ota_v1");
+    tls_log("TLS BUILD: fleet_auto_v3 credential_rotation_v2 shadow_v1 hw_telemetry_v1 rtc_sntp_v1 iwdg_mpu_v1 durable_events_v2 full_ota_v1");
     tls_connected = 0;
     tls_ctx_ready = 0;
     mqtt_interaction_active = 0U;
     mqtt_interaction_expiry_pending = 0U;
     mqtt_interaction_deadline_ms = 0U;
     mqtt_last_interaction_diagnostic_ms = 0U;
-    mqtt_interaction_sequence = 0U;
     mqtt_provisioning_failed_attempts = 0U;
     mqtt_provisioning_next_attempt_ms = 0U;
     DeviceConfig_Init();
@@ -444,7 +461,7 @@ int TlsClient_Init(void)
     tls_logf("IDENTITY: thingName=%s clientId=%s",
              DeviceIdentity_GetThingName(),
              DeviceIdentity_GetClientId());
-    if ((credential_state == CREDENTIAL_STORE_PROVISIONED) &&
+    if (CredentialStore_UsesDeviceCredentials() &&
         (DeviceConfig_Get()->provisioning_state != DEVICE_PROVISIONING_PROVISIONED))
     {
         (void)DeviceConfig_SetProvisioned();
@@ -487,7 +504,7 @@ int TlsClient_Init(void)
                  DeviceIdentity_GetHardwareUid());
         tls_logf("FLEET: credentialStore=%s automatic=%s",
                  CredentialStore_StateName(credential_state),
-                 credential_state == CREDENTIAL_STORE_PROVISIONED ? "ready" : "required");
+                 CredentialStore_IsProvisioningRequired() ? "required" : "ready");
         FleetProvisioning_Init(mqtt_publish_json,
                                AWS_FLEET_PROVISIONING_TEMPLATE_NAME,
                                DeviceIdentity_GetThingName(),
@@ -847,7 +864,7 @@ int TlsClient_Connect(void)
         return -1;
     }
 
-    if (CredentialStore_GetState() == CREDENTIAL_STORE_PROVISIONED)
+    if (CredentialStore_UsesDeviceCredentials())
     {
         const CredentialStoreData *credentials = CredentialStore_Get();
         client_certificate = (const unsigned char *)credentials->certificate_pem;
@@ -962,7 +979,14 @@ int TlsClient_Connect(void)
 
     tls_log_diag("TLS: private key parsed");
 
+#if MBEDTLS_VERSION_NUMBER >= 0x03000000
+    ret = mbedtls_pk_check_pair(&tls_client_cert.pk,
+                                &tls_pkey,
+                                mbedtls_ctr_drbg_random,
+                                &tls_ctr_drbg);
+#else
     ret = mbedtls_pk_check_pair(&tls_client_cert.pk, &tls_pkey);
+#endif
     if (ret != 0)
     {
         tls_log_mbedtls_error("mbedtls_pk_check_pair(cert,key)", ret);
@@ -1076,7 +1100,7 @@ int TlsClient_Connect(void)
 
     ret = 0;
 
-    while (tls_ssl.state != MBEDTLS_SSL_HANDSHAKE_OVER)
+    while (!MbedtlsCompat_HandshakeOver(&tls_ssl))
     {
         uint32_t step_start;
         uint32_t now;
@@ -1089,7 +1113,13 @@ int TlsClient_Connect(void)
         }
 
         hs_try++;
+#if MBEDTLS_VERSION_NUMBER >= 0x03000000
+        state_before = MbedtlsCompat_HandshakeOver(&tls_ssl)
+                           ? MBEDTLS_SSL_HANDSHAKE_OVER
+                           : -1;
+#else
         state_before = tls_ssl.state;
+#endif
         step_start = HAL_GetTick();
 
         if ((state_before == MBEDTLS_SSL_SERVER_HELLO) &&
@@ -1126,8 +1156,12 @@ int TlsClient_Connect(void)
             hs_server_hello_after_logged = 1;
             tls_log_diagf("TLS: after SERVER_HELLO ret=%d state=%s(%d) dt=%lu rr=%d re=%d rx=%lu pb=%lu al=%lu fr=%lu af=%lu",
                           ret,
-                          tls_state_name(tls_ssl.state),
-                          tls_ssl.state,
+                          tls_state_name(MbedtlsCompat_HandshakeOver(&tls_ssl)
+                                             ? MBEDTLS_SSL_HANDSHAKE_OVER
+                                             : -1),
+                          MbedtlsCompat_HandshakeOver(&tls_ssl)
+                              ? MBEDTLS_SSL_HANDSHAKE_OVER
+                              : -1,
                           (unsigned long)(now - step_start),
                           tls_last_recv_ret,
                           tls_last_recv_errno,
@@ -1142,25 +1176,35 @@ int TlsClient_Connect(void)
 #endif
 
         if ((hs_try <= 20) ||
-            (tls_ssl.state != hs_last_after_state) ||
+            ((MbedtlsCompat_HandshakeOver(&tls_ssl)
+                  ? MBEDTLS_SSL_HANDSHAKE_OVER
+                  : -1) != hs_last_after_state) ||
             ((ret != 0) &&
              (ret != MBEDTLS_ERR_SSL_WANT_READ) &&
              (ret != MBEDTLS_ERR_SSL_WANT_WRITE)))
         {
-            hs_last_after_state = tls_ssl.state;
+            hs_last_after_state = MbedtlsCompat_HandshakeOver(&tls_ssl)
+                                      ? MBEDTLS_SSL_HANDSHAKE_OVER
+                                      : -1;
             tls_log_diagf("TLS STEP: after tr=%d state=%s(%d) ret=%d dt=%lu",
                           hs_try,
-                          tls_state_name(tls_ssl.state),
-                          tls_ssl.state,
+                          tls_state_name(hs_last_after_state),
+                          hs_last_after_state,
                           ret,
                           (unsigned long)(now - step_start));
         }
 
 #if TLS_STATE_TRANSITION_LOGS
-        if (tls_ssl.state != hs_last_public_state)
+        if ((MbedtlsCompat_HandshakeOver(&tls_ssl)
+                 ? MBEDTLS_SSL_HANDSHAKE_OVER
+                 : -1) != hs_last_public_state)
         {
-            hs_last_public_state = tls_ssl.state;
-            tls_logf("TLS: state=%s(%d)", tls_state_name(tls_ssl.state), tls_ssl.state);
+            hs_last_public_state = MbedtlsCompat_HandshakeOver(&tls_ssl)
+                                       ? MBEDTLS_SSL_HANDSHAKE_OVER
+                                       : -1;
+            tls_logf("TLS: state=%s(%d)",
+                     tls_state_name(hs_last_public_state),
+                     hs_last_public_state);
         }
 #endif
 
@@ -1431,14 +1475,52 @@ static int tls_read_exact(uint8_t *data, size_t len, uint32_t timeout_ms)
 
 static int mqtt_send_connect(void)
 {
-    uint8_t pkt[256];
+    uint8_t pkt[768];
     uint8_t connack[4];
+    char will_payload[MQTT_LWT_PAYLOAD_SIZE];
     const DeviceConfig *config = DeviceConfig_Get();
     const char *client_id = DeviceIdentity_GetClientId();
+    const MqttTopics *topics = MqttTopics_Get();
     size_t client_id_len = strlen(client_id);
-    size_t remaining = 10U + 2U + client_id_len;
+    size_t will_topic_len;
+    size_t will_payload_len;
+    size_t remaining;
     size_t rem_len;
     size_t pos;
+    int written;
+
+    if ((mqtt_retained_status_enabled != 0U) && (topics == NULL))
+    {
+        tls_log("MQTT: topics unavailable for CONNECT");
+        return -1;
+    }
+
+    written = 0;
+    will_topic_len = 0U;
+    will_payload_len = 0U;
+    if (mqtt_retained_status_enabled != 0U)
+    {
+        written = snprintf(will_payload,
+                           sizeof(will_payload),
+                           "{\"deviceId\":\"%s\",\"schemaVersion\":1,"
+                           "\"state\":\"offline\","
+                           "\"reason\":\"connection_lost\"}",
+                           DeviceIdentity_GetThingName());
+        if ((written < 0) || ((size_t)written >= sizeof(will_payload)))
+        {
+            tls_log("MQTT: Last Will JSON too large");
+            return -1;
+        }
+
+        will_topic_len = strlen(topics->status);
+        will_payload_len = (size_t)written;
+    }
+
+    remaining = 10U + 2U + client_id_len;
+    if (mqtt_retained_status_enabled != 0U)
+    {
+        remaining += 2U + will_topic_len + 2U + will_payload_len;
+    }
 
     pkt[0] = 0x10U;
     rem_len = mqtt_encode_remaining_length(&pkt[1], remaining);
@@ -1455,12 +1537,20 @@ static int mqtt_send_connect(void)
     }
 
     pkt[pos++] = 4U;      /* MQTT 3.1.1 */
-    pkt[pos++] = 0x02U;   /* clean session */
+    /* Clean session, optionally with a retained QoS 1 status Last Will. */
+    pkt[pos++] = (mqtt_retained_status_enabled != 0U) ? 0x2EU : 0x02U;
     pkt[pos++] = (uint8_t)((config->mqtt_keep_alive_seconds >> 8U) & 0xFFU);
     pkt[pos++] = (uint8_t)(config->mqtt_keep_alive_seconds & 0xFFU);
 
     if (mqtt_put_string(pkt, sizeof(pkt), &pos, client_id) != 0)
     {
+        return -1;
+    }
+    if ((mqtt_retained_status_enabled != 0U) &&
+        ((mqtt_put_string(pkt, sizeof(pkt), &pos, topics->status) != 0) ||
+         (mqtt_put_string(pkt, sizeof(pkt), &pos, will_payload) != 0)))
+    {
+        tls_log("MQTT: Last Will does not fit CONNECT packet");
         return -1;
     }
 
@@ -1473,6 +1563,11 @@ static int mqtt_send_connect(void)
 
     if (tls_read_exact(connack, sizeof(connack), 5000U) != 0)
     {
+        if (mqtt_retained_status_enabled != 0U)
+        {
+            mqtt_retained_status_enabled = 0U;
+            tls_log("MQTT: retained status unavailable, compatibility mode scheduled");
+        }
         tls_log("MQTT: CONNACK read failed");
         return -1;
     }
@@ -1582,7 +1677,8 @@ static int mqtt_subscribe_topic(const char *topic, uint16_t packet_id)
 
 static int mqtt_publish_json_internal(const char *topic,
                                       const char *payload,
-                                      uint8_t qos)
+                                      uint8_t qos,
+                                      uint8_t retain)
 {
     uint8_t pkt[MQTT_TX_BUFFER_SIZE];
     size_t topic_len = strlen(topic);
@@ -1601,7 +1697,8 @@ static int mqtt_publish_json_internal(const char *topic,
         return -1;
     }
 
-    pkt[0] = (qos == 1U) ? 0x32U : 0x30U;
+    pkt[0] = (uint8_t)(0x30U | ((qos & 0x03U) << 1U) |
+                       (retain != 0U ? 0x01U : 0x00U));
     rem_len = mqtt_encode_remaining_length(&pkt[1], remaining);
     pos = 1U + rem_len;
 
@@ -1675,12 +1772,18 @@ static int mqtt_publish_json_internal(const char *topic,
 
 static int mqtt_publish_json(const char *topic, const char *payload)
 {
-    return mqtt_publish_json_internal(topic, payload, 0U);
+    return mqtt_publish_json_internal(topic, payload, 0U, 0U);
 }
 
 static int mqtt_publish_json_qos1(const char *topic, const char *payload)
 {
-    return mqtt_publish_json_internal(topic, payload, 1U);
+    return mqtt_publish_json_internal(topic, payload, 1U, 0U);
+}
+
+static int mqtt_publish_json_qos1_retained(const char *topic,
+                                           const char *payload)
+{
+    return mqtt_publish_json_internal(topic, payload, 1U, 1U);
 }
 
 static int mqtt_interaction_deadline_reached(uint32_t now)
@@ -1717,46 +1820,38 @@ static uint32_t mqtt_interaction_remaining_seconds(uint32_t now)
     return (remaining_ms + 999U) / 1000U;
 }
 
-static int mqtt_publish_interaction_diagnostic(const char *code,
-                                                const char *message,
-                                                uint32_t now)
+static void mqtt_queue_interaction_diagnostic(const char *code,
+                                               const char *message,
+                                               int durable)
 {
-    char payload[MQTT_JSON_BUFFER_SIZE];
-    const DeviceConfig *config = DeviceConfig_Get();
-    int written;
+    IotEventResult result;
 
-    mqtt_interaction_sequence++;
-    written = snprintf(payload,
-                       sizeof(payload),
-                       "{\"deviceId\":\"%s\",\"schemaVersion\":1,"
-                       "\"logId\":\"interaction-%08lx-%04lx\","
-                       "\"level\":\"DEBUG\",\"source\":\"INTERACTION\","
-                       "\"code\":\"%s\",\"message\":\"%s\","
-                       "\"uptimeMs\":%lu,\"configVersion\":%lu,"
-                       "\"suppressedCount\":0}",
-                       DeviceIdentity_GetThingName(),
-                       (unsigned long)now,
-                       (unsigned long)(mqtt_interaction_sequence & 0xFFFFU),
-                       code,
-                       message,
-                       (unsigned long)now,
-                       (unsigned long)config->config_version);
+    result = durable
+                 ? IotEvents_QueueDiagnosticDurable(IOT_DIAGNOSTIC_DEBUG,
+                                                    "INTERACTION",
+                                                    code,
+                                                    message)
+                 : IotEvents_QueueDiagnostic(IOT_DIAGNOSTIC_DEBUG,
+                                             "INTERACTION",
+                                             code,
+                                             message);
 
-    if ((written < 0) || ((size_t)written >= sizeof(payload)))
+    if ((result == IOT_EVENT_QUEUE_FULL) || (result == IOT_EVENT_INVALID))
     {
-        tls_log("INTERACTION: diagnostic JSON too large");
-        return -1;
+        /* Diagnostic pressure must never tear down the MQTT control plane. */
+        tls_logf("INTERACTION: diagnostic dropped code=%s result=%d",
+                 code,
+                 (int)result);
     }
-
-    return mqtt_publish_json(MqttTopics_Get()->diagnostics, payload);
 }
 
 static int mqtt_publish_status(void)
 {
-    char payload[768];
+    char payload[896];
     char hardware_uid[DEVICE_HARDWARE_UID_HEX_LENGTH + 1U];
     const DeviceConfig *config = DeviceConfig_Get();
     CredentialStoreState credential_state = CredentialStore_GetState();
+    const CredentialStoreData *credentials = CredentialStore_Get();
     const char *thing_name = DeviceIdentity_GetThingName();
     uint32_t now = HAL_GetTick();
     uint32_t remaining_seconds = mqtt_interaction_remaining_seconds(now);
@@ -1775,8 +1870,12 @@ static int mqtt_publish_status(void)
                        "\"provisioning\":{\"state\":\"%s\","
                        "\"mode\":\"AUTO_FLEET\","
                        "\"credentialState\":\"%s\","
+                       "\"certificateId\":\"%s\","
                        "\"thingName\":\"%s\","
-                       "\"hardwareUid\":\"%s\"}}",
+                       "\"hardwareUid\":\"%s\"},"
+                       "\"eventBuffer\":{\"capacity\":%u,"
+                       "\"pending\":%u,\"durablePending\":%u,"
+                       "\"dropped\":%lu,\"persistenceFailures\":%lu}}",
                        DeviceIdentity_GetThingName(),
                        (unsigned long)now,
                        STM32_APP_FIRMWARE_VERSION,
@@ -1786,8 +1885,14 @@ static int mqtt_publish_status(void)
                        (unsigned long)(INTERACTION_DIAGNOSTIC_INTERVAL_MS / 1000U),
                        DeviceConfig_ProvisioningStateName(config->provisioning_state),
                        CredentialStore_StateName(credential_state),
+                       credentials->certificate_id,
                        thing_name,
-                       hardware_uid);
+                       hardware_uid,
+                       (unsigned int)IOT_EVENT_QUEUE_CAPACITY,
+                       (unsigned int)IotEvents_PendingCount(),
+                       (unsigned int)IotEvents_DurablePendingCount(),
+                       (unsigned long)IotEvents_DroppedCount(),
+                       (unsigned long)IotEvents_PersistenceFailureCount());
 
     if ((written < 0) || ((size_t)written >= sizeof(payload)))
     {
@@ -1795,6 +1900,18 @@ static int mqtt_publish_status(void)
         return -1;
     }
 
+    if (mqtt_retained_status_enabled != 0U)
+    {
+        /* Replace the retained offline Last Will after a full-LWT connect. */
+        return mqtt_publish_json_qos1_retained(MqttTopics_Get()->status,
+                                               payload);
+    }
+
+    /*
+     * Broker policy compatibility: keep status observable without RETAIN.
+     * QoS 0 also prevents an application command handler from synchronously
+     * waiting for a status PUBACK while it is already dispatching MQTT input.
+     */
     return mqtt_publish_json(MqttTopics_Get()->status, payload);
 }
 
@@ -2053,10 +2170,13 @@ static int mqtt_publish_queued_event(const IotEventMessage *event)
         return -1;
     }
 
-    if ((event->type == IOT_MESSAGE_ALERT) &&
-        (event->level >= (uint8_t)IOT_ALERT_ALARM))
+    if (IotEvents_IsDurable(event))
     {
-        return mqtt_publish_json_qos1(MqttTopics_Get()->alerts, payload);
+        return mqtt_publish_json_qos1(
+            (event->type == IOT_MESSAGE_ALERT)
+                ? MqttTopics_Get()->alerts
+                : MqttTopics_Get()->diagnostics,
+            payload);
     }
 
     return mqtt_publish_json((event->type == IOT_MESSAGE_ALERT)
@@ -2331,6 +2451,7 @@ static int mqtt_publish_command_result(const char *command_id,
                                        const char *message)
 {
     char payload[MQTT_JSON_BUFFER_SIZE];
+    int result;
     int written = snprintf(payload,
                            sizeof(payload),
                            "{\"deviceId\":\"%s\",\"schemaVersion\":1,"
@@ -2348,7 +2469,23 @@ static int mqtt_publish_command_result(const char *command_id,
         return -1;
     }
 
-    return mqtt_publish_json(MqttTopics_Get()->command_result, payload);
+    result = mqtt_publish_json(MqttTopics_Get()->command_result, payload);
+    if (result == 0)
+    {
+        (void)snprintf(mqtt_last_command_id,
+                       sizeof(mqtt_last_command_id),
+                       "%s",
+                       command_id);
+        (void)snprintf(mqtt_last_command_status,
+                       sizeof(mqtt_last_command_status),
+                       "%s",
+                       status);
+        (void)snprintf(mqtt_last_command_message,
+                       sizeof(mqtt_last_command_message),
+                       "%s",
+                       message);
+    }
+    return result;
 }
 
 static int mqtt_publish_reported_config(uint32_t request_version,
@@ -2644,6 +2781,7 @@ static int mqtt_handle_command(const char *payload)
     char actual_hardware_uid[DEVICE_HARDWARE_UID_HEX_LENGTH + 1U];
     uint32_t now;
     uint32_t duration_seconds;
+    int confirmed;
     int led_on;
 
     if (json_get_string(payload, "commandId", command_id, sizeof(command_id)) != 0)
@@ -2652,10 +2790,79 @@ static int mqtt_handle_command(const char *payload)
         return mqtt_publish_command_result("unknown", "FAILED", "Invalid commandId");
     }
 
+    if ((mqtt_last_command_id[0] != '\0') &&
+        (strcmp(command_id, mqtt_last_command_id) == 0))
+    {
+        tls_logf("MQTT CMD: duplicate commandId=%s, replaying result",
+                 command_id);
+        return mqtt_publish_command_result(command_id,
+                                           mqtt_last_command_status,
+                                           mqtt_last_command_message);
+    }
+
     if (json_get_string(payload, "type", command_type, sizeof(command_type)) != 0)
     {
         tls_log("MQTT CMD: missing/invalid type");
         return mqtt_publish_command_result(command_id, "FAILED", "Invalid command type");
+    }
+
+    if (strcmp(command_type, "credentials.rotate") == 0)
+    {
+        if ((json_get_bool(payload, "confirm", &confirmed) != 0) ||
+            !confirmed ||
+            (json_get_string(payload,
+                             "hardwareUid",
+                             requested_hardware_uid,
+                             sizeof(requested_hardware_uid)) != 0))
+        {
+            return mqtt_publish_command_result(
+                command_id,
+                "FAILED",
+                "Credential rotation requires confirm=true and hardwareUid");
+        }
+
+        DeviceConfig_GetHardwareUid(actual_hardware_uid,
+                                    sizeof(actual_hardware_uid));
+        if (strcmp(requested_hardware_uid, actual_hardware_uid) != 0)
+        {
+            (void)IotEvents_QueueAlert(IOT_ALERT_WARNING,
+                                       "CREDENTIAL_ROTATION_UID_MISMATCH",
+                                       "Credential rotation hardware UID mismatch");
+            return mqtt_publish_command_result(command_id,
+                                               "FAILED",
+                                               "Credential rotation hardwareUid mismatch");
+        }
+
+        if (CredentialStore_GetState() != CREDENTIAL_STORE_PROVISIONED)
+        {
+            return mqtt_publish_command_result(command_id,
+                                               "FAILED",
+                                               "Credential rotation already active or unavailable");
+        }
+
+        if (FleetProvisioning_RequestRotation() != 0)
+        {
+            (void)IotEvents_QueueAlert(IOT_ALERT_CRITICAL,
+                                       "CREDENTIAL_ROTATION_START_FAILED",
+                                       "Credential rotation could not be persisted");
+            return mqtt_publish_command_result(command_id,
+                                               "FAILED",
+                                               "Credential rotation could not be started");
+        }
+
+        tls_logf("FLEET: credential rotation accepted commandId=%s",
+                 command_id);
+        (void)IotEvents_QueueDiagnostic(IOT_DIAGNOSTIC_INFO,
+                                        "SECURITY",
+                                        "CREDENTIAL_ROTATION_REQUESTED",
+                                        "Credential rotation was requested");
+        if (mqtt_publish_command_result(command_id,
+                                        "ACKED",
+                                        "Credential rotation started") != 0)
+        {
+            return -1;
+        }
+        return mqtt_publish_status();
     }
 
     if (strcmp(command_type, "provisioning.apply") == 0)
@@ -2771,10 +2978,10 @@ static int mqtt_handle_command(const char *payload)
                  (unsigned long)duration_seconds,
                  command_id);
 
-        if ((mqtt_publish_interaction_diagnostic("MODE_STARTED",
-                                                 "Full interaction mode started",
-                                                 now) != 0) ||
-            (mqtt_publish_status() != 0))
+        mqtt_queue_interaction_diagnostic("MODE_STARTED",
+                                          "Full interaction mode started",
+                                          1);
+        if (mqtt_publish_status() != 0)
         {
             return -1;
         }
@@ -2791,10 +2998,10 @@ static int mqtt_handle_command(const char *payload)
         mqtt_interaction_deadline_ms = 0U;
         tls_logf("INTERACTION: stopped commandId=%s", command_id);
 
-        if ((mqtt_publish_interaction_diagnostic("MODE_STOPPED",
-                                                 "Normal mode restored by command",
-                                                 now) != 0) ||
-            (mqtt_publish_status() != 0))
+        mqtt_queue_interaction_diagnostic("MODE_STOPPED",
+                                          "Normal mode restored by command",
+                                          1);
+        if (mqtt_publish_status() != 0)
         {
             return -1;
         }
@@ -2841,10 +3048,10 @@ static int mqtt_process_interaction(uint32_t now)
     if (mqtt_interaction_expiry_pending)
     {
         mqtt_interaction_expiry_pending = 0U;
-        if ((mqtt_publish_interaction_diagnostic("MODE_EXPIRED",
-                                                 "Interaction timeout expired",
-                                                 now) != 0) ||
-            (mqtt_publish_status() != 0))
+        mqtt_queue_interaction_diagnostic("MODE_EXPIRED",
+                                          "Interaction timeout expired",
+                                          1);
+        if (mqtt_publish_status() != 0)
         {
             return -1;
         }
@@ -2855,12 +3062,9 @@ static int mqtt_process_interaction(uint32_t now)
          INTERACTION_DIAGNOSTIC_INTERVAL_MS))
     {
         mqtt_last_interaction_diagnostic_ms = now;
-        if (mqtt_publish_interaction_diagnostic("MODE_ACTIVE",
-                                                "Full interaction mode active",
-                                                now) != 0)
-        {
-            return -1;
-        }
+        mqtt_queue_interaction_diagnostic("MODE_ACTIVE",
+                                          "Full interaction mode active",
+                                          0);
     }
 
     return 0;
@@ -2954,6 +3158,27 @@ static int mqtt_handle_publish_packet(const uint8_t *packet,
     payload[payload_length] = '\0';
     tls_logf("MQTT: received PUBLISH %s", topic);
 
+    /*
+     * MQTT QoS 1 acknowledges transport-level receipt, not completion of the
+     * application action.  Send PUBACK before a handler performs synchronous
+     * response publishes; otherwise the broker may retransmit while the
+     * original packet is still being handled.
+     */
+    if (qos == 1U)
+    {
+        uint8_t puback[4] = {
+            0x40U,
+            0x02U,
+            (uint8_t)((packet_id >> 8U) & 0xFFU),
+            (uint8_t)(packet_id & 0xFFU)
+        };
+
+        if (tls_write_all(puback, sizeof(puback), 5000U) != 0)
+        {
+            return -1;
+        }
+    }
+
     fleet_result = FleetProvisioning_HandleMessage(topic, payload);
     if (fleet_result < 0)
     {
@@ -2989,26 +3214,35 @@ static int mqtt_handle_publish_packet(const uint8_t *packet,
             }
             else if (strcmp(topic, MqttTopics_Get()->command) == 0)
             {
-                if (mqtt_handle_command(payload) != 0)
+                int command_result;
+
+                if (mqtt_command_processing != 0U)
+                {
+                    char nested_command_id[96] = "unknown";
+
+                    (void)json_get_string(payload,
+                                          "commandId",
+                                          nested_command_id,
+                                          sizeof(nested_command_id));
+                    tls_logf("MQTT CMD: busy, rejecting commandId=%s",
+                             nested_command_id);
+                    command_result = mqtt_publish_command_result(
+                        nested_command_id,
+                        "FAILED",
+                        "Another command is being processed");
+                }
+                else
+                {
+                    mqtt_command_processing = 1U;
+                    command_result = mqtt_handle_command(payload);
+                    mqtt_command_processing = 0U;
+                }
+
+                if (command_result != 0)
                 {
                     return -1;
                 }
             }
-        }
-    }
-
-    if (qos == 1U)
-    {
-        uint8_t puback[4] = {
-            0x40U,
-            0x02U,
-            (uint8_t)((packet_id >> 8U) & 0xFFU),
-            (uint8_t)(packet_id & 0xFFU)
-        };
-
-        if (tls_write_all(puback, sizeof(puback), 5000U) != 0)
-        {
-            return -1;
         }
     }
 
@@ -3121,34 +3355,12 @@ static int mqtt_process_rx_buffer(void)
             return 0;
         }
 
-        if ((mqtt_rx_buffer[0] & 0xF0U) == 0x30U)
-        {
-            if (mqtt_handle_publish_packet(mqtt_rx_buffer,
-                                           packet_length,
-                                           header_length) != 0)
-            {
-                return -1;
-            }
-        }
-        else if ((mqtt_rx_buffer[0] & 0xF0U) == 0x90U)
-        {
-            if (mqtt_handle_suback_packet(mqtt_rx_buffer,
-                                          packet_length,
-                                          header_length) != 0)
-            {
-                return -1;
-            }
-        }
-        else if ((mqtt_rx_buffer[0] & 0xF0U) == 0x40U)
-        {
-            if (mqtt_handle_puback_packet(mqtt_rx_buffer,
-                                          packet_length,
-                                          header_length) != 0)
-            {
-                return -1;
-            }
-        }
-
+        /*
+         * Detach the packet before dispatch.  Publish handlers are allowed to
+         * perform MQTT I/O; a nested read must see only subsequent packets,
+         * never the packet currently being handled.
+         */
+        memcpy(mqtt_packet_buffer, mqtt_rx_buffer, packet_length);
         mqtt_rx_length -= packet_length;
         if (mqtt_rx_length > 0U)
         {
@@ -3156,6 +3368,35 @@ static int mqtt_process_rx_buffer(void)
                     &mqtt_rx_buffer[packet_length],
                     mqtt_rx_length);
         }
+
+        if ((mqtt_packet_buffer[0] & 0xF0U) == 0x30U)
+        {
+            if (mqtt_handle_publish_packet(mqtt_packet_buffer,
+                                           packet_length,
+                                           header_length) != 0)
+            {
+                return -1;
+            }
+        }
+        else if ((mqtt_packet_buffer[0] & 0xF0U) == 0x90U)
+        {
+            if (mqtt_handle_suback_packet(mqtt_packet_buffer,
+                                          packet_length,
+                                          header_length) != 0)
+            {
+                return -1;
+            }
+        }
+        else if ((mqtt_packet_buffer[0] & 0xF0U) == 0x40U)
+        {
+            if (mqtt_handle_puback_packet(mqtt_packet_buffer,
+                                          packet_length,
+                                          header_length) != 0)
+            {
+                return -1;
+            }
+        }
+
     }
 
     return 0;
@@ -3506,6 +3747,11 @@ int TlsClient_MqttProcess(void)
 int TlsClient_MqttIsReady(void)
 {
     return mqtt_ready;
+}
+
+int TlsClient_PublishStatus(void)
+{
+    return (tls_connected && mqtt_ready) ? mqtt_publish_status() : -1;
 }
 
 void TlsClient_Disconnect(void)

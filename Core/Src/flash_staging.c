@@ -1,4 +1,5 @@
 #include "flash_staging.h"
+#include "mbedtls_compat.h"
 
 #include "main.h"
 #include "ota_image.h"
@@ -160,7 +161,7 @@ static FlashStagingResult FlashStaging_CalculateSha256(
 
     FlashStaging_InvalidateCache(FlashStaging_DataAddress(), size);
     mbedtls_sha256_init(&context);
-    result = mbedtls_sha256_starts_ret(&context, 0);
+    result = MbedtlsCompat_Sha256Starts(&context, 0);
     while ((result == 0) && (offset < size))
     {
         size_t chunk = size - offset;
@@ -168,14 +169,14 @@ static FlashStagingResult FlashStaging_CalculateSha256(
         {
             chunk = 2048U;
         }
-        result = mbedtls_sha256_update_ret(&context,
+        result = MbedtlsCompat_Sha256Update(&context,
                                            data + offset,
                                            chunk);
         offset += (uint32_t)chunk;
     }
     if (result == 0)
     {
-        result = mbedtls_sha256_finish_ret(&context, output);
+        result = MbedtlsCompat_Sha256Finish(&context, output);
     }
     mbedtls_sha256_free(&context);
     return result == 0 ? FLASH_STAGING_OK : FLASH_STAGING_CRYPTO_ERROR;

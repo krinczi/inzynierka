@@ -9,23 +9,26 @@
 
 /*
  * The last two sectors of Bank 1 are outside the executable linker region.
- * Records are appended in alternating sectors. A sector erase is therefore
- * needed only after all record positions in that inactive sector have been
- * consumed, while a power loss leaves the previously verified generation
- * available. Firmware updates do not touch either credential sector.
+ * Records are appended in the active sector. When it is full, the other
+ * sector is erased and becomes active while the last verified generation
+ * remains intact in the old sector. This preserves a rollback record during
+ * multi-step credential rotation and minimizes sector erases. Firmware
+ * updates do not touch either credential sector.
  */
 #define CREDENTIAL_SLOT_A_ADDRESS       0x080C0000UL
 #define CREDENTIAL_SLOT_B_ADDRESS       0x080E0000UL
 #define CREDENTIAL_SLOT_A_SECTOR        FLASH_SECTOR_6
 #define CREDENTIAL_SLOT_B_SECTOR        FLASH_SECTOR_7
 #define CREDENTIAL_FLASH_MAGIC          0x43524431UL /* "CRD1" */
-#define CREDENTIAL_STORAGE_FORMAT       1U
+#define CREDENTIAL_STORAGE_FORMAT_LEGACY 1U
+#define CREDENTIAL_STORAGE_FORMAT        2U
 #define CREDENTIAL_FLASHWORD_SIZE       32U
 #define CREDENTIAL_RECORD_SIZE          8192U
 #define CREDENTIAL_SECTOR_SIZE          (128U * 1024U)
 #define CREDENTIAL_RECORDS_PER_SECTOR   \
     (CREDENTIAL_SECTOR_SIZE / CREDENTIAL_RECORD_SIZE)
 #define CREDENTIAL_PROGRAM_YIELD_WORDS     8U
+#define CREDENTIAL_ROTATION_MAX_VALIDATION_FAILURES 3U
 
 typedef struct
 {
@@ -60,6 +63,11 @@ static CredentialStoreState current_state;
 static CredentialStoreData current_data;
 static uint32_t current_generation;
 static uint32_t active_slot_address;
+static uint16_t current_rotation_validation_failures;
+static CredentialFlashRecord credential_write_record
+    __attribute__((aligned(CREDENTIAL_FLASHWORD_SIZE)));
+
+static int CredentialStore_RecordIsValid(const CredentialFlashRecord *record);
 
 static void CredentialStore_SecureZero(void *buffer, size_t length)
 {
@@ -177,6 +185,48 @@ static uint32_t CredentialStore_FindErasedRecord(uint32_t sector_base)
     return 0U;
 }
 
+static const CredentialFlashRecord *CredentialStore_FindPreviousProvisioned(void)
+{
+    const CredentialFlashRecord *selected = NULL;
+    const uint32_t sector_bases[] = {
+        CREDENTIAL_SLOT_A_ADDRESS,
+        CREDENTIAL_SLOT_B_ADDRESS
+    };
+    size_t sector_index;
+    uint32_t record_index;
+
+    CredentialStore_InvalidateCache(CREDENTIAL_SLOT_A_ADDRESS,
+                                    CREDENTIAL_SECTOR_SIZE);
+    CredentialStore_InvalidateCache(CREDENTIAL_SLOT_B_ADDRESS,
+                                    CREDENTIAL_SECTOR_SIZE);
+
+    for (sector_index = 0U;
+         sector_index < (sizeof(sector_bases) / sizeof(sector_bases[0]));
+         sector_index++)
+    {
+        for (record_index = 0U;
+             record_index < CREDENTIAL_RECORDS_PER_SECTOR;
+             record_index++)
+        {
+            uint32_t address = sector_bases[sector_index] +
+                               (record_index * CREDENTIAL_RECORD_SIZE);
+            const CredentialFlashRecord *record =
+                (const CredentialFlashRecord *)(uintptr_t)address;
+
+            if (CredentialStore_RecordIsValid(record) &&
+                (record->header.state == CREDENTIAL_STORE_PROVISIONED) &&
+                (record->header.generation < current_generation) &&
+                ((selected == NULL) ||
+                 (record->header.generation > selected->header.generation)))
+            {
+                selected = record;
+            }
+        }
+    }
+
+    return selected;
+}
+
 static int CredentialStore_LengthsAreValid(const CredentialFlashHeader *header)
 {
     size_t total;
@@ -193,12 +243,16 @@ static int CredentialStore_LengthsAreValid(const CredentialFlashHeader *header)
         return 0;
     }
 
-    if ((header->state == CREDENTIAL_STORE_PROVISIONED) &&
+    if (((header->state == CREDENTIAL_STORE_PROVISIONED) ||
+         (header->state == CREDENTIAL_STORE_ROTATION_REQUESTED) ||
+         (header->state == CREDENTIAL_STORE_ROTATION_PENDING) ||
+         (header->state == CREDENTIAL_STORE_ROTATION_VALIDATING)) &&
         (header->thing_name_length == 0U))
     {
         return 0;
     }
-    if ((header->state == CREDENTIAL_STORE_PENDING_REGISTRATION) &&
+    if (((header->state == CREDENTIAL_STORE_PENDING_REGISTRATION) ||
+         (header->state == CREDENTIAL_STORE_ROTATION_PENDING)) &&
         (header->ownership_token_length == 0U))
     {
         return 0;
@@ -215,10 +269,14 @@ static int CredentialStore_LengthsAreValid(const CredentialFlashHeader *header)
 static int CredentialStore_RecordIsValid(const CredentialFlashRecord *record)
 {
     if ((record->header.magic != CREDENTIAL_FLASH_MAGIC) ||
-        (record->header.storage_format != CREDENTIAL_STORAGE_FORMAT) ||
+        ((record->header.storage_format != CREDENTIAL_STORAGE_FORMAT_LEGACY) &&
+         (record->header.storage_format != CREDENTIAL_STORAGE_FORMAT)) ||
         (record->header.header_size != sizeof(CredentialFlashHeader)) ||
         ((record->header.state != CREDENTIAL_STORE_PENDING_REGISTRATION) &&
-         (record->header.state != CREDENTIAL_STORE_PROVISIONED)) ||
+         (record->header.state != CREDENTIAL_STORE_PROVISIONED) &&
+         (record->header.state != CREDENTIAL_STORE_ROTATION_REQUESTED) &&
+         (record->header.state != CREDENTIAL_STORE_ROTATION_PENDING) &&
+         (record->header.state != CREDENTIAL_STORE_ROTATION_VALIDATING)) ||
         !CredentialStore_LengthsAreValid(&record->header))
     {
         return 0;
@@ -279,9 +337,14 @@ static int CredentialStore_PrepareRecord(CredentialStoreState state,
         (certificate_id_length == 0U) ||
         (certificate_id_length > CREDENTIAL_STORE_CERTIFICATE_ID_MAX_LENGTH) ||
         (thing_name_length > CREDENTIAL_STORE_THING_NAME_MAX_LENGTH) ||
-        ((state == CREDENTIAL_STORE_PENDING_REGISTRATION) &&
+        (((state == CREDENTIAL_STORE_PENDING_REGISTRATION) ||
+          (state == CREDENTIAL_STORE_ROTATION_PENDING)) &&
          (ownership_token_length == 0U)) ||
-        ((state == CREDENTIAL_STORE_PROVISIONED) && (thing_name_length == 0U)))
+        (((state == CREDENTIAL_STORE_PROVISIONED) ||
+          (state == CREDENTIAL_STORE_ROTATION_REQUESTED) ||
+          (state == CREDENTIAL_STORE_ROTATION_PENDING) ||
+          (state == CREDENTIAL_STORE_ROTATION_VALIDATING)) &&
+         (thing_name_length == 0U)))
     {
         return -1;
     }
@@ -301,6 +364,10 @@ static int CredentialStore_PrepareRecord(CredentialStoreState state,
     record->header.ownership_token_length = (uint16_t)ownership_token_length;
     record->header.certificate_id_length = (uint16_t)certificate_id_length;
     record->header.thing_name_length = (uint16_t)thing_name_length;
+    record->header.reserved =
+        (state == CREDENTIAL_STORE_ROTATION_VALIDATING)
+            ? current_rotation_validation_failures
+            : 0U;
 
     cursor = record->payload;
 #define CREDENTIAL_COPY_FIELD(source, length)       \
@@ -337,7 +404,7 @@ static size_t CredentialStore_ProgrammedLength(const CredentialFlashRecord *reco
 static int CredentialStore_Write(CredentialStoreState state,
                                  const CredentialStoreData *data)
 {
-    CredentialFlashRecord record __attribute__((aligned(CREDENTIAL_FLASHWORD_SIZE)));
+    CredentialFlashRecord *record = &credential_write_record;
     const CredentialFlashRecord *persisted_record;
     FLASH_EraseInitTypeDef erase = { 0 };
     uint32_t sector_error = 0xFFFFFFFFUL;
@@ -347,24 +414,49 @@ static int CredentialStore_Write(CredentialStoreState state,
     size_t offset;
     HAL_StatusTypeDef status;
 
-    if (CredentialStore_PrepareRecord(state, data, &record) != 0)
+    if (CredentialStore_PrepareRecord(state, data, record) != 0)
     {
         return -1;
     }
-    programmed_length = CredentialStore_ProgrammedLength(&record);
+    programmed_length = CredentialStore_ProgrammedLength(record);
 
     if (CredentialStore_AddressInSector(active_slot_address,
                                         CREDENTIAL_SLOT_A_ADDRESS))
     {
         target_address =
+            CredentialStore_FindErasedRecord(CREDENTIAL_SLOT_A_ADDRESS);
+        target_sector = CREDENTIAL_SLOT_A_SECTOR;
+        if (target_address == 0U)
+        {
+            target_address =
+                CredentialStore_FindErasedRecord(CREDENTIAL_SLOT_B_ADDRESS);
+            target_sector = CREDENTIAL_SLOT_B_SECTOR;
+        }
+    }
+    else if (CredentialStore_AddressInSector(active_slot_address,
+                                             CREDENTIAL_SLOT_B_ADDRESS))
+    {
+        target_address =
             CredentialStore_FindErasedRecord(CREDENTIAL_SLOT_B_ADDRESS);
         target_sector = CREDENTIAL_SLOT_B_SECTOR;
+        if (target_address == 0U)
+        {
+            target_address =
+                CredentialStore_FindErasedRecord(CREDENTIAL_SLOT_A_ADDRESS);
+            target_sector = CREDENTIAL_SLOT_A_SECTOR;
+        }
     }
     else
     {
         target_address =
             CredentialStore_FindErasedRecord(CREDENTIAL_SLOT_A_ADDRESS);
         target_sector = CREDENTIAL_SLOT_A_SECTOR;
+        if (target_address == 0U)
+        {
+            target_address =
+                CredentialStore_FindErasedRecord(CREDENTIAL_SLOT_B_ADDRESS);
+            target_sector = CREDENTIAL_SLOT_B_SECTOR;
+        }
     }
 
     erase.TypeErase = FLASH_TYPEERASE_SECTORS;
@@ -375,7 +467,7 @@ static int CredentialStore_Write(CredentialStoreState state,
 
     if (HAL_FLASH_Unlock() != HAL_OK)
     {
-        CredentialStore_SecureZero(&record, sizeof(record));
+        CredentialStore_SecureZero(record, sizeof(*record));
         return -1;
     }
 
@@ -397,7 +489,7 @@ static int CredentialStore_Write(CredentialStoreState state,
         status = HAL_FLASH_Program(
             FLASH_TYPEPROGRAM_FLASHWORD,
             target_address + (uint32_t)offset,
-            (uint32_t)(uintptr_t)(((const uint8_t *)&record) + offset));
+            (uint32_t)(uintptr_t)(((const uint8_t *)record) + offset));
         if ((((offset / CREDENTIAL_FLASHWORD_SIZE) + 1U) %
              CREDENTIAL_PROGRAM_YIELD_WORDS) == 0U)
         {
@@ -408,24 +500,25 @@ static int CredentialStore_Write(CredentialStoreState state,
 
     if ((status != HAL_OK) || (sector_error != 0xFFFFFFFFUL))
     {
-        CredentialStore_SecureZero(&record, sizeof(record));
+        CredentialStore_SecureZero(record, sizeof(*record));
         return -1;
     }
 
-    CredentialStore_InvalidateCache(target_address, sizeof(record));
+    CredentialStore_InvalidateCache(target_address, sizeof(*record));
     persisted_record = (const CredentialFlashRecord *)(uintptr_t)target_address;
     if (!CredentialStore_RecordIsValid(persisted_record) ||
-        (memcmp(persisted_record, &record, sizeof(record)) != 0))
+        (memcmp(persisted_record, record, sizeof(*record)) != 0))
     {
-        CredentialStore_SecureZero(&record, sizeof(record));
+        CredentialStore_SecureZero(record, sizeof(*record));
         return -1;
     }
 
     current_state = state;
     current_data = *data;
-    current_generation = record.header.generation;
+    current_generation = record->header.generation;
     active_slot_address = target_address;
-    CredentialStore_SecureZero(&record, sizeof(record));
+    current_rotation_validation_failures = record->header.reserved;
+    CredentialStore_SecureZero(record, sizeof(*record));
     return 0;
 }
 
@@ -443,6 +536,7 @@ int CredentialStore_Init(void)
     memset(&current_data, 0, sizeof(current_data));
     current_generation = 0U;
     active_slot_address = 0U;
+    current_rotation_validation_failures = 0U;
 
     CredentialStore_InvalidateCache(CREDENTIAL_SLOT_A_ADDRESS,
                                     CREDENTIAL_SECTOR_SIZE);
@@ -476,6 +570,11 @@ int CredentialStore_Init(void)
         CredentialStoreData sanitized;
         current_state = (CredentialStoreState)selected->header.state;
         current_generation = selected->header.generation;
+        current_rotation_validation_failures =
+            ((selected->header.storage_format >= CREDENTIAL_STORAGE_FORMAT) &&
+             (current_state == CREDENTIAL_STORE_ROTATION_VALIDATING))
+                ? selected->header.reserved
+                : 0U;
         CredentialStore_RecordToData(selected, &current_data);
 
         if ((current_state == CREDENTIAL_STORE_PROVISIONED) &&
@@ -511,9 +610,33 @@ const char *CredentialStore_StateName(CredentialStoreState state)
             return "PENDING_REGISTRATION";
         case CREDENTIAL_STORE_PROVISIONED:
             return "PROVISIONED";
+        case CREDENTIAL_STORE_ROTATION_REQUESTED:
+            return "ROTATION_REQUESTED";
+        case CREDENTIAL_STORE_ROTATION_PENDING:
+            return "ROTATION_PENDING";
+        case CREDENTIAL_STORE_ROTATION_VALIDATING:
+            return "ROTATION_VALIDATING";
         default:
             return "EMPTY";
     }
+}
+
+int CredentialStore_UsesDeviceCredentials(void)
+{
+    return (current_state == CREDENTIAL_STORE_PROVISIONED) ||
+           (current_state == CREDENTIAL_STORE_ROTATION_VALIDATING);
+}
+
+int CredentialStore_IsProvisioningRequired(void)
+{
+    return !CredentialStore_UsesDeviceCredentials();
+}
+
+int CredentialStore_IsRotationInProgress(void)
+{
+    return (current_state == CREDENTIAL_STORE_ROTATION_REQUESTED) ||
+           (current_state == CREDENTIAL_STORE_ROTATION_PENDING) ||
+           (current_state == CREDENTIAL_STORE_ROTATION_VALIDATING);
 }
 
 int CredentialStore_SavePending(const char *certificate_pem,
@@ -522,6 +645,7 @@ int CredentialStore_SavePending(const char *certificate_pem,
                                 const char *certificate_id)
 {
     CredentialStoreData data;
+    CredentialStoreState target_state = CREDENTIAL_STORE_PENDING_REGISTRATION;
     int result;
 
     if ((certificate_pem == NULL) || (private_key_pem == NULL) ||
@@ -547,7 +671,16 @@ int CredentialStore_SavePending(const char *certificate_pem,
     strcpy(data.private_key_pem, private_key_pem);
     strcpy(data.ownership_token, ownership_token);
     strcpy(data.certificate_id, certificate_id);
-    result = CredentialStore_Write(CREDENTIAL_STORE_PENDING_REGISTRATION, &data);
+
+    if ((current_state == CREDENTIAL_STORE_ROTATION_REQUESTED) ||
+        (current_state == CREDENTIAL_STORE_ROTATION_PENDING))
+    {
+        strcpy(data.thing_name, current_data.thing_name);
+        target_state = CREDENTIAL_STORE_ROTATION_PENDING;
+    }
+
+    current_rotation_validation_failures = 0U;
+    result = CredentialStore_Write(target_state, &data);
     CredentialStore_SecureZero(&data, sizeof(data));
     return result;
 }
@@ -555,15 +688,26 @@ int CredentialStore_SavePending(const char *certificate_pem,
 int CredentialStore_CommitProvisioned(const char *thing_name)
 {
     CredentialStoreData data;
+    CredentialStoreState target_state;
     int result;
 
-    if ((current_state != CREDENTIAL_STORE_PENDING_REGISTRATION) ||
+    if (((current_state != CREDENTIAL_STORE_PENDING_REGISTRATION) &&
+         (current_state != CREDENTIAL_STORE_ROTATION_PENDING)) ||
         (thing_name == NULL) ||
         (strnlen(thing_name, sizeof(data.thing_name)) >= sizeof(data.thing_name)))
     {
         return -1;
     }
 
+    if ((current_state == CREDENTIAL_STORE_ROTATION_PENDING) &&
+        (strcmp(thing_name, current_data.thing_name) != 0))
+    {
+        return -1;
+    }
+
+    target_state = (current_state == CREDENTIAL_STORE_ROTATION_PENDING)
+                       ? CREDENTIAL_STORE_ROTATION_VALIDATING
+                       : CREDENTIAL_STORE_PROVISIONED;
     data = current_data;
     strcpy(data.thing_name, thing_name);
     /*
@@ -572,9 +716,102 @@ int CredentialStore_CommitProvisioned(const char *thing_name)
      */
     CredentialStore_SecureZero(data.ownership_token,
                                sizeof(data.ownership_token));
+    current_rotation_validation_failures = 0U;
+    result = CredentialStore_Write(target_state, &data);
+    CredentialStore_SecureZero(&data, sizeof(data));
+    return result;
+}
+
+int CredentialStore_RequestRotation(void)
+{
+    CredentialStoreData data;
+    int result;
+
+    if (current_state != CREDENTIAL_STORE_PROVISIONED)
+    {
+        return -1;
+    }
+
+    data = current_data;
+    CredentialStore_SecureZero(data.ownership_token,
+                               sizeof(data.ownership_token));
+    current_rotation_validation_failures = 0U;
+    result = CredentialStore_Write(CREDENTIAL_STORE_ROTATION_REQUESTED, &data);
+    CredentialStore_SecureZero(&data, sizeof(data));
+    return result;
+}
+
+int CredentialStore_CommitRotationValidated(void)
+{
+    CredentialStoreData data;
+    int result;
+
+    if (current_state != CREDENTIAL_STORE_ROTATION_VALIDATING)
+    {
+        return -1;
+    }
+
+    data = current_data;
+    current_rotation_validation_failures = 0U;
     result = CredentialStore_Write(CREDENTIAL_STORE_PROVISIONED, &data);
     CredentialStore_SecureZero(&data, sizeof(data));
     return result;
+}
+
+int CredentialStore_RollbackRotation(void)
+{
+    const CredentialFlashRecord *fallback;
+    CredentialStoreData data;
+    int result;
+
+    if (!CredentialStore_IsRotationInProgress())
+    {
+        return -1;
+    }
+
+    fallback = CredentialStore_FindPreviousProvisioned();
+    if (fallback == NULL)
+    {
+        return -1;
+    }
+
+    CredentialStore_RecordToData(fallback, &data);
+    CredentialStore_SecureZero(data.ownership_token,
+                               sizeof(data.ownership_token));
+    current_rotation_validation_failures = 0U;
+    result = CredentialStore_Write(CREDENTIAL_STORE_PROVISIONED, &data);
+    CredentialStore_SecureZero(&data, sizeof(data));
+    return result;
+}
+
+int CredentialStore_RecordRotationFailure(void)
+{
+    CredentialStoreData data;
+    uint16_t previous_failures;
+    int result;
+
+    if (current_state != CREDENTIAL_STORE_ROTATION_VALIDATING)
+    {
+        return 0;
+    }
+
+    if ((uint32_t)current_rotation_validation_failures + 1U >=
+        CREDENTIAL_ROTATION_MAX_VALIDATION_FAILURES)
+    {
+        return CredentialStore_RollbackRotation() == 0 ? 1 : -1;
+    }
+
+    previous_failures = current_rotation_validation_failures;
+    current_rotation_validation_failures++;
+    data = current_data;
+    result = CredentialStore_Write(CREDENTIAL_STORE_ROTATION_VALIDATING, &data);
+    CredentialStore_SecureZero(&data, sizeof(data));
+    if (result != 0)
+    {
+        current_rotation_validation_failures = previous_failures;
+        return -1;
+    }
+    return 0;
 }
 
 int CredentialStore_Erase(void)
@@ -618,5 +855,6 @@ int CredentialStore_Erase(void)
     memset(&current_data, 0, sizeof(current_data));
     current_generation = 0U;
     active_slot_address = 0U;
+    current_rotation_validation_failures = 0U;
     return 0;
 }

@@ -29,4 +29,11 @@ int FleetProvisioning_Process(uint32_t now_ms);
 /* Becomes true after credentials are committed and a reconnect is required. */
 int FleetProvisioning_ReconnectRequired(void);
 
+/*
+ * Persists a service-requested certificate rotation. The current provisioned
+ * pair remains available for automatic rollback until the new pair proves a
+ * stable MQTT session.
+ */
+int FleetProvisioning_RequestRotation(void);
+
 #endif /* INC_FLEET_PROVISIONING_H_ */

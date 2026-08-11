@@ -14,7 +14,10 @@ typedef enum
 {
     CREDENTIAL_STORE_EMPTY = 0,
     CREDENTIAL_STORE_PENDING_REGISTRATION = 1,
-    CREDENTIAL_STORE_PROVISIONED = 2
+    CREDENTIAL_STORE_PROVISIONED = 2,
+    CREDENTIAL_STORE_ROTATION_REQUESTED = 3,
+    CREDENTIAL_STORE_ROTATION_PENDING = 4,
+    CREDENTIAL_STORE_ROTATION_VALIDATING = 5
 } CredentialStoreState;
 
 typedef struct
@@ -32,6 +35,9 @@ int CredentialStore_Init(void);
 CredentialStoreState CredentialStore_GetState(void);
 const CredentialStoreData *CredentialStore_Get(void);
 const char *CredentialStore_StateName(CredentialStoreState state);
+int CredentialStore_UsesDeviceCredentials(void);
+int CredentialStore_IsProvisioningRequired(void);
+int CredentialStore_IsRotationInProgress(void);
 
 /* Atomically stores credentials returned by CreateKeysAndCertificate. */
 int CredentialStore_SavePending(const char *certificate_pem,
@@ -41,6 +47,22 @@ int CredentialStore_SavePending(const char *certificate_pem,
 
 /* Atomically commits the Thing name after RegisterThing succeeds. */
 int CredentialStore_CommitProvisioned(const char *thing_name);
+
+/* Starts a claim-based rotation while retaining the last provisioned record. */
+int CredentialStore_RequestRotation(void);
+
+/* Promotes a rotated pair only after a stable TLS/MQTT validation session. */
+int CredentialStore_CommitRotationValidated(void);
+
+/* Restores the most recent provisioned pair retained in the journal. */
+int CredentialStore_RollbackRotation(void);
+
+/*
+ * Persists one failed rotated-credential validation. Returns 1 when the
+ * failure limit caused an automatic rollback, 0 when another retry is
+ * permitted, and -1 on a storage error.
+ */
+int CredentialStore_RecordRotationFailure(void);
 
 /* Factory/service operation. Erases both credential slots. */
 int CredentialStore_Erase(void);

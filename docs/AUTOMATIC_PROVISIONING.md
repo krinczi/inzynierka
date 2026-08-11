@@ -51,7 +51,12 @@ Stan trwały magazynu poświadczeń:
 - `EMPTY` — brak docelowej tożsamości; wymagany bootstrap,
 - `PENDING_REGISTRATION` — unikalny certyfikat jest zapisany, ale AWS nie
   potwierdził jeszcze rejestracji,
-- `PROVISIONED` — certyfikat jest zatwierdzony i może być użyty do normalnej sesji.
+- `PROVISIONED` — certyfikat jest zatwierdzony i może być użyty do normalnej sesji,
+- `ROTATION_REQUESTED` — zachowano działający certyfikat i zaplanowano reconnect
+  z poświadczeniem claim,
+- `ROTATION_PENDING` — nowa para jest zapisana i oczekuje na `RegisterThing`,
+- `ROTATION_VALIDATING` — AWS zatwierdził rejestrację, ale nowa para musi jeszcze
+  utrzymać poprawną sesję MQTT przez 30 sekund.
 
 Po utracie zasilania w stanie `PENDING_REGISTRATION` firmware ponawia wyłącznie
 `RegisterThing`; nie tworzy bez potrzeby kolejnego certyfikatu. Jeżeli AWS zgłosi
@@ -77,9 +82,10 @@ chwilowe błędy nie tworzą nieograniczonej pętli wywołań AWS.
 | Device config | `0x081C0000` | 256 KiB | dual-slot konfiguracji |
 
 Rekord poświadczeń ma stałe 8 KiB i zawiera nagłówek, numer generacji, stan,
-długości pól oraz CRC32 całego rekordu. Zapis zawsze kasuje i programuje slot
-nieaktywny, weryfikuje odczyt, a dopiero potem przełącza aktywną generację. Format
-programowania jest zgodny z 32-bajtowym Flash word STM32H753.
+długości pól oraz CRC32 całego rekordu. Nowe rekordy są dopisywane do aktywnego
+sektora. Dopiero po jego zapełnieniu drugi sektor jest kasowany i przejmuje rolę
+aktywnego, podczas gdy ostatnia zweryfikowana generacja nadal istnieje w starym
+sektorze. Format programowania jest zgodny z 32-bajtowym Flash word STM32H753.
 
 Linker ogranicza obraz aplikacji do `512 KiB - 1024 B` i zawiera asercje
 wykrywające nakładanie się bootloadera, slotów OTA, dziennika zdarzeń,
@@ -92,6 +98,10 @@ credential store i konfiguracji. Szczegóły znajdują się w `docs/FULL_OTA.md`
 - `CredentialStore_Init()` — odczyt i wybór najnowszego poprawnego slotu,
 - `CredentialStore_SavePending()` — atomowy zapis odpowiedzi AWS,
 - `CredentialStore_CommitProvisioned()` — finalne zatwierdzenie po RegisterThing,
+- `CredentialStore_RequestRotation()` — trwałe rozpoczęcie rotacji,
+- `CredentialStore_CommitRotationValidated()` — promocja nowej pary po health gate,
+- `CredentialStore_RecordRotationFailure()` — trwały licznik nieudanych walidacji,
+- `CredentialStore_RollbackRotation()` — powrót do ostatniego rekordu `PROVISIONED`,
 - `CredentialStore_Get()` / `CredentialStore_GetState()` — wybór danych dla TLS,
 - `CredentialStore_Erase()` — jawna operacja fabryczna/serwisowa.
 
@@ -102,6 +112,51 @@ credential store i konfiguracji. Szczegóły znajdują się w `docs/FULL_OTA.md`
 - `FleetProvisioning_HandleMessage()` — obsługa odpowiedzi reserved topics,
 - `FleetProvisioning_Process()` — timeouty, backoff i retry,
 - `FleetProvisioning_ReconnectRequired()` — przełączenie z claim na unique cert.
+- `FleetProvisioning_RequestRotation()` — rozpoczęcie kontrolowanej rotacji.
+
+## Rotacja unikalnego certyfikatu urządzenia
+
+Rotację rozpoczyna uwierzytelniona komenda serwisowa wysłana na istniejący temat
+komend urządzenia:
+
+```json
+{
+  "commandId": "rotate-2026-001",
+  "type": "credentials.rotate",
+  "confirm": true,
+  "hardwareUid": "001F00423438511136353232"
+}
+```
+
+Firmware odrzuca komendę bez jawnego `confirm=true`, z niezgodnym UID albo gdy
+poprzednia rotacja nie została zakończona. Po zapisie `ROTATION_REQUESTED`
+urządzenie przełącza się na claim, wykonuje `CreateKeysAndCertificate` oraz
+`RegisterThing` dla tej samej nazwy Thing. Stary rekord `PROVISIONED` nie jest
+kasowany. Nowa para przechodzi do `ROTATION_VALIDATING` i zostaje zatwierdzona
+dopiero po 30 sekundach stabilnego MQTT. Trzy nieudane próby TLS/MQTT powodują
+automatyczny rollback do poprzedniego certyfikatu; licznik przetrwa restart.
+
+Firmware publikuje diagnostykę `CREDENTIAL_ROTATION_REQUESTED`,
+`CREDENTIAL_ROTATION_SUCCEEDED` albo alert `CREDENTIAL_ROTATION_ROLLED_BACK`.
+Po sukcesie firmware raportuje wyłącznie identyfikator użytego certyfikatu.
+Backend wykrywa przejście z poprzedniego identyfikatora na nowy i oznacza stary
+certyfikat jako oczekujący na wycofanie. Właściciel musi jawnie potwierdzić
+operację w aplikacji. Przed modyfikacją AWS backend sprawdza, czy nowy certyfikat
+ma stan `ACTIVE` i jest przypięty do właściwego Thing. Dopiero wtedy stary
+certyfikat otrzymuje stan `INACTIVE`, traci polityki i powiązanie z Thing.
+Obiekt certyfikatu nie jest automatycznie usuwany, dzięki czemu pozostaje ślad
+audytowy, a operację można bezpiecznie ponowić po częściowym błędzie.
+
+Rola IAM backendu wymaga do tej operacji: `iot:DescribeCertificate`,
+`iot:ListThingPrincipals`, `iot:UpdateCertificate`,
+`iot:ListPrincipalPolicies`, `iot:DetachPolicy` i
+`iot:DetachThingPrincipal`. Urządzenie celowo nie otrzymuje żadnego z tych
+uprawnień administracyjnych, ponieważ naruszałoby to zasadę least privilege.
+
+Szablon Fleet Provisioning używany do rotacji musi dopuszczać ponowne
+`RegisterThing` dla istniejącej nazwy Thing. Zalecane ustawienia zasobu Thing to
+`AttributePayload: MERGE` oraz `ThingGroups: DO_NOTHING`; certyfikat tworzony w
+rotacji musi otrzymać status `ACTIVE` i właściwą politykę urządzenia.
 
 ## Dane widoczne w aplikacji
 
@@ -113,6 +168,7 @@ Po docelowym reconnect firmware publikuje status z:
     "state": "PROVISIONED",
     "mode": "AUTO_FLEET",
     "credentialState": "PROVISIONED",
+    "certificateId": "258f4e35ed1f03bd8a7a32c41e83b9ff9bbcbb87ddad9dde3fa991142601657e",
     "thingName": "stm32h753zi-dev-01",
     "hardwareUid": "001F00423438511136353232"
   }
@@ -125,7 +181,7 @@ telemetrii, diagnostyce ani logach UART.
 ## Test akceptacyjny
 
 1. Wdrożyć stos CloudFormation i dodać UID płytki do allowlisty.
-2. Wgrać firmware z markerem `fleet_auto_v2`.
+2. Wgrać firmware z markerem `credential_rotation_v1`.
 3. Potwierdzić sekwencję `EMPTY → PENDING_REGISTRATION → PROVISIONED`.
 4. Potwierdzić reconnect z logiem `credential source=unique fleet certificate`.
 5. Sprawdzić telemetrię i status `AUTO_FLEET` w aplikacji.

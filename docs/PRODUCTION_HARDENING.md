@@ -4,6 +4,12 @@ This document separates mechanisms implemented in the application and
 bootloader from controls that require board hardware, AWS operations, or a
 middleware migration.
 
+The exact option-byte baseline, read-only audit command and irreversible
+manufacturing gate are defined in `PRODUCTION_OPTION_BYTES.md`.
+
+The maintained Mbed TLS and FreeRTOS baseline, source provenance and regression
+gate are defined in `MIDDLEWARE_MIGRATION.md`.
+
 ## Implemented in the application
 
 ### Hardware telemetry
@@ -30,6 +36,9 @@ Board integrations override:
   and an acceptable Unix time range.
 - TLS is blocked on first boot when neither RTC nor NTP provides a valid time.
 - A valid RTC value is accepted as holdover when a later NTP refresh fails.
+- Network time is refreshed every six hours while the network is available;
+  a failed refresh is retried after 15 minutes without invalidating RTC
+  holdover.
 - `_gettimeofday()` no longer returns a compiled-in test date.
 
 ### Recovery and memory protection
@@ -49,16 +58,31 @@ The current Cube package contains only the non-MPU FreeRTOS port. The hardware
 MPU therefore protects memory attributes, but tasks remain privileged. Full
 per-task isolation requires a FreeRTOS MPU-port migration.
 
-### Durable critical events
+### Durable operational events
 
 - Bank 1 sector 5 is reserved as a 128 KiB append-only event journal.
-- `ALARM` and `CRITICAL` messages are restored after reset.
-- Critical events use MQTT QoS 1.
+- `WARNING`, `ALARM`, and `CRITICAL` alerts plus `ERROR`/`WARN`
+  diagnostics are restored after reset.
+- Low-volume service audit transitions (`MODE_STARTED`, `MODE_STOPPED`, and
+  `MODE_EXPIRED`) explicitly request durable delivery regardless of the
+  configured diagnostic log level.
+- Periodic `MODE_ACTIVE`, ordinary `INFO`, and raw `DEBUG`/`TRACE` output stay
+  non-durable. This prevents a service session from exhausting Flash endurance.
+- The RAM delivery queue contains 32 structured events. When it is full, a
+  durable event may evict a non-durable entry, but never another durable entry.
+- Durable events use MQTT QoS 1; non-durable diagnostics use QoS 0.
 - An event is removed only after the matching broker PUBACK and a durable ACK
   journal record.
 - Journal records use a versioned header, sequence number, CRC32, read-back
   verification, and compaction.
 - MQTT `eventId` remains stable across retries, allowing backend deduplication.
+- A live connection loss queues a durable warning. The first successful MQTT
+  reconnect queues a durable recovery diagnostic containing the outage
+  duration, so an offline interval is visible after connectivity returns.
+- MQTT CONNECT configures a retained QoS 1 Last Will on the device status
+  topic. A successful session publishes retained `online` status, so an
+  ungraceful disconnect is represented as retained `offline` state without
+  changing the application topic contract.
 
 The internal-Flash implementation is the board-compatible fallback. A high
 write-rate product should replace it with FRAM or another endurance-qualified
@@ -70,6 +94,11 @@ store through the same queue semantics.
   an existing provisioned record.
 - Temporary credential buffers and Flash programming buffers are explicitly
   zeroed.
+- Unique device credentials support claim-based transactional rotation. The
+  previous provisioned record remains available until the new certificate has
+  maintained a healthy MQTT session for 30 seconds.
+- Three persisted validation failures automatically restore the previous
+  provisioned pair, including across MCU resets.
 - Runtime diagnostics report RDP, debugger, MPU, mbedTLS, and FreeRTOS state.
 - Production diagnostics warn when RDP is disabled, a debugger is attached, or
   a legacy dependency baseline is detected.
@@ -89,6 +118,32 @@ For stronger extraction resistance, use a secure element and override the
 credential backend. CRC and MPU do not encrypt private keys against invasive
 physical access.
 
+After a successful device-side rotation, firmware reports the non-secret AWS
+certificate identifier. The backend records both identities but performs no
+automatic AWS mutation during MQTT ingest. An explicit owner action starts an
+idempotent retirement operation which first verifies that the new certificate
+is `ACTIVE` and attached to the expected Thing, then marks the replaced
+certificate `INACTIVE`, detaches its policies, and detaches it from the Thing.
+The certificate object is retained for audit. The device policy must not grant
+certificate-administration permissions.
+
+### Device decommissioning
+
+The management application provides an explicit owner-only decommissioning
+operation. The request must repeat the current device ID, hardware UID and
+active certificate ID, and include a human-readable reason. The backend first
+atomically sets `enabled=false` for the matching hardware UID and Thing in the
+Fleet Provisioning allow-list. Only then does it verify that the certificate is
+attached to the expected Thing, set it to `INACTIVE`, detach its policies and
+remove the Thing-principal association. Missing allow-list configuration or an
+identity mismatch aborts the operation before the certificate is changed.
+The Thing, application record, telemetry and event history are retained for
+audit. After completion, commands are rejected and delayed MQTT messages cannot
+reactivate the application record. Erasing the STM32 credential store cannot
+re-enroll a decommissioned board because the pre-provisioning hook rejects its
+disabled UID. Re-enrollment is intentionally a separate, audited service
+procedure.
+
 ### Complete signed OTA boot chain
 
 - A separate bootloader occupies a dedicated 128 KiB sector.
@@ -99,7 +154,7 @@ physical access.
 - Installation uses a power-loss-resumable sector swap and dedicated scratch
   sector.
 - Trial images are confirmed only after local persistent services and IWDG are
-  operational.
+  operational and MQTT has remained healthy for at least 30 seconds.
 - Three unconfirmed trial boots trigger automatic restoration of the previous
   image.
 - The confirmed version is a monotonic anti-rollback floor.
@@ -141,6 +196,11 @@ Flash transition. These controls deliberately remain outside normal
 application firmware.
 
 ## Claim-certificate operations
+
+The detailed planned-rotation and emergency-disable procedure is maintained in
+the application repository as `docs/CLAIM_CERTIFICATE_ROTATION.md`. Protected
+OTA signing controls and the HSM-neutral signing request format are documented
+in `docs/RELEASE_SIGNING.md`.
 
 Fleet claim credentials are shared bootstrap credentials and therefore remain
 an operational risk even when device credentials are unique. Production AWS

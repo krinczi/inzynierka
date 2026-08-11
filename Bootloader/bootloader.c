@@ -1,5 +1,6 @@
 #include "firmware_trust_anchor_config.h"
 #include "ota_control.h"
+#include "mbedtls_compat.h"
 #include "ota_image.h"
 
 #include "stm32h753xx.h"
@@ -417,29 +418,29 @@ static int Boot_VerifySignature(const OtaImageHeader *header)
     field[2] = (uint8_t)(header->image_size >> 8U);
     field[3] = (uint8_t)header->image_size;
     mbedtls_sha256_init(&sha);
-    result = mbedtls_sha256_starts_ret(&sha, 0);
+    result = MbedtlsCompat_Sha256Starts(&sha, 0);
     if (result == 0)
     {
-        result = mbedtls_sha256_update_ret(
+        result = MbedtlsCompat_Sha256Update(
             &sha,
             (const uint8_t *)OTA_IMAGE_SIGNING_CONTEXT,
             OTA_IMAGE_SIGNING_CONTEXT_SIZE);
     }
     if (result == 0)
     {
-        result = mbedtls_sha256_update_ret(&sha,
+        result = MbedtlsCompat_Sha256Update(&sha,
                                            fields,
                                            sizeof(fields));
     }
     if (result == 0)
     {
-        result = mbedtls_sha256_update_ret(&sha,
+        result = MbedtlsCompat_Sha256Update(&sha,
                                            header->payload_sha256,
                                            OTA_SHA256_SIZE);
     }
     if (result == 0)
     {
-        result = mbedtls_sha256_finish_ret(&sha, digest);
+        result = MbedtlsCompat_Sha256Finish(&sha, digest);
     }
     mbedtls_sha256_free(&sha);
     if (result != 0)
@@ -517,7 +518,7 @@ static int Boot_VerifyImage(uint32_t slot,
     payload = (const uint8_t *)(uintptr_t)
         (slot + header.payload_offset);
     mbedtls_sha256_init(&sha);
-    result = mbedtls_sha256_starts_ret(&sha, 0);
+    result = MbedtlsCompat_Sha256Starts(&sha, 0);
     while ((result == 0) && (offset < header.image_size))
     {
         size_t chunk = header.image_size - offset;
@@ -525,7 +526,7 @@ static int Boot_VerifyImage(uint32_t slot,
         {
             chunk = 4096U;
         }
-        result = mbedtls_sha256_update_ret(&sha,
+        result = MbedtlsCompat_Sha256Update(&sha,
                                            payload + offset,
                                            chunk);
         Boot_WatchdogRefresh();
@@ -533,7 +534,7 @@ static int Boot_VerifyImage(uint32_t slot,
     }
     if (result == 0)
     {
-        result = mbedtls_sha256_finish_ret(&sha, digest);
+        result = MbedtlsCompat_Sha256Finish(&sha, digest);
     }
     mbedtls_sha256_free(&sha);
     if ((result != 0) ||

@@ -1,4 +1,5 @@
 #include "ota_image.h"
+#include "mbedtls_compat.h"
 
 #include "firmware_authenticity.h"
 #include "main.h"
@@ -129,29 +130,29 @@ OtaImageResult OtaImage_BuildSignedDigest(
     OtaImage_StoreBe32(encoded + 8U, header->image_size);
 
     mbedtls_sha256_init(&context);
-    result = mbedtls_sha256_starts_ret(&context, 0);
+    result = MbedtlsCompat_Sha256Starts(&context, 0);
     if (result == 0)
     {
-        result = mbedtls_sha256_update_ret(
+        result = MbedtlsCompat_Sha256Update(
             &context,
             (const uint8_t *)OTA_IMAGE_SIGNING_CONTEXT,
             OTA_IMAGE_SIGNING_CONTEXT_SIZE);
     }
     if (result == 0)
     {
-        result = mbedtls_sha256_update_ret(&context,
+        result = MbedtlsCompat_Sha256Update(&context,
                                            encoded,
                                            sizeof(encoded));
     }
     if (result == 0)
     {
-        result = mbedtls_sha256_update_ret(&context,
+        result = MbedtlsCompat_Sha256Update(&context,
                                            header->payload_sha256,
                                            OTA_SHA256_SIZE);
     }
     if (result == 0)
     {
-        result = mbedtls_sha256_finish_ret(&context, digest);
+        result = MbedtlsCompat_Sha256Finish(&context, digest);
     }
     mbedtls_sha256_free(&context);
     memset(encoded, 0, sizeof(encoded));
@@ -194,7 +195,7 @@ OtaImageResult OtaImage_VerifySlot(uint32_t slot_address,
     OtaImage_InvalidateCache((uint32_t)(uintptr_t)payload,
                              header.image_size);
     mbedtls_sha256_init(&context);
-    result = mbedtls_sha256_starts_ret(&context, 0);
+    result = MbedtlsCompat_Sha256Starts(&context, 0);
     while ((result == 0) && (offset < header.image_size))
     {
         size_t chunk = header.image_size - offset;
@@ -202,14 +203,14 @@ OtaImageResult OtaImage_VerifySlot(uint32_t slot_address,
         {
             chunk = 2048U;
         }
-        result = mbedtls_sha256_update_ret(&context,
+        result = MbedtlsCompat_Sha256Update(&context,
                                            payload + offset,
                                            chunk);
         offset += (uint32_t)chunk;
     }
     if (result == 0)
     {
-        result = mbedtls_sha256_finish_ret(&context, calculated);
+        result = MbedtlsCompat_Sha256Finish(&context, calculated);
     }
     mbedtls_sha256_free(&context);
     if ((result != 0) ||

@@ -5,11 +5,13 @@
 #include <stdint.h>
 
 #define IOT_EVENT_SCHEMA_VERSION       1U
-#define IOT_EVENT_QUEUE_CAPACITY       16U
+#define IOT_EVENT_QUEUE_CAPACITY       32U
 #define IOT_EVENT_ID_CAPACITY          32U
 #define IOT_EVENT_CODE_CAPACITY        40U
 #define IOT_EVENT_SOURCE_CAPACITY      24U
 #define IOT_EVENT_MESSAGE_CAPACITY     385U
+
+#define IOT_EVENT_FLAG_DURABLE         0x01U
 
 typedef enum
 {
@@ -48,6 +50,8 @@ typedef struct
 {
     IotMessageType type;
     uint8_t level;
+    /* Uses padding that existed in journal v1, preserving its binary layout. */
+    uint8_t flags;
     uint32_t uptime_ms;
     uint32_t suppressed_count;
     char message_id[IOT_EVENT_ID_CAPACITY];
@@ -64,6 +68,14 @@ IotEventResult IotEvents_QueueDiagnostic(IotDiagnosticLevel level,
                                          const char *source,
                                          const char *code,
                                          const char *message);
+/*
+ * Queues a low-volume audit diagnostic that must survive reset. This API is
+ * intended for state transitions, not periodic DEBUG/TRACE output.
+ */
+IotEventResult IotEvents_QueueDiagnosticDurable(IotDiagnosticLevel level,
+                                                const char *source,
+                                                const char *code,
+                                                const char *message);
 int IotEvents_PeekCopy(IotEventMessage *event);
 /*
  * Removes the event only after a durable acknowledgement has been written.
@@ -71,8 +83,10 @@ int IotEvents_PeekCopy(IotEventMessage *event);
  */
 int IotEvents_PopIfMatch(const char *message_id);
 size_t IotEvents_PendingCount(void);
+size_t IotEvents_DurablePendingCount(void);
 uint32_t IotEvents_DroppedCount(void);
 uint32_t IotEvents_PersistenceFailureCount(void);
+int IotEvents_IsDurable(const IotEventMessage *event);
 const char *IotEvents_SeverityName(uint8_t severity);
 const char *IotEvents_DiagnosticLevelName(uint8_t level);
 
