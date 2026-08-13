@@ -13,6 +13,7 @@ typedef struct
 {
     char status[MQTT_TOPICS_MAX_LENGTH];
     char telemetry[MQTT_TOPICS_MAX_LENGTH];
+    char capabilities[MQTT_TOPICS_MAX_LENGTH];
     char alerts[MQTT_TOPICS_MAX_LENGTH];
     char diagnostics[MQTT_TOPICS_MAX_LENGTH];
     char command[MQTT_TOPICS_MAX_LENGTH];

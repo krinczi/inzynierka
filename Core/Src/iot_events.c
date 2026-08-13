@@ -705,6 +705,23 @@ void IotEvents_Init(void)
     initialized = 1U;
 }
 
+int IotEvents_FactoryReset(void)
+{
+    if (IotEvents_JournalErase() != 0)
+    {
+        return -1;
+    }
+
+    memset(event_queue, 0, sizeof(event_queue));
+    memset(throttle_entries, 0, sizeof(throttle_entries));
+    queue_count = 0U;
+    dropped_count = 0U;
+    persistence_failure_count = 0U;
+    message_sequence = 0U;
+    journal_sequence = 0U;
+    return 0;
+}
+
 IotEventResult IotEvents_QueueAlert(IotAlertSeverity severity,
                                     const char *code,
                                     const char *message)

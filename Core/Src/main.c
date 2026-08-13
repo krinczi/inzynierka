@@ -53,6 +53,7 @@
 #include "system_watchdog.h"
 #include "ota_manager.h"
 #include "credential_store.h"
+#include "device_config.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -124,6 +125,10 @@ uint32_t last_log_ms = 0;
 static volatile uint8_t network_ready = 0U;
 static volatile uint8_t tls_initialized = 0U;
 static volatile uint8_t mqtt_ready = 0U;
+static volatile uint8_t network_reconfigure_requested = 0U;
+static volatile uint8_t network_force_dhcp_fallback = 0U;
+static volatile uint8_t network_active_mode = DEVICE_NETWORK_DHCP;
+static uint8_t network_cloud_connection_failures = 0U;
 #if FLASH_STAGING_BUTTON_SELF_TEST_ENABLED
 static uint8_t flash_staging_self_test_requested = 0U;
 #endif
@@ -164,6 +169,23 @@ static uint8_t FlashStagingSelfTest_ButtonHeldAtBoot(void);
 #define SYS_LOGF(...)      Debug_Logf(DEBUG_SRC_SYSTEM, __VA_ARGS__)
 #define NET_LOG(text)      Debug_LogLine(DEBUG_SRC_NET, (text))
 #define NET_LOGF(...)      Debug_Logf(DEBUG_SRC_NET, __VA_ARGS__)
+
+void Net_RequestReconfigure(void)
+{
+    network_force_dhcp_fallback = 0U;
+    network_cloud_connection_failures = 0U;
+    network_reconfigure_requested = 1U;
+}
+
+const char *Net_GetActiveModeName(void)
+{
+    if ((network_active_mode == DEVICE_NETWORK_DHCP) &&
+        (network_force_dhcp_fallback != 0U))
+    {
+        return "DHCP_FALLBACK";
+    }
+    return network_active_mode == DEVICE_NETWORK_STATIC ? "STATIC" : "DHCP";
+}
 
 #if FLASH_STAGING_BUTTON_SELF_TEST_ENABLED
 static uint8_t FlashStagingSelfTest_ButtonHeldAtBoot(void)
@@ -739,11 +761,14 @@ static int Net_TestDns(const char *hostname)
 
 static int Net_ConfigureConnectedInterface(void)
 {
+    DeviceConfig config;
     uint32_t start_ms;
     uint32_t last_log_ms;
     ip4_addr_t zero;
     err_t err;
     char buf[96];
+
+    DeviceConfig_GetSnapshot(&config);
 
     if (!netif_is_link_up(&gnetif))
     {
@@ -751,8 +776,60 @@ static int Net_ConfigureConnectedInterface(void)
         return -1;
     }
 
+    if ((config.network_addressing_mode == DEVICE_NETWORK_STATIC) &&
+        (network_force_dhcp_fallback == 0U))
+    {
+        ip4_addr_t address;
+        ip4_addr_t netmask;
+        ip4_addr_t gateway;
+        ip_addr_t dns_primary;
+        ip_addr_t dns_secondary;
+
+        IP4_ADDR(&address,
+                 config.ipv4_address[0],
+                 config.ipv4_address[1],
+                 config.ipv4_address[2],
+                 config.ipv4_address[3]);
+        IP4_ADDR(&netmask,
+                 config.ipv4_netmask[0],
+                 config.ipv4_netmask[1],
+                 config.ipv4_netmask[2],
+                 config.ipv4_netmask[3]);
+        IP4_ADDR(&gateway,
+                 config.ipv4_gateway[0],
+                 config.ipv4_gateway[1],
+                 config.ipv4_gateway[2],
+                 config.ipv4_gateway[3]);
+        IP_ADDR4(&dns_primary,
+                 config.dns_primary[0],
+                 config.dns_primary[1],
+                 config.dns_primary[2],
+                 config.dns_primary[3]);
+        IP_ADDR4(&dns_secondary,
+                 config.dns_secondary[0],
+                 config.dns_secondary[1],
+                 config.dns_secondary[2],
+                 config.dns_secondary[3]);
+
+        NET_LOG("NET: static IPv4 configuration start");
+        dhcp_stop(&gnetif);
+        netif_set_addr(&gnetif, &address, &netmask, &gateway);
+        netif_set_default(&gnetif);
+        if (!netif_is_up(&gnetif))
+        {
+            netif_set_up(&gnetif);
+        }
+        dns_setserver(0U, &dns_primary);
+        dns_setserver(1U, &dns_secondary);
+        network_active_mode = DEVICE_NETWORK_STATIC;
+        NET_LOG("NET: static IPv4 configuration applied");
+        goto network_configuration_ready;
+    }
+
     IP4_ADDR(&zero, 0, 0, 0, 0);
-    NET_LOG("NET: DHCP configuration start");
+    NET_LOG(network_force_dhcp_fallback
+                ? "NET: DHCP safety fallback start"
+                : "NET: DHCP configuration start");
     dhcp_stop(&gnetif);
     netif_set_addr(&gnetif, &zero, &zero, &zero);
     netif_set_default(&gnetif);
@@ -804,6 +881,9 @@ static int Net_ConfigureConnectedInterface(void)
     }
 
     NET_LOG("NET: DHCP lease acquired");
+    network_active_mode = DEVICE_NETWORK_DHCP;
+
+network_configuration_ready:
     Net_PrintIp();
     snprintf(buf, sizeof(buf), "NET: DNS0=%s", ipaddr_ntoa(dns_getserver(0)));
     NET_LOG(buf);
@@ -894,6 +974,34 @@ static void CredentialRotation_RecordConnectionFailure(const char *stage)
     }
 }
 
+static void Network_RecordCloudConnectionFailure(void)
+{
+    DeviceConfig config;
+
+    DeviceConfig_GetSnapshot(&config);
+    if ((config.network_addressing_mode != DEVICE_NETWORK_STATIC) ||
+        (config.network_dhcp_fallback_enabled == 0U) ||
+        (network_force_dhcp_fallback != 0U))
+    {
+        return;
+    }
+
+    if (network_cloud_connection_failures < UINT8_MAX)
+    {
+        network_cloud_connection_failures++;
+    }
+    if (network_cloud_connection_failures >= 3U)
+    {
+        network_force_dhcp_fallback = 1U;
+        network_reconfigure_requested = 1U;
+        SYS_LOG("NET: static configuration failed cloud health gate; DHCP fallback scheduled");
+        (void)IotEvents_QueueAlert(
+            IOT_ALERT_WARNING,
+            "STATIC_NETWORK_FALLBACK",
+            "Static IPv4 could not reach AWS IoT; DHCP safety fallback scheduled");
+    }
+}
+
 /*
  * This is the sole owner of all mbedTLS/MQTT contexts.  Bounded waits during
  * DNS, TCP, TLS, Fleet Provisioning and MQTT setup therefore cannot stop the
@@ -914,8 +1022,19 @@ static void StartMqttServiceTask(void *argument)
         uint32_t now = HAL_GetTick();
         SystemWatchdog_Heartbeat(SYSTEM_WATCHDOG_MQTT);
         OtaManager_Process(now);
+
+        if (TlsClient_LifecycleResetIsDue())
+        {
+            SYS_LOG("LIFECYCLE: acknowledgement window completed; rebooting");
+            TlsClient_Disconnect();
+            osDelay(50U);
+            __DSB();
+            NVIC_SystemReset();
+        }
+
         uint8_t usable_network =
             (tls_initialized != 0U) &&
+            DeviceConfig_IsCloudAccessAllowed() &&
             (network_ready != 0U) &&
             netif_is_link_up(&gnetif) &&
             netif_is_up(&gnetif) &&
@@ -979,11 +1098,13 @@ static void StartMqttServiceTask(void *argument)
                     SYS_LOG("MQTT TEST: OK");
                     mqtt_ready = 1U;
                     mqtt_healthy_since_ms = HAL_GetTick();
+                    network_cloud_connection_failures = 0U;
                 }
                 else
                 {
                     SYS_LOG("MQTT TEST: FAIL");
                     CredentialRotation_RecordConnectionFailure("mqtt");
+                    Network_RecordCloudConnectionFailure();
                     (void)IotEvents_QueueAlert(
                         IOT_ALERT_WARNING,
                         "MQTT_CONNECT_FAILED",
@@ -995,6 +1116,7 @@ static void StartMqttServiceTask(void *argument)
             {
                 SYS_LOG("TLS TEST: HANDSHAKE FAIL");
                 CredentialRotation_RecordConnectionFailure("tls");
+                Network_RecordCloudConnectionFailure();
                 (void)IotEvents_QueueAlert(
                     IOT_ALERT_WARNING,
                     "TLS_HANDSHAKE_FAILED",
@@ -1218,6 +1340,30 @@ void StartDefaultTask(void *argument)
             NET_LOG(buf);
         }
 #endif
+
+        if ((network_reconfigure_requested != 0U) &&
+            netif_is_link_up(&gnetif))
+        {
+            network_reconfigure_requested = 0U;
+            network_ready = 0U;
+            TlsClient_RequestCancel();
+            NET_LOG("NET: applying persisted network configuration");
+            osDelay(250U);
+            network_ready =
+                (Net_ConfigureConnectedInterface() == 0) ? 1U : 0U;
+            network_retry_after_ms = network_ready
+                                         ? 0U
+                                         : HAL_GetTick() +
+                                               NET_DHCP_RETRY_DELAY_MS;
+            if (network_ready != 0U)
+            {
+                (void)IotEvents_QueueDiagnosticDurable(
+                    IOT_DIAGNOSTIC_INFO,
+                    "NETWORK",
+                    "NETWORK_CONFIGURATION_APPLIED",
+                    Net_GetActiveModeName());
+            }
+        }
 
         if (!netif_is_link_up(&gnetif))
         {

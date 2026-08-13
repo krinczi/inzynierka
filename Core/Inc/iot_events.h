@@ -61,6 +61,8 @@ typedef struct
 } IotEventMessage;
 
 void IotEvents_Init(void);
+/* Service lifecycle operation. Erases the durable local event journal. */
+int IotEvents_FactoryReset(void);
 IotEventResult IotEvents_QueueAlert(IotAlertSeverity severity,
                                     const char *code,
                                     const char *message);

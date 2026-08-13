@@ -19,6 +19,7 @@ int TlsClient_MqttTest(void);
 int TlsClient_MqttProcess(void);
 int TlsClient_MqttIsReady(void);
 int TlsClient_PublishStatus(void);
+int TlsClient_LifecycleResetIsDue(void);
 /* Thread-safe cancellation flag used by the Ethernet supervisor. */
 void TlsClient_RequestCancel(void);
 void TlsClient_ClearCancel(void);

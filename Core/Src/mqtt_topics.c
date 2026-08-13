@@ -57,6 +57,11 @@ int MqttTopics_Init(const char *environment, const char *device_id)
                           environment,
                           device_id,
                           "telemetry") != 0) ||
+        (MqttTopics_Build(mqtt_topics.capabilities,
+                          sizeof(mqtt_topics.capabilities),
+                          environment,
+                          device_id,
+                          "capabilities") != 0) ||
         (MqttTopics_Build(mqtt_topics.alerts,
                           sizeof(mqtt_topics.alerts),
                           environment,

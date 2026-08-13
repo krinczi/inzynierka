@@ -99,6 +99,10 @@ store through the same queue semantics.
   maintained a healthy MQTT session for 30 seconds.
 - Three persisted validation failures automatically restore the previous
   provisioned pair, including across MCU resets.
+- The backend can optionally schedule rotation by credential age and retire the
+  previous AWS certificate after both device-side validation and an additional
+  operator-defined grace period. Scheduling is disabled until the production
+  environment explicitly enables its policy variables.
 - Runtime diagnostics report RDP, debugger, MPU, mbedTLS, and FreeRTOS state.
 - Production diagnostics warn when RDP is disabled, a debugger is attached, or
   a legacy dependency baseline is detected.
@@ -131,18 +135,53 @@ certificate-administration permissions.
 
 The management application provides an explicit owner-only decommissioning
 operation. The request must repeat the current device ID, hardware UID and
-active certificate ID, and include a human-readable reason. The backend first
-atomically sets `enabled=false` for the matching hardware UID and Thing in the
-Fleet Provisioning allow-list. Only then does it verify that the certificate is
-attached to the expected Thing, set it to `INACTIVE`, detach its policies and
-remove the Thing-principal association. Missing allow-list configuration or an
-identity mismatch aborts the operation before the certificate is changed.
+active certificate ID, and include a human-readable reason. For an online
+device, the backend first sends a fresh owner-authorized command containing the
+exact hardware UID. The STM32 persists a decommission-pending marker before it
+acknowledges the command, then erases staged data, durable events and unique
+credentials after reset. Finally it stores a local `DECOMMISSIONED` quarantine
+marker which prevents both cloud connection and automatic re-provisioning.
+Only after the command acknowledgement does the backend atomically set
+`enabled=false` in the Fleet Provisioning allow-list, verify the Thing
+association, set the active certificate to `INACTIVE`, detach its policies and
+remove the Thing-principal association. An explicit cloud-only emergency path
+is available for an unreachable device and is reported separately in the
+audit result because local erasure cannot then be confirmed.
 The Thing, application record, telemetry and event history are retained for
 audit. After completion, commands are rejected and delayed MQTT messages cannot
 reactivate the application record. Erasing the STM32 credential store cannot
 re-enroll a decommissioned board because the pre-provisioning hook rejects its
 disabled UID. Re-enrollment is intentionally a separate, audited service
 procedure.
+
+### Factory reset and recovery
+
+- `lifecycle.factory_reset` is owner-only and requires `confirm=true`, the exact
+  96-bit hardware UID and a command timestamp no older than five minutes.
+- The request is written to the dual-sector configuration journal before the
+  MQTT acknowledgement is sent. A power loss at any later point resumes the
+  reset during the next boot.
+- The reset clears staged downloads, durable event records, unique device
+  credentials and the persisted Device Shadow configuration, then reboots into
+  factory defaults and Fleet Provisioning.
+- Factory reset deliberately does not alter the AWS allow-list. Decommissioning
+  must be used when the device must not enroll again.
+- A locally decommissioned unit stays quarantined even if Ethernet is restored;
+  re-enrollment requires an explicit controlled service procedure.
+
+### Remote network configuration
+
+- Device Shadow schema version 2 adds DHCP/static selection, IPv4 address,
+  contiguous subnet mask, gateway, primary/secondary DNS and DHCP recovery.
+- API, web UI and firmware independently validate canonical IPv4 syntax,
+  unicast host addressing and gateway membership in the configured subnet.
+- A valid Shadow update is committed atomically before it is acknowledged.
+  Network reconfiguration starts only after the reported-state publication.
+- After three failed AWS connection attempts with a static configuration, the
+  optional recovery policy temporarily uses DHCP so the device can be repaired
+  remotely. The desired static configuration remains persisted and visible.
+- Version 1 configuration records and reported states are migrated to safe DHCP
+  defaults, preserving compatibility with devices upgraded in the field.
 
 ### Complete signed OTA boot chain
 
@@ -212,3 +251,13 @@ operations must:
 - inventory issued device certificates;
 - rotate and revoke the claim certificate on a defined schedule;
 - provide an incident procedure for immediate claim revocation.
+
+## Sensor extensibility boundary
+
+Production builds use the bounded registry described in `docs/SENSOR_REGISTRY.md`.
+Only compiled and explicitly registered drivers may read hardware. Runtime bus
+scanning must be implemented by the board layer with bounded timeouts; an
+unknown address is reported as `UNSUPPORTED` and is never interpreted as a
+valid measurement. Stable slots, capability validation and schema v2 dynamic
+telemetry allow different product variants to share the same cloud and UI
+without permitting runtime code loading or unbounded payloads.

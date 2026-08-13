@@ -54,6 +54,10 @@ void Error_Handler(void);
 
 /* USER CODE BEGIN EFP */
 
+/* Thread-safe request issued after a Device Shadow network update. */
+void Net_RequestReconfigure(void);
+const char *Net_GetActiveModeName(void);
+
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/

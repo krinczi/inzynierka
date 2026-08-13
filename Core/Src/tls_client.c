@@ -15,6 +15,7 @@
 #include "iot_events.h"
 #include "main.h"
 #include "sensor_manager.h"
+#include "system_time.h"
 #include "system_watchdog.h"
 
 #include <string.h>
@@ -77,11 +78,12 @@
 #define MQTT_RX_BUFFER_SIZE            8192U
 #define MQTT_INCOMING_PAYLOAD_SIZE     7680U
 #define MQTT_TOPIC_BUFFER_SIZE          MQTT_TOPICS_MAX_LENGTH
-#define MQTT_TX_BUFFER_SIZE            4096U
+#define MQTT_TX_BUFFER_SIZE           16384U
 #define MQTT_MAX_PUBLISH_OVERHEAD \
     (5U + 2U + (MQTT_TOPIC_BUFFER_SIZE - 1U) + 2U)
-#define MQTT_JSON_BUFFER_SIZE          768U
-#define MQTT_SHADOW_JSON_BUFFER_SIZE   1024U
+#define MQTT_JSON_BUFFER_SIZE          3584U
+#define MQTT_SHADOW_JSON_BUFFER_SIZE   3072U
+#define MQTT_CAPABILITIES_JSON_BUFFER_SIZE 15360U
 #define MQTT_LWT_PAYLOAD_SIZE          192U
 
 #define INTERACTION_DURATION_DEFAULT_SECONDS 300U
@@ -91,6 +93,8 @@
 #define INTERACTION_DIAGNOSTIC_INTERVAL_MS    10000U
 #define PROVISIONING_MAX_FAILED_ATTEMPTS          5U
 #define PROVISIONING_MAX_RETRY_DELAY_MS        60000U
+#define LIFECYCLE_RESET_DELAY_MS                2000U
+#define PRIVILEGED_COMMAND_MAX_AGE_SECONDS       300U
 
 #if (MQTT_INCOMING_PAYLOAD_SIZE + MQTT_MAX_PUBLISH_OVERHEAD) > MQTT_RX_BUFFER_SIZE
 #error "MQTT incoming payload and publish overhead exceed the RX buffer"
@@ -145,13 +149,23 @@ static uint8_t mqtt_interaction_active = 0U;
 static uint8_t mqtt_interaction_expiry_pending = 0U;
 static uint32_t mqtt_interaction_deadline_ms = 0U;
 static uint32_t mqtt_last_interaction_diagnostic_ms = 0U;
+static uint32_t mqtt_last_capability_signature = 0U;
 static uint8_t mqtt_provisioning_failed_attempts = 0U;
 static uint32_t mqtt_provisioning_next_attempt_ms = 0U;
+static uint32_t mqtt_lifecycle_reset_deadline_ms = 0U;
 static uint8_t mqtt_shadow_get_pending = 0U;
 static uint8_t mqtt_rx_buffer[MQTT_RX_BUFFER_SIZE];
 /* The current packet is detached before dispatch so nested MQTT I/O cannot
  * process the same bytes recursively while a handler publishes a response. */
 static uint8_t mqtt_packet_buffer[MQTT_RX_BUFFER_SIZE];
+/* Shared by the single MQTT owner task to keep large capability messages off
+ * its stack. Nested command replies occur only after the previous packet has
+ * already been written to TLS, so reusing this buffer is safe. */
+static uint8_t mqtt_tx_buffer[MQTT_TX_BUFFER_SIZE];
+static char mqtt_capabilities_payload[MQTT_CAPABILITIES_JSON_BUFFER_SIZE];
+static char mqtt_config_reported_payload[MQTT_JSON_BUFFER_SIZE];
+static char mqtt_shadow_update_payload[MQTT_SHADOW_JSON_BUFFER_SIZE];
+static char mqtt_config_metrics_payload[1152U];
 static size_t mqtt_rx_length = 0U;
 static uint16_t mqtt_expected_suback_packet_id = 0U;
 static int mqtt_suback_result = 0;
@@ -193,20 +207,6 @@ void TlsClient_ClearCancel(void)
 {
     tls_cancel_requested = 0U;
 }
-
-typedef struct
-{
-    const char *name;
-    uint8_t mask;
-} MqttMetricDefinition;
-
-static const MqttMetricDefinition mqtt_metric_definitions[] = {
-    { "temperature", DEVICE_METRIC_TEMPERATURE },
-    { "voltage", DEVICE_METRIC_VOLTAGE },
-    { "current", DEVICE_METRIC_CURRENT },
-    { "signal", DEVICE_METRIC_SIGNAL },
-    { "humidity", DEVICE_METRIC_HUMIDITY }
-};
 
 static void Tls_DnsFound(const char *name, const ip_addr_t *ipaddr, void *arg)
 {
@@ -440,7 +440,7 @@ int TlsClient_Init(void)
     FlashStagingResult staging_result;
 
     tls_log("TLS: init");
-    tls_log("TLS BUILD: fleet_auto_v3 credential_rotation_v2 shadow_v1 hw_telemetry_v1 rtc_sntp_v1 iwdg_mpu_v1 durable_events_v2 full_ota_v1");
+    tls_log("TLS BUILD: fleet_auto_v3 credential_rotation_v2 lifecycle_v1 shadow_v3 network_config_v1 sensor_registry_v1 rtc_sntp_v1 iwdg_mpu_v1 durable_events_v2 full_ota_v1");
     tls_connected = 0;
     tls_ctx_ready = 0;
     mqtt_interaction_active = 0U;
@@ -449,7 +449,33 @@ int TlsClient_Init(void)
     mqtt_last_interaction_diagnostic_ms = 0U;
     mqtt_provisioning_failed_attempts = 0U;
     mqtt_provisioning_next_attempt_ms = 0U;
+    mqtt_lifecycle_reset_deadline_ms = 0U;
     DeviceConfig_Init();
+
+    if ((DeviceConfig_Get()->local_lifecycle_state ==
+         DEVICE_LOCAL_LIFECYCLE_FACTORY_RESET_PENDING) ||
+        (DeviceConfig_Get()->local_lifecycle_state ==
+         DEVICE_LOCAL_LIFECYCLE_DECOMMISSION_PENDING))
+    {
+        tls_logf("LIFECYCLE: resuming state=%s",
+                 DeviceConfig_LocalLifecycleStateName(
+                     DeviceConfig_Get()->local_lifecycle_state));
+        if ((FlashStaging_Abort() != FLASH_STAGING_OK) ||
+            (IotEvents_FactoryReset() != 0) ||
+            (CredentialStore_Erase() != 0) ||
+            (DeviceConfig_CompletePendingLifecycleAction() != 0))
+        {
+            tls_log("LIFECYCLE: persistent reset failed; retry required");
+            return -1;
+        }
+
+        tls_logf("LIFECYCLE: completed state=%s; rebooting",
+                 DeviceConfig_LocalLifecycleStateName(
+                     DeviceConfig_Get()->local_lifecycle_state));
+        __DSB();
+        NVIC_SystemReset();
+    }
+
     (void)CredentialStore_Init();
     credential_state = CredentialStore_GetState();
     if ((DeviceIdentity_Refresh() != 0) ||
@@ -494,10 +520,13 @@ int TlsClient_Init(void)
                                    "OTA boot control state could not be loaded");
     }
     config = DeviceConfig_Get();
-    tls_logf("CONFIG: loaded version=%lu telemetry=%lus keepalive=%lus",
+    tls_logf("CONFIG: loaded version=%lu telemetry=%lus keepalive=%lus network=%s lifecycle=%s",
              (unsigned long)config->config_version,
              (unsigned long)config->telemetry_frequency_seconds,
-             (unsigned long)config->mqtt_keep_alive_seconds);
+             (unsigned long)config->mqtt_keep_alive_seconds,
+             DeviceConfig_NetworkModeName(config->network_addressing_mode),
+             DeviceConfig_LocalLifecycleStateName(
+                 config->local_lifecycle_state));
     {
         tls_logf("PROVISIONING: state=%s hardwareUid=%s",
                  DeviceConfig_ProvisioningStateName(config->provisioning_state),
@@ -1680,7 +1709,7 @@ static int mqtt_publish_json_internal(const char *topic,
                                       uint8_t qos,
                                       uint8_t retain)
 {
-    uint8_t pkt[MQTT_TX_BUFFER_SIZE];
+    uint8_t *pkt = mqtt_tx_buffer;
     size_t topic_len = strlen(topic);
     size_t payload_len = strlen(payload);
     size_t remaining;
@@ -1702,7 +1731,7 @@ static int mqtt_publish_json_internal(const char *topic,
     rem_len = mqtt_encode_remaining_length(&pkt[1], remaining);
     pos = 1U + rem_len;
 
-    if (mqtt_put_string(pkt, sizeof(pkt), &pos, topic) != 0)
+    if (mqtt_put_string(pkt, MQTT_TX_BUFFER_SIZE, &pos, topic) != 0)
     {
         return -1;
     }
@@ -1720,7 +1749,7 @@ static int mqtt_publish_json_internal(const char *topic,
         mqtt_puback_result = 0;
     }
 
-    if ((pos + payload_len) > sizeof(pkt))
+    if ((pos + payload_len) > MQTT_TX_BUFFER_SIZE)
     {
         tls_log("MQTT: PUBLISH buffer too small");
         return -1;
@@ -1873,6 +1902,9 @@ static int mqtt_publish_status(void)
                        "\"certificateId\":\"%s\","
                        "\"thingName\":\"%s\","
                        "\"hardwareUid\":\"%s\"},"
+                       "\"lifecycle\":{\"state\":\"%s\"},"
+                       "\"network\":{\"configuredMode\":\"%s\","
+                       "\"activeMode\":\"%s\"},"
                        "\"eventBuffer\":{\"capacity\":%u,"
                        "\"pending\":%u,\"durablePending\":%u,"
                        "\"dropped\":%lu,\"persistenceFailures\":%lu}}",
@@ -1888,6 +1920,11 @@ static int mqtt_publish_status(void)
                        credentials->certificate_id,
                        thing_name,
                        hardware_uid,
+                       DeviceConfig_LocalLifecycleStateName(
+                           config->local_lifecycle_state),
+                       DeviceConfig_NetworkModeName(
+                           config->network_addressing_mode),
+                       Net_GetActiveModeName(),
                        (unsigned int)IOT_EVENT_QUEUE_CAPACITY,
                        (unsigned int)IotEvents_PendingCount(),
                        (unsigned int)IotEvents_DurablePendingCount(),
@@ -1939,10 +1976,12 @@ static int mqtt_json_append(char *buffer, size_t buffer_size, size_t *length,
     return 0;
 }
 
-static int mqtt_metrics_json(uint8_t enabled_metrics, char *output, size_t output_size)
+static int mqtt_metrics_json(uint32_t enabled_metrics,
+                             char *output,
+                             size_t output_size)
 {
     size_t length = 0U;
-    size_t index;
+    uint8_t slot;
     int first = 1;
 
     if (mqtt_json_append(output, output_size, &length, "[") != 0)
@@ -1950,11 +1989,13 @@ static int mqtt_metrics_json(uint8_t enabled_metrics, char *output, size_t outpu
         return -1;
     }
 
-    for (index = 0U;
-         index < (sizeof(mqtt_metric_definitions) / sizeof(mqtt_metric_definitions[0]));
-         index++)
+    for (slot = 0U; slot < SENSOR_MANAGER_MAX_SENSORS; slot++)
     {
-        if ((enabled_metrics & mqtt_metric_definitions[index].mask) == 0U)
+        const SensorCapability *capability =
+            SensorManager_CapabilityForSlot(slot);
+
+        if ((capability == NULL) ||
+            ((enabled_metrics & (1UL << slot)) == 0U))
         {
             continue;
         }
@@ -1964,7 +2005,7 @@ static int mqtt_metrics_json(uint8_t enabled_metrics, char *output, size_t outpu
                              &length,
                              "%s\"%s\"",
                              first ? "" : ",",
-                             mqtt_metric_definitions[index].name) != 0)
+                             capability->definition.metric_id) != 0)
         {
             return -1;
         }
@@ -1974,16 +2015,297 @@ static int mqtt_metrics_json(uint8_t enabled_metrics, char *output, size_t outpu
     return mqtt_json_append(output, output_size, &length, "]");
 }
 
+static int mqtt_uint64_decimal(uint64_t value,
+                               char *output,
+                               size_t output_size,
+                               size_t minimum_digits,
+                               size_t *written)
+{
+    char reversed[20];
+    size_t digits = 0U;
+    size_t output_digits;
+    size_t index;
+
+    if ((output == NULL) || (written == NULL) || (output_size == 0U))
+    {
+        return -1;
+    }
+
+    do
+    {
+        reversed[digits++] = (char)('0' + (value % 10U));
+        value /= 10U;
+    } while ((value != 0U) && (digits < sizeof(reversed)));
+
+    if (value != 0U)
+    {
+        return -1;
+    }
+
+    output_digits = digits > minimum_digits ? digits : minimum_digits;
+    if (output_digits >= output_size)
+    {
+        return -1;
+    }
+
+    for (index = digits; index < output_digits; index++)
+    {
+        output[index - digits] = '0';
+    }
+    for (index = 0U; index < digits; index++)
+    {
+        output[output_digits - digits + index] = reversed[digits - index - 1U];
+    }
+
+    output[output_digits] = '\0';
+    *written = output_digits;
+    return 0;
+}
+
+static int mqtt_sensor_value_json(const SensorMeasurement *measurement,
+                                  char *output,
+                                  size_t output_size)
+{
+    uint64_t absolute;
+    uint64_t divisor = 1U;
+    uint64_t integer_part;
+    uint64_t fractional_part;
+    size_t length = 0U;
+    size_t part_length;
+    uint8_t fractional_digits;
+    uint8_t integer_scale_digits;
+
+    if ((measurement == NULL) || (output == NULL) || (output_size == 0U) ||
+        (measurement->scale10 < -9) || (measurement->scale10 > 9))
+    {
+        return -1;
+    }
+
+    absolute = (measurement->value < 0)
+                   ? ((uint64_t)(-(measurement->value + 1)) + 1U)
+                   : (uint64_t)measurement->value;
+
+    if (measurement->value < 0)
+    {
+        if (output_size < 2U)
+        {
+            return -1;
+        }
+        output[length++] = '-';
+    }
+
+    if (measurement->scale10 >= 0)
+    {
+        if (mqtt_uint64_decimal(absolute,
+                                output + length,
+                                output_size - length,
+                                1U,
+                                &part_length) != 0)
+        {
+            return -1;
+        }
+        length += part_length;
+        integer_scale_digits = (uint8_t)measurement->scale10;
+        while (integer_scale_digits-- > 0U)
+        {
+            if ((length + 1U) >= output_size)
+            {
+                return -1;
+            }
+            output[length++] = '0';
+        }
+    }
+    else
+    {
+        fractional_digits = (uint8_t)(-measurement->scale10);
+        for (uint8_t digit = 0U; digit < fractional_digits; digit++)
+        {
+            divisor *= 10U;
+        }
+        integer_part = absolute / divisor;
+        fractional_part = absolute % divisor;
+
+        if (mqtt_uint64_decimal(integer_part,
+                                output + length,
+                                output_size - length,
+                                1U,
+                                &part_length) != 0)
+        {
+            return -1;
+        }
+        length += part_length;
+        if ((length + 1U) >= output_size)
+        {
+            return -1;
+        }
+        output[length++] = '.';
+        if (mqtt_uint64_decimal(fractional_part,
+                                output + length,
+                                output_size - length,
+                                fractional_digits,
+                                &part_length) != 0)
+        {
+            return -1;
+        }
+        length += part_length;
+    }
+
+    if (length >= output_size)
+    {
+        return -1;
+    }
+    output[length] = '\0';
+    return 0;
+}
+
+static int mqtt_publish_capabilities(void)
+{
+    char *payload = mqtt_capabilities_payload;
+    SensorCapability capabilities[SENSOR_MANAGER_MAX_SENSORS];
+    SensorDiscoveredDevice discovered[8];
+    size_t capability_count;
+    size_t discovered_count;
+    size_t length = 0U;
+    size_t index;
+
+    capability_count = SensorManager_GetCapabilities(
+        capabilities,
+        sizeof(capabilities) / sizeof(capabilities[0]));
+    discovered_count = SensorManager_GetDiscoveredDevices(
+        discovered,
+        sizeof(discovered) / sizeof(discovered[0]));
+
+    if (mqtt_json_append(payload,
+                         MQTT_CAPABILITIES_JSON_BUFFER_SIZE,
+                         &length,
+                         "{\"deviceId\":\"%s\",\"schemaVersion\":1,"
+                         "\"registryVersion\":1,\"maxSlots\":%u,"
+                         "\"metrics\":[",
+                         DeviceIdentity_GetThingName(),
+                         (unsigned int)SENSOR_MANAGER_MAX_SENSORS) != 0)
+    {
+        return -1;
+    }
+
+    for (index = 0U; index < capability_count; index++)
+    {
+        const SensorDefinition *definition =
+            &capabilities[index].definition;
+        if (mqtt_json_append(
+                payload,
+                MQTT_CAPABILITIES_JSON_BUFFER_SIZE,
+                &length,
+                "%s{\"slot\":%u,\"id\":\"%s\",\"label\":\"%s\","
+                "\"unit\":\"%s\",\"driver\":\"%s\",\"bus\":\"%s\","
+                "\"state\":\"%s\",\"minimumMilli\":%ld,"
+                "\"maximumMilli\":%ld}",
+                index == 0U ? "" : ",",
+                (unsigned int)definition->slot,
+                definition->metric_id,
+                definition->label,
+                definition->unit,
+                definition->driver,
+                SensorManager_BusName(definition->bus),
+                SensorManager_CapabilityStateName(capabilities[index].state),
+                (long)definition->minimum_milli,
+                (long)definition->maximum_milli) != 0)
+        {
+            tls_log("MQTT: capabilities JSON too large");
+            return -1;
+        }
+    }
+
+    if (mqtt_json_append(payload,
+                         MQTT_CAPABILITIES_JSON_BUFFER_SIZE,
+                         &length,
+                         "],\"unsupportedDevices\":[") != 0)
+    {
+        return -1;
+    }
+    for (index = 0U; index < discovered_count; index++)
+    {
+        if (mqtt_json_append(
+                payload,
+                MQTT_CAPABILITIES_JSON_BUFFER_SIZE,
+                &length,
+                "%s{\"bus\":\"%s\",\"address\":%u,\"identifier\":\"%s\","
+                "\"reason\":\"%s\"}",
+                index == 0U ? "" : ",",
+                SensorManager_BusName(discovered[index].bus),
+                (unsigned int)discovered[index].address,
+                discovered[index].identifier != NULL
+                    ? discovered[index].identifier
+                    : "unknown",
+                discovered[index].reason != NULL
+                    ? discovered[index].reason
+                    : "DRIVER_NOT_REGISTERED") != 0)
+        {
+            return -1;
+        }
+    }
+
+    if (mqtt_json_append(payload,
+                         MQTT_CAPABILITIES_JSON_BUFFER_SIZE,
+                         &length,
+                         "],\"registeredMask\":%lu}",
+                         (unsigned long)SensorManager_RegisteredMask()) != 0)
+    {
+        return -1;
+    }
+
+    if (mqtt_publish_json(MqttTopics_Get()->capabilities, payload) != 0)
+    {
+        return -1;
+    }
+
+    {
+        uint32_t signature = 2166136261UL;
+        for (index = 0U; index < capability_count; index++)
+        {
+            signature ^= (uint32_t)capabilities[index].definition.slot;
+            signature *= 16777619UL;
+            signature ^= (uint32_t)capabilities[index].state;
+            signature *= 16777619UL;
+        }
+        mqtt_last_capability_signature = signature;
+    }
+    return 0;
+}
+
+static uint32_t mqtt_capability_signature(void)
+{
+    SensorCapability capabilities[SENSOR_MANAGER_MAX_SENSORS];
+    size_t count = SensorManager_GetCapabilities(
+        capabilities,
+        sizeof(capabilities) / sizeof(capabilities[0]));
+    size_t index;
+    uint32_t signature = 2166136261UL;
+
+    for (index = 0U; index < count; index++)
+    {
+        signature ^= (uint32_t)capabilities[index].definition.slot;
+        signature *= 16777619UL;
+        signature ^= (uint32_t)capabilities[index].state;
+        signature *= 16777619UL;
+    }
+    return signature;
+}
+
 static int mqtt_publish_telemetry(void)
 {
     char payload[MQTT_JSON_BUFFER_SIZE];
     const DeviceConfig *config = DeviceConfig_Get();
-    SensorSnapshot sensors;
+    SensorMeasurement measurements[SENSOR_MANAGER_MAX_SENSORS];
+    uint32_t measured_mask = 0U;
+    size_t measurement_count = 0U;
+    size_t index;
     uint32_t uptime_ms;
     size_t length = 0U;
-    uint32_t absolute_value;
 
-    if (SensorManager_Read(&sensors) != 0)
+    if (SensorManager_ReadAll(config->enabled_metrics,
+                              measurements,
+                              sizeof(measurements) / sizeof(measurements[0]),
+                              &measurement_count) != 0)
     {
         (void)IotEvents_QueueDiagnostic(
             IOT_DIAGNOSTIC_ERROR,
@@ -1993,12 +2315,13 @@ static int mqtt_publish_telemetry(void)
         return 0;
     }
 
-    uptime_ms = sensors.sampled_at_uptime_ms;
+    uptime_ms = HAL_GetTick();
     if (mqtt_json_append(payload,
                          sizeof(payload),
                          &length,
-                         "{\"deviceId\":\"%s\",\"schemaVersion\":1,"
-                         "\"configVersion\":%lu,\"uptimeMs\":%lu",
+                         "{\"deviceId\":\"%s\",\"schemaVersion\":2,"
+                         "\"configVersion\":%lu,\"uptimeMs\":%lu,"
+                         "\"measurements\":[",
                          DeviceIdentity_GetThingName(),
                          (unsigned long)config->config_version,
                          (unsigned long)uptime_ms) != 0)
@@ -2007,104 +2330,93 @@ static int mqtt_publish_telemetry(void)
         return -1;
     }
 
-    if (((config->enabled_metrics & DEVICE_METRIC_TEMPERATURE) != 0U) &&
-        ((sensors.valid_mask & SENSOR_VALID_TEMPERATURE) != 0U))
+    for (index = 0U; index < measurement_count; index++)
     {
-        absolute_value = (sensors.temperature_milli_celsius < 0)
-                             ? (uint32_t)(-sensors.temperature_milli_celsius)
-                             : (uint32_t)sensors.temperature_milli_celsius;
-        if (mqtt_json_append(payload,
-                             sizeof(payload),
-                             &length,
-                             ",\"temperature\":%s%lu.%03lu",
-                             sensors.temperature_milli_celsius < 0 ? "-" : "",
-                             (unsigned long)(absolute_value / 1000U),
-                             (unsigned long)(absolute_value % 1000U)) != 0)
+        const SensorCapability *capability =
+            SensorManager_CapabilityForSlot(measurements[index].slot);
+        char value[48];
+
+        if ((capability == NULL) ||
+            (mqtt_sensor_value_json(&measurements[index], value, sizeof(value)) != 0) ||
+            (mqtt_json_append(
+                 payload,
+                 sizeof(payload),
+                 &length,
+                 "%s{\"slot\":%u,\"metric\":\"%s\",\"value\":%s,"
+                 "\"unit\":\"%s\",\"quality\":\"%s\"}",
+                 index == 0U ? "" : ",",
+                 (unsigned int)measurements[index].slot,
+                 capability->definition.metric_id,
+                 value,
+                 capability->definition.unit,
+                 SensorManager_QualityName(measurements[index].quality)) != 0))
         {
             return -1;
         }
+        measured_mask |= (1UL << measurements[index].slot);
     }
 
-    if (((config->enabled_metrics & DEVICE_METRIC_VOLTAGE) != 0U) &&
-        ((sensors.valid_mask & SENSOR_VALID_VOLTAGE) != 0U) &&
-        (mqtt_json_append(payload,
-                          sizeof(payload),
-                          &length,
-                          ",\"voltage\":%lu.%03lu",
-                          (unsigned long)(sensors.supply_millivolts / 1000U),
-                          (unsigned long)(sensors.supply_millivolts % 1000U)) != 0))
+    if (mqtt_json_append(payload, sizeof(payload), &length,
+                         "],\"unavailableMetrics\":[") != 0)
     {
         return -1;
     }
-
-    if (((config->enabled_metrics & DEVICE_METRIC_CURRENT) != 0U) &&
-        ((sensors.valid_mask & SENSOR_VALID_CURRENT) != 0U))
     {
-        absolute_value = (sensors.current_microamps < 0)
-                             ? (uint32_t)(-sensors.current_microamps)
-                             : (uint32_t)sensors.current_microamps;
-        if (mqtt_json_append(payload,
-                             sizeof(payload),
-                             &length,
-                             ",\"current\":%s%lu.%06lu",
-                             sensors.current_microamps < 0 ? "-" : "",
-                             (unsigned long)(absolute_value / 1000000U),
-                             (unsigned long)(absolute_value % 1000000U)) != 0)
+        int first_unavailable = 1;
+        uint8_t slot;
+        for (slot = 0U; slot < SENSOR_MANAGER_MAX_SENSORS; slot++)
         {
-            return -1;
+            const SensorCapability *capability =
+                SensorManager_CapabilityForSlot(slot);
+            if ((capability == NULL) ||
+                ((config->enabled_metrics & (1UL << slot)) == 0U) ||
+                ((measured_mask & (1UL << slot)) != 0U))
+            {
+                continue;
+            }
+            if (mqtt_json_append(payload,
+                                 sizeof(payload),
+                                 &length,
+                                 "%s\"%s\"",
+                                 first_unavailable ? "" : ",",
+                                 capability->definition.metric_id) != 0)
+            {
+                return -1;
+            }
+            first_unavailable = 0;
         }
     }
 
-    if (((config->enabled_metrics & DEVICE_METRIC_SIGNAL) != 0U) &&
-        ((sensors.valid_mask & SENSOR_VALID_SIGNAL) != 0U) &&
-        (mqtt_json_append(payload,
-                          sizeof(payload),
-                          &length,
-                          ",\"signal\":%lu",
-                          (unsigned long)sensors.signal_percent) != 0))
+    if (mqtt_json_append(payload, sizeof(payload), &length, "]") != 0)
     {
         return -1;
     }
 
-    if (((config->enabled_metrics & DEVICE_METRIC_HUMIDITY) != 0U) &&
-        ((sensors.valid_mask & SENSOR_VALID_HUMIDITY) != 0U) &&
-        (mqtt_json_append(payload,
-                          sizeof(payload),
-                          &length,
-                          ",\"humidity\":%lu.%03lu",
-                          (unsigned long)(sensors.humidity_milli_percent / 1000U),
-                          (unsigned long)(sensors.humidity_milli_percent % 1000U)) != 0))
+    /* Keep the original top-level fields for older consumers. */
+    for (index = 0U; index < measurement_count; index++)
     {
-        return -1;
+        const SensorCapability *capability =
+            SensorManager_CapabilityForSlot(measurements[index].slot);
+        char value[48];
+        if ((capability != NULL) && (measurements[index].slot < 5U) &&
+            (mqtt_sensor_value_json(&measurements[index], value, sizeof(value)) == 0) &&
+            (mqtt_json_append(payload,
+                              sizeof(payload),
+                              &length,
+                              ",\"%s\":%s",
+                              capability->definition.metric_id,
+                              value) != 0))
+        {
+            return -1;
+        }
     }
 
     if (mqtt_json_append(payload,
                          sizeof(payload),
                          &length,
                          ",\"measurementStatus\":\"%s\","
-                         "\"unavailableMetrics\":[%s%s%s],"
                          "\"interactionMode\":%s}",
-                         SensorManager_StatusName(sensors.status),
-                         ((config->enabled_metrics & DEVICE_METRIC_CURRENT) != 0U) &&
-                                 ((sensors.valid_mask & SENSOR_VALID_CURRENT) == 0U)
-                             ? "\"current\""
-                             : "",
-                         ((config->enabled_metrics & DEVICE_METRIC_SIGNAL) != 0U) &&
-                                 ((sensors.valid_mask & SENSOR_VALID_SIGNAL) == 0U)
-                             ? ((((config->enabled_metrics & DEVICE_METRIC_CURRENT) != 0U) &&
-                                 ((sensors.valid_mask & SENSOR_VALID_CURRENT) == 0U))
-                                    ? ",\"signal\""
-                                    : "\"signal\"")
-                             : "",
-                         ((config->enabled_metrics & DEVICE_METRIC_HUMIDITY) != 0U) &&
-                                 ((sensors.valid_mask & SENSOR_VALID_HUMIDITY) == 0U)
-                             ? (((((config->enabled_metrics & DEVICE_METRIC_CURRENT) != 0U) &&
-                                   ((sensors.valid_mask & SENSOR_VALID_CURRENT) == 0U)) ||
-                                  (((config->enabled_metrics & DEVICE_METRIC_SIGNAL) != 0U) &&
-                                   ((sensors.valid_mask & SENSOR_VALID_SIGNAL) == 0U)))
-                                    ? ",\"humidity\""
-                                    : "\"humidity\"")
-                             : "",
+                         measurement_count > 0U ? "OK" : "UNAVAILABLE",
                          mqtt_interaction_active ? "true" : "false") != 0)
     {
         return -1;
@@ -2332,27 +2644,15 @@ static int json_get_uint32(const char *json, const char *key, uint32_t *out)
     return 0;
 }
 
-static uint8_t mqtt_metric_mask_for_name(const char *name)
+static uint32_t mqtt_metric_mask_for_name(const char *name)
 {
-    size_t index;
-
-    for (index = 0U;
-         index < (sizeof(mqtt_metric_definitions) / sizeof(mqtt_metric_definitions[0]));
-         index++)
-    {
-        if (strcmp(name, mqtt_metric_definitions[index].name) == 0)
-        {
-            return mqtt_metric_definitions[index].mask;
-        }
-    }
-
-    return 0U;
+    return SensorManager_MetricMaskForName(name);
 }
 
-static int json_get_metric_mask(const char *json, const char *key, uint8_t *out)
+static int json_get_metric_mask(const char *json, const char *key, uint32_t *out)
 {
     const char *value = json_value_start(json, key);
-    uint8_t mask = 0U;
+    uint32_t mask = 0U;
 
     if ((value == NULL) || (*value != '['))
     {
@@ -2364,7 +2664,7 @@ static int json_get_metric_mask(const char *json, const char *key, uint8_t *out)
     {
         char metric[32];
         size_t length = 0U;
-        uint8_t metric_mask;
+        uint32_t metric_mask;
 
         while ((*value == ' ') || (*value == '\t') || (*value == '\r') || (*value == '\n'))
         {
@@ -2488,24 +2788,89 @@ static int mqtt_publish_command_result(const char *command_id,
     return result;
 }
 
+static void mqtt_format_ipv4(const uint8_t address[4],
+                             char *output,
+                             size_t output_size)
+{
+    (void)snprintf(output,
+                   output_size,
+                   "%u.%u.%u.%u",
+                   (unsigned int)address[0],
+                   (unsigned int)address[1],
+                   (unsigned int)address[2],
+                   (unsigned int)address[3]);
+}
+
+static int mqtt_parse_ipv4_field(const char *payload,
+                                 const char *field,
+                                 uint8_t output[4])
+{
+    char text[16];
+    unsigned int octets[4];
+    char trailing;
+
+    if ((json_get_string(payload, field, text, sizeof(text)) != 0) ||
+        (sscanf(text,
+                "%u.%u.%u.%u%c",
+                &octets[0],
+                &octets[1],
+                &octets[2],
+                &octets[3],
+                &trailing) != 4) ||
+        (octets[0] > 255U) || (octets[1] > 255U) ||
+        (octets[2] > 255U) || (octets[3] > 255U))
+    {
+        return -1;
+    }
+
+    output[0] = (uint8_t)octets[0];
+    output[1] = (uint8_t)octets[1];
+    output[2] = (uint8_t)octets[2];
+    output[3] = (uint8_t)octets[3];
+    return 0;
+}
+
 static int mqtt_publish_reported_config(uint32_t request_version,
                                         const char *status,
                                         const char *message)
 {
-    char reported[MQTT_JSON_BUFFER_SIZE];
-    char payload[MQTT_SHADOW_JSON_BUFFER_SIZE];
-    char metrics[128];
+    char *reported = mqtt_config_reported_payload;
+    char *payload = mqtt_shadow_update_payload;
+    char *metrics = mqtt_config_metrics_payload;
+    char ipv4_address[16];
+    char ipv4_netmask[16];
+    char ipv4_gateway[16];
+    char dns_primary[16];
+    char dns_secondary[16];
     const DeviceConfig *config = DeviceConfig_Get();
     int written;
 
-    if (mqtt_metrics_json(config->enabled_metrics, metrics, sizeof(metrics)) != 0)
+    if (mqtt_metrics_json(config->enabled_metrics,
+                          metrics,
+                          sizeof(mqtt_config_metrics_payload)) != 0)
     {
         tls_log("MQTT CONFIG: metrics JSON too large");
         return -1;
     }
 
+    mqtt_format_ipv4(config->ipv4_address,
+                     ipv4_address,
+                     sizeof(ipv4_address));
+    mqtt_format_ipv4(config->ipv4_netmask,
+                     ipv4_netmask,
+                     sizeof(ipv4_netmask));
+    mqtt_format_ipv4(config->ipv4_gateway,
+                     ipv4_gateway,
+                     sizeof(ipv4_gateway));
+    mqtt_format_ipv4(config->dns_primary,
+                     dns_primary,
+                     sizeof(dns_primary));
+    mqtt_format_ipv4(config->dns_secondary,
+                     dns_secondary,
+                     sizeof(dns_secondary));
+
     written = snprintf(reported,
-                       sizeof(reported),
+                       sizeof(mqtt_config_reported_payload),
                        "{\"deviceId\":\"%s\",\"schemaVersion\":%u,"
                        "\"requestVersion\":%lu,\"configVersion\":%lu,"
                        "\"status\":\"%s\",\"message\":\"%s\","
@@ -2514,7 +2879,14 @@ static int mqtt_publish_reported_config(uint32_t request_version,
                        "\"enabledMetrics\":%s},"
                        "\"diagnostics\":{\"logLevel\":\"%s\","
                        "\"maxMessageBytes\":%u},"
-                       "\"network\":{\"mqttKeepAliveSeconds\":%u},"
+                       "\"network\":{\"mqttKeepAliveSeconds\":%u,"
+                       "\"addressingMode\":\"%s\","
+                       "\"dhcpFallbackEnabled\":%s,"
+                       "\"ipv4Address\":\"%s\","
+                       "\"subnetMask\":\"%s\","
+                       "\"gateway\":\"%s\","
+                       "\"dnsPrimary\":\"%s\","
+                       "\"dnsSecondary\":\"%s\"},"
                        "\"firmware\":{\"allowRollback\":%s}}}",
                        DeviceIdentity_GetThingName(),
                        DEVICE_CONFIG_SCHEMA_VERSION,
@@ -2528,21 +2900,31 @@ static int mqtt_publish_reported_config(uint32_t request_version,
                        DeviceConfig_LogLevelName(config->log_level),
                        (unsigned int)config->diagnostics_max_message_bytes,
                        (unsigned int)config->mqtt_keep_alive_seconds,
+                       DeviceConfig_NetworkModeName(
+                           config->network_addressing_mode),
+                       config->network_dhcp_fallback_enabled ? "true" : "false",
+                       ipv4_address,
+                       ipv4_netmask,
+                       ipv4_gateway,
+                       dns_primary,
+                       dns_secondary,
                        config->allow_rollback ? "true" : "false");
 
-    if ((written < 0) || ((size_t)written >= sizeof(reported)))
+    if ((written < 0) ||
+        ((size_t)written >= sizeof(mqtt_config_reported_payload)))
     {
         tls_log("MQTT CONFIG: reported JSON too large");
         return -1;
     }
 
     written = snprintf(payload,
-                       sizeof(payload),
+                       sizeof(mqtt_shadow_update_payload),
                        "{\"state\":{\"reported\":%s},"
                        "\"clientToken\":\"stm32-config-%lu\"}",
                        reported,
                        (unsigned long)request_version);
-    if ((written < 0) || ((size_t)written >= sizeof(payload)))
+    if ((written < 0) ||
+        ((size_t)written >= sizeof(mqtt_shadow_update_payload)))
     {
         tls_log("SHADOW CONFIG: update JSON too large");
         return -1;
@@ -2599,7 +2981,10 @@ static int mqtt_handle_desired_config(const char *payload)
     uint32_t number;
     char device_id[DEVICE_IDENTITY_THING_NAME_MAX_LENGTH + 1U];
     char log_level[16];
+    char addressing_mode[12];
     int allow_rollback;
+    int dhcp_fallback_enabled;
+    int network_changed;
 
     if (json_get_uint32(payload, "configVersion", &request_version) != 0)
     {
@@ -2607,7 +2992,8 @@ static int mqtt_handle_desired_config(const char *payload)
     }
 
     if ((json_get_uint32(payload, "schemaVersion", &schema_version) != 0) ||
-        (schema_version != DEVICE_CONFIG_SCHEMA_VERSION))
+        (schema_version < DEVICE_CONFIG_MIN_SUPPORTED_SCHEMA_VERSION) ||
+        (schema_version > DEVICE_CONFIG_SCHEMA_VERSION))
     {
         return mqtt_reject_config(request_version, "Unsupported schemaVersion");
     }
@@ -2651,16 +3037,92 @@ static int mqtt_handle_desired_config(const char *payload)
     }
     candidate.mqtt_keep_alive_seconds = (uint16_t)number;
 
+    if (schema_version >= 2U)
+    {
+        if (json_get_string(payload,
+                            "addressingMode",
+                            addressing_mode,
+                            sizeof(addressing_mode)) != 0)
+        {
+            return mqtt_reject_config(request_version,
+                                      "Invalid network addressing mode");
+        }
+        if (strcmp(addressing_mode, "DHCP") == 0)
+        {
+            candidate.network_addressing_mode = DEVICE_NETWORK_DHCP;
+        }
+        else if (strcmp(addressing_mode, "STATIC") == 0)
+        {
+            candidate.network_addressing_mode = DEVICE_NETWORK_STATIC;
+        }
+        else
+        {
+            return mqtt_reject_config(request_version,
+                                      "Unsupported network addressing mode");
+        }
+
+        if ((json_get_bool(payload,
+                           "dhcpFallbackEnabled",
+                           &dhcp_fallback_enabled) != 0) ||
+            (mqtt_parse_ipv4_field(payload,
+                                   "ipv4Address",
+                                   candidate.ipv4_address) != 0) ||
+            (mqtt_parse_ipv4_field(payload,
+                                   "subnetMask",
+                                   candidate.ipv4_netmask) != 0) ||
+            (mqtt_parse_ipv4_field(payload,
+                                   "gateway",
+                                   candidate.ipv4_gateway) != 0) ||
+            (mqtt_parse_ipv4_field(payload,
+                                   "dnsPrimary",
+                                   candidate.dns_primary) != 0) ||
+            (mqtt_parse_ipv4_field(payload,
+                                   "dnsSecondary",
+                                   candidate.dns_secondary) != 0))
+        {
+            return mqtt_reject_config(request_version,
+                                      "Invalid IPv4 network configuration");
+        }
+        candidate.network_dhcp_fallback_enabled =
+            dhcp_fallback_enabled ? 1U : 0U;
+    }
+
     if (json_get_bool(payload, "allowRollback", &allow_rollback) != 0)
     {
         return mqtt_reject_config(request_version, "Invalid allowRollback");
     }
     candidate.allow_rollback = allow_rollback ? 1U : 0U;
 
+    network_changed =
+        (candidate.mqtt_keep_alive_seconds !=
+         DeviceConfig_Get()->mqtt_keep_alive_seconds) ||
+        (candidate.network_addressing_mode !=
+         DeviceConfig_Get()->network_addressing_mode) ||
+        (candidate.network_dhcp_fallback_enabled !=
+         DeviceConfig_Get()->network_dhcp_fallback_enabled) ||
+        (memcmp(candidate.ipv4_address,
+                DeviceConfig_Get()->ipv4_address,
+                sizeof(candidate.ipv4_address)) != 0) ||
+        (memcmp(candidate.ipv4_netmask,
+                DeviceConfig_Get()->ipv4_netmask,
+                sizeof(candidate.ipv4_netmask)) != 0) ||
+        (memcmp(candidate.ipv4_gateway,
+                DeviceConfig_Get()->ipv4_gateway,
+                sizeof(candidate.ipv4_gateway)) != 0) ||
+        (memcmp(candidate.dns_primary,
+                DeviceConfig_Get()->dns_primary,
+                sizeof(candidate.dns_primary)) != 0) ||
+        (memcmp(candidate.dns_secondary,
+                DeviceConfig_Get()->dns_secondary,
+                sizeof(candidate.dns_secondary)) != 0);
+
     result = DeviceConfig_Apply(&candidate);
     switch (result)
     {
         case DEVICE_CONFIG_APPLIED:
+        {
+            int publish_result;
+
             mqtt_last_telemetry_ms = HAL_GetTick();
             tls_logf("MQTT CONFIG: applied version=%lu telemetry=%lus",
                      (unsigned long)candidate.config_version,
@@ -2669,9 +3131,18 @@ static int mqtt_handle_desired_config(const char *payload)
                                             "CONFIG",
                                             "CONFIG_APPLIED",
                                             "Device configuration applied");
-            return mqtt_publish_reported_config(request_version,
-                                                "APPLIED",
-                                                "Configuration applied");
+            publish_result = mqtt_publish_reported_config(
+                request_version,
+                "APPLIED",
+                network_changed
+                    ? "Configuration applied; network reconnect scheduled"
+                    : "Configuration applied");
+            if ((publish_result == 0) && network_changed)
+            {
+                Net_RequestReconfigure();
+            }
+            return publish_result;
+        }
 
         case DEVICE_CONFIG_UNCHANGED:
             return mqtt_publish_reported_config(request_version,
@@ -2772,6 +3243,23 @@ static int mqtt_handle_shadow_message(const char *topic, const char *payload)
     return 0;
 }
 
+static int mqtt_privileged_command_is_fresh(const char *payload)
+{
+    struct timeval current_time;
+    uint32_t requested_at;
+    int64_t age_seconds;
+
+    if ((json_get_uint32(payload, "requestedAt", &requested_at) != 0) ||
+        (SystemTime_GetTimeval(&current_time) != 0))
+    {
+        return 0;
+    }
+
+    age_seconds = (int64_t)current_time.tv_sec - (int64_t)requested_at;
+    return (age_seconds >= 0) &&
+           (age_seconds <= PRIVILEGED_COMMAND_MAX_AGE_SECONDS);
+}
+
 static int mqtt_handle_command(const char *payload)
 {
     char command_id[96];
@@ -2804,6 +3292,84 @@ static int mqtt_handle_command(const char *payload)
     {
         tls_log("MQTT CMD: missing/invalid type");
         return mqtt_publish_command_result(command_id, "FAILED", "Invalid command type");
+    }
+
+    if ((strcmp(command_type, "lifecycle.factory_reset") == 0) ||
+        (strcmp(command_type, "lifecycle.decommission") == 0))
+    {
+        int decommission =
+            strcmp(command_type, "lifecycle.decommission") == 0;
+        int request_result;
+
+        if ((json_get_bool(payload, "confirm", &confirmed) != 0) ||
+            !confirmed ||
+            (json_get_string(payload,
+                             "hardwareUid",
+                             requested_hardware_uid,
+                             sizeof(requested_hardware_uid)) != 0) ||
+            !mqtt_privileged_command_is_fresh(payload))
+        {
+            return mqtt_publish_command_result(
+                command_id,
+                "FAILED",
+                "Lifecycle command requires confirm, hardwareUid and a fresh timestamp");
+        }
+
+        DeviceConfig_GetHardwareUid(actual_hardware_uid,
+                                    sizeof(actual_hardware_uid));
+        if (strcmp(requested_hardware_uid, actual_hardware_uid) != 0)
+        {
+            (void)IotEvents_QueueAlert(
+                IOT_ALERT_WARNING,
+                "LIFECYCLE_UID_MISMATCH",
+                "Lifecycle command hardware UID mismatch");
+            return mqtt_publish_command_result(command_id,
+                                               "FAILED",
+                                               "Lifecycle hardwareUid mismatch");
+        }
+
+        if (decommission &&
+            (CredentialStore_GetState() != CREDENTIAL_STORE_PROVISIONED))
+        {
+            return mqtt_publish_command_result(
+                command_id,
+                "FAILED",
+                "Decommissioning requires stable unique credentials");
+        }
+
+        request_result = decommission
+                             ? DeviceConfig_RequestDecommission()
+                             : DeviceConfig_RequestFactoryReset();
+        if (request_result != 0)
+        {
+            (void)IotEvents_QueueAlert(
+                IOT_ALERT_CRITICAL,
+                "LIFECYCLE_REQUEST_FAILED",
+                "Lifecycle request could not be persisted");
+            return mqtt_publish_command_result(command_id,
+                                               "FAILED",
+                                               "Lifecycle request persistence failed");
+        }
+
+        (void)IotEvents_QueueDiagnosticDurable(
+            IOT_DIAGNOSTIC_INFO,
+            "LIFECYCLE",
+            decommission ? "DECOMMISSION_REQUESTED"
+                         : "FACTORY_RESET_REQUESTED",
+            decommission ? "Secure device decommissioning was requested"
+                         : "Secure factory reset was requested");
+        mqtt_lifecycle_reset_deadline_ms =
+            HAL_GetTick() + LIFECYCLE_RESET_DELAY_MS;
+        if (mqtt_publish_command_result(
+                command_id,
+                "ACKED",
+                decommission ? "Decommission persisted; secure reset scheduled"
+                             : "Factory reset persisted; reboot scheduled") != 0)
+        {
+            return -1;
+        }
+        (void)mqtt_publish_status();
+        return 0;
     }
 
     if (strcmp(command_type, "credentials.rotate") == 0)
@@ -3603,6 +4169,15 @@ int TlsClient_MqttTest(void)
         return -1;
     }
 
+    if (mqtt_publish_capabilities() != 0)
+    {
+        tls_log("MQTT: capabilities publish failed");
+        return -1;
+    }
+
+    /* Publish the registry before schema-v2 samples. An upgraded device may
+     * introduce new metric ids and the backend must validate them against the
+     * new registry rather than a catalog cached from the previous firmware. */
     if (mqtt_publish_telemetry() != 0)
     {
         tls_log("MQTT: initial telemetry failed");
@@ -3729,6 +4304,13 @@ int TlsClient_MqttProcess(void)
             mqtt_ready = 0;
             return -1;
         }
+        if ((mqtt_capability_signature() !=
+             mqtt_last_capability_signature) &&
+            (mqtt_publish_capabilities() != 0))
+        {
+            mqtt_ready = 0;
+            return -1;
+        }
     }
 
     if ((now - mqtt_last_ping_ms) >= ping_interval_ms)
@@ -3752,6 +4334,13 @@ int TlsClient_MqttIsReady(void)
 int TlsClient_PublishStatus(void)
 {
     return (tls_connected && mqtt_ready) ? mqtt_publish_status() : -1;
+}
+
+int TlsClient_LifecycleResetIsDue(void)
+{
+    return (mqtt_lifecycle_reset_deadline_ms != 0U) &&
+           ((int32_t)(HAL_GetTick() -
+                      mqtt_lifecycle_reset_deadline_ms) >= 0);
 }
 
 void TlsClient_Disconnect(void)
