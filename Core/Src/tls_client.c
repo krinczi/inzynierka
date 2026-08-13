@@ -91,6 +91,8 @@
 #define INTERACTION_DURATION_MAX_SECONDS      1800U
 #define INTERACTION_TELEMETRY_INTERVAL_MS     5000U
 #define INTERACTION_DIAGNOSTIC_INTERVAL_MS    10000U
+#define OFFLINE_TELEMETRY_BACKOFF_THRESHOLD      4U
+#define OFFLINE_TELEMETRY_MIN_INTERVAL_MS    300000U
 #define PROVISIONING_MAX_FAILED_ATTEMPTS          5U
 #define PROVISIONING_MAX_RETRY_DELAY_MS        60000U
 #define LIFECYCLE_RESET_DELAY_MS                2000U
@@ -440,7 +442,7 @@ int TlsClient_Init(void)
     FlashStagingResult staging_result;
 
     tls_log("TLS: init");
-    tls_log("TLS BUILD: fleet_auto_v3 credential_rotation_v2 lifecycle_v1 shadow_v3 network_config_v1 sensor_registry_v1 rtc_sntp_v1 iwdg_mpu_v1 durable_events_v2 full_ota_v1");
+    tls_log("TLS BUILD: fleet_auto_v3 credential_rotation_v2 lifecycle_v1 shadow_v3 network_config_v1 sensor_registry_v1 rtc_sntp_v1 iwdg_mpu_v1 durable_outbox_v3 topic_contract_v1 full_ota_v1");
     tls_connected = 0;
     tls_ctx_ready = 0;
     mqtt_interaction_active = 0U;
@@ -493,6 +495,11 @@ int TlsClient_Init(void)
         (void)DeviceConfig_SetProvisioned();
     }
     IotEvents_Init();
+    tls_logf("OUTBOX: events=%lu telemetry=%lu commandHistory=%lu failures=%lu",
+             (unsigned long)IotEvents_PendingCount(),
+             (unsigned long)IotEvents_TelemetryPendingCount(),
+             (unsigned long)IotEvents_CommandHistoryCount(),
+             (unsigned long)IotEvents_PersistenceFailureCount());
     if (SensorManager_Init() != 0)
     {
         (void)IotEvents_QueueAlert(
@@ -1876,13 +1883,14 @@ static void mqtt_queue_interaction_diagnostic(const char *code,
 
 static int mqtt_publish_status(void)
 {
-    char payload[896];
+    char payload[1152];
     char hardware_uid[DEVICE_HARDWARE_UID_HEX_LENGTH + 1U];
     const DeviceConfig *config = DeviceConfig_Get();
     CredentialStoreState credential_state = CredentialStore_GetState();
     const CredentialStoreData *credentials = CredentialStore_Get();
     const char *thing_name = DeviceIdentity_GetThingName();
     uint32_t now = HAL_GetTick();
+    uint32_t image_version = OtaManager_GetInstalledImageVersion();
     uint32_t remaining_seconds = mqtt_interaction_remaining_seconds(now);
     int written;
 
@@ -1891,7 +1899,8 @@ static int mqtt_publish_status(void)
                        sizeof(payload),
                        "{\"deviceId\":\"%s\",\"schemaVersion\":1,"
                        "\"state\":\"online\",\"uptimeMs\":%lu,"
-                       "\"firmwareVersion\":\"%s\","
+                       "\"firmwareVersion\":\"%lu\","
+                       "\"appVersion\":\"%s\","
                        "\"interaction\":{\"active\":%s,"
                        "\"remainingSeconds\":%lu,"
                        "\"telemetryIntervalSeconds\":%lu,"
@@ -1907,9 +1916,15 @@ static int mqtt_publish_status(void)
                        "\"activeMode\":\"%s\"},"
                        "\"eventBuffer\":{\"capacity\":%u,"
                        "\"pending\":%u,\"durablePending\":%u,"
-                       "\"dropped\":%lu,\"persistenceFailures\":%lu}}",
+                       "\"dropped\":%lu,\"persistenceFailures\":%lu},"
+                       "\"telemetryOutbox\":{\"capacity\":%u,"
+                       "\"pending\":%u,\"dropped\":%lu},"
+                       "\"commandHistory\":{\"capacity\":%u,"
+                       "\"entries\":%u},"
+                       "\"topicContract\":\"%s\"}",
                        DeviceIdentity_GetThingName(),
                        (unsigned long)now,
+                       (unsigned long)image_version,
                        STM32_APP_FIRMWARE_VERSION,
                        mqtt_interaction_active ? "true" : "false",
                        (unsigned long)remaining_seconds,
@@ -1929,7 +1944,13 @@ static int mqtt_publish_status(void)
                        (unsigned int)IotEvents_PendingCount(),
                        (unsigned int)IotEvents_DurablePendingCount(),
                        (unsigned long)IotEvents_DroppedCount(),
-                       (unsigned long)IotEvents_PersistenceFailureCount());
+                       (unsigned long)IotEvents_PersistenceFailureCount(),
+                       (unsigned int)IOT_TELEMETRY_QUEUE_CAPACITY,
+                       (unsigned int)IotEvents_TelemetryPendingCount(),
+                       (unsigned long)IotEvents_TelemetryDroppedCount(),
+                       (unsigned int)IOT_COMMAND_HISTORY_CAPACITY,
+                       (unsigned int)IotEvents_CommandHistoryCount(),
+                       MQTT_TOPIC_CONTRACT_VERSION);
 
     if ((written < 0) || ((size_t)written >= sizeof(payload)))
     {
@@ -2291,16 +2312,19 @@ static uint32_t mqtt_capability_signature(void)
     return signature;
 }
 
-static int mqtt_publish_telemetry(void)
+static int mqtt_capture_telemetry(IotTelemetrySample *sample)
 {
-    char payload[MQTT_JSON_BUFFER_SIZE];
     const DeviceConfig *config = DeviceConfig_Get();
     SensorMeasurement measurements[SENSOR_MANAGER_MAX_SENSORS];
-    uint32_t measured_mask = 0U;
     size_t measurement_count = 0U;
     size_t index;
-    uint32_t uptime_ms;
-    size_t length = 0U;
+    struct timeval timestamp;
+
+    if (sample == NULL)
+    {
+        return -1;
+    }
+    memset(sample, 0, sizeof(*sample));
 
     if (SensorManager_ReadAll(config->enabled_metrics,
                               measurements,
@@ -2312,48 +2336,121 @@ static int mqtt_publish_telemetry(void)
             "SENSORS",
             "SENSOR_READ_FAILED",
             "No valid hardware measurement is available; telemetry was skipped");
-        return 0;
+        return -1;
     }
 
-    uptime_ms = HAL_GetTick();
+    sample->sampled_uptime_ms = HAL_GetTick();
+    sample->config_version = config->config_version;
+    sample->enabled_metrics = config->enabled_metrics;
+    sample->interaction_mode = mqtt_interaction_active ? 1U : 0U;
+    sample->measurement_count = (uint8_t)measurement_count;
+    if (SystemTime_GetTimeval(&timestamp) == 0)
+    {
+        sample->sampled_unix_seconds = (uint32_t)timestamp.tv_sec;
+    }
+
+    for (index = 0U; index < measurement_count; index++)
+    {
+        sample->measurements[index].slot = measurements[index].slot;
+        sample->measurements[index].scale10 = measurements[index].scale10;
+        sample->measurements[index].quality =
+            (uint8_t)measurements[index].quality;
+        sample->measurements[index].value = measurements[index].value;
+    }
+    return IotEvents_AssignTelemetryId(sample);
+}
+
+static int mqtt_publish_telemetry_sample(const IotTelemetrySample *sample,
+                                         int replayed)
+{
+    char payload[MQTT_JSON_BUFFER_SIZE];
+    uint32_t measured_mask = 0U;
+    size_t index;
+    size_t serialized_count = 0U;
+    size_t length = 0U;
+
+    if ((sample == NULL) || (sample->measurement_count == 0U) ||
+        (sample->measurement_count > IOT_TELEMETRY_MAX_MEASUREMENTS))
+    {
+        return -1;
+    }
+
     if (mqtt_json_append(payload,
                          sizeof(payload),
                          &length,
-                         "{\"deviceId\":\"%s\",\"schemaVersion\":2,"
-                         "\"configVersion\":%lu,\"uptimeMs\":%lu,"
-                         "\"measurements\":[",
+                         "{\"deviceId\":\"%s\",\"schemaVersion\":3,"
+                         "\"sampleId\":\"%s\",\"replayed\":%s,"
+                         "\"configVersion\":%lu,\"uptimeMs\":%lu",
                          DeviceIdentity_GetThingName(),
-                         (unsigned long)config->config_version,
-                         (unsigned long)uptime_ms) != 0)
+                         sample->sample_id,
+                         replayed ? "true" : "false",
+                         (unsigned long)sample->config_version,
+                         (unsigned long)sample->sampled_uptime_ms) != 0)
     {
         tls_log("MQTT: telemetry JSON too large");
         return -1;
     }
 
-    for (index = 0U; index < measurement_count; index++)
+    if ((sample->sampled_unix_seconds != 0U) &&
+        (mqtt_json_append(payload,
+                          sizeof(payload),
+                          &length,
+                          ",\"ts\":%lu",
+                          (unsigned long)sample->sampled_unix_seconds) != 0))
     {
+        return -1;
+    }
+    if (mqtt_json_append(payload,
+                         sizeof(payload),
+                         &length,
+                         ",\"measurements\":[") != 0)
+    {
+        return -1;
+    }
+
+    for (index = 0U; index < sample->measurement_count; index++)
+    {
+        SensorMeasurement measurement;
         const SensorCapability *capability =
-            SensorManager_CapabilityForSlot(measurements[index].slot);
+            SensorManager_CapabilityForSlot(sample->measurements[index].slot);
         char value[48];
 
-        if ((capability == NULL) ||
-            (mqtt_sensor_value_json(&measurements[index], value, sizeof(value)) != 0) ||
+        if (capability == NULL)
+        {
+            continue;
+        }
+        memset(&measurement, 0, sizeof(measurement));
+        measurement.slot = sample->measurements[index].slot;
+        measurement.scale10 = sample->measurements[index].scale10;
+        measurement.quality =
+            (SensorQuality)sample->measurements[index].quality;
+        measurement.value = sample->measurements[index].value;
+        measurement.sampled_at_uptime_ms = sample->sampled_uptime_ms;
+
+        if ((mqtt_sensor_value_json(&measurement, value, sizeof(value)) != 0) ||
             (mqtt_json_append(
                  payload,
                  sizeof(payload),
                  &length,
                  "%s{\"slot\":%u,\"metric\":\"%s\",\"value\":%s,"
                  "\"unit\":\"%s\",\"quality\":\"%s\"}",
-                 index == 0U ? "" : ",",
-                 (unsigned int)measurements[index].slot,
+                 serialized_count == 0U ? "" : ",",
+                 (unsigned int)measurement.slot,
                  capability->definition.metric_id,
                  value,
                  capability->definition.unit,
-                 SensorManager_QualityName(measurements[index].quality)) != 0))
+                 SensorManager_QualityName(measurement.quality)) != 0))
         {
             return -1;
         }
-        measured_mask |= (1UL << measurements[index].slot);
+        measured_mask |= (1UL << measurement.slot);
+        serialized_count++;
+    }
+
+    if (serialized_count == 0U)
+    {
+        tls_log("MQTT: stored telemetry has no registered metric slots");
+        return -1;
     }
 
     if (mqtt_json_append(payload, sizeof(payload), &length,
@@ -2369,7 +2466,7 @@ static int mqtt_publish_telemetry(void)
             const SensorCapability *capability =
                 SensorManager_CapabilityForSlot(slot);
             if ((capability == NULL) ||
-                ((config->enabled_metrics & (1UL << slot)) == 0U) ||
+                ((sample->enabled_metrics & (1UL << slot)) == 0U) ||
                 ((measured_mask & (1UL << slot)) != 0U))
             {
                 continue;
@@ -2393,13 +2490,21 @@ static int mqtt_publish_telemetry(void)
     }
 
     /* Keep the original top-level fields for older consumers. */
-    for (index = 0U; index < measurement_count; index++)
+    for (index = 0U; index < sample->measurement_count; index++)
     {
+        SensorMeasurement measurement;
         const SensorCapability *capability =
-            SensorManager_CapabilityForSlot(measurements[index].slot);
+            SensorManager_CapabilityForSlot(sample->measurements[index].slot);
         char value[48];
-        if ((capability != NULL) && (measurements[index].slot < 5U) &&
-            (mqtt_sensor_value_json(&measurements[index], value, sizeof(value)) == 0) &&
+
+        memset(&measurement, 0, sizeof(measurement));
+        measurement.slot = sample->measurements[index].slot;
+        measurement.scale10 = sample->measurements[index].scale10;
+        measurement.quality =
+            (SensorQuality)sample->measurements[index].quality;
+        measurement.value = sample->measurements[index].value;
+        if ((capability != NULL) && (measurement.slot < 5U) &&
+            (mqtt_sensor_value_json(&measurement, value, sizeof(value)) == 0) &&
             (mqtt_json_append(payload,
                               sizeof(payload),
                               &length,
@@ -2416,13 +2521,55 @@ static int mqtt_publish_telemetry(void)
                          &length,
                          ",\"measurementStatus\":\"%s\","
                          "\"interactionMode\":%s}",
-                         measurement_count > 0U ? "OK" : "UNAVAILABLE",
-                         mqtt_interaction_active ? "true" : "false") != 0)
+                         serialized_count > 0U ? "OK" : "UNAVAILABLE",
+                         sample->interaction_mode ? "true" : "false") != 0)
     {
         return -1;
     }
 
-    return mqtt_publish_json(MqttTopics_Get()->telemetry, payload);
+    return replayed
+               ? mqtt_publish_json_qos1(MqttTopics_Get()->telemetry, payload)
+               : mqtt_publish_json(MqttTopics_Get()->telemetry, payload);
+}
+
+static int mqtt_publish_telemetry(void)
+{
+    IotTelemetrySample sample;
+    int result;
+
+    if (mqtt_capture_telemetry(&sample) != 0)
+    {
+        return 0;
+    }
+    result = mqtt_publish_telemetry_sample(&sample, 0);
+    if ((result != 0) && (IotEvents_QueueTelemetry(&sample) != 0))
+    {
+        tls_log("MQTT: failed sample could not be persisted");
+    }
+    return result;
+}
+
+static int mqtt_flush_queued_telemetry(void)
+{
+    IotTelemetrySample sample;
+
+    if (!IotEvents_PeekTelemetry(&sample))
+    {
+        return 0;
+    }
+    if (mqtt_publish_telemetry_sample(&sample, 1) != 0)
+    {
+        return -1;
+    }
+    if (IotEvents_PopTelemetryIfMatch(sample.sample_id) != 0)
+    {
+        tls_log("MQTT: telemetry ACK could not be persisted");
+        return -1;
+    }
+    tls_logf("MQTT: replayed telemetry sample=%s remaining=%lu",
+             sample.sample_id,
+             (unsigned long)IotEvents_TelemetryPendingCount());
+    return 0;
 }
 
 static int mqtt_publish_queued_event(const IotEventMessage *event)
@@ -2746,15 +2893,45 @@ static int device_log_level_from_name(const char *name, uint8_t *level)
     return -1;
 }
 
-static int mqtt_publish_command_result(const char *command_id,
-                                       const char *status,
-                                       const char *message)
+static int mqtt_send_command_result(const char *command_id,
+                                    const char *status,
+                                    const char *message,
+                                    int remember)
 {
     char payload[MQTT_JSON_BUFFER_SIZE];
+    IotCommandResult cached_result;
+    struct timeval timestamp;
     int result;
-    int written = snprintf(payload,
+    int persistence_result = 0;
+    uint32_t executed_unix_seconds = 0U;
+    int written;
+
+    memset(&cached_result, 0, sizeof(cached_result));
+    if (SystemTime_GetTimeval(&timestamp) == 0)
+    {
+        executed_unix_seconds = (uint32_t)timestamp.tv_sec;
+    }
+
+    if (executed_unix_seconds != 0U)
+    {
+        written = snprintf(payload,
                            sizeof(payload),
-                           "{\"deviceId\":\"%s\",\"schemaVersion\":1,"
+                           "{\"deviceId\":\"%s\",\"schemaVersion\":2,"
+                           "\"commandId\":\"%s\",\"status\":\"%s\","
+                           "\"message\":\"%s\",\"uptimeMs\":%lu,"
+                           "\"executedAt\":%lu}",
+                           DeviceIdentity_GetThingName(),
+                           command_id,
+                           status,
+                           message,
+                           (unsigned long)HAL_GetTick(),
+                           (unsigned long)executed_unix_seconds);
+    }
+    else
+    {
+        written = snprintf(payload,
+                           sizeof(payload),
+                           "{\"deviceId\":\"%s\",\"schemaVersion\":2,"
                            "\"commandId\":\"%s\",\"status\":\"%s\","
                            "\"message\":\"%s\",\"uptimeMs\":%lu}",
                            DeviceIdentity_GetThingName(),
@@ -2762,6 +2939,7 @@ static int mqtt_publish_command_result(const char *command_id,
                            status,
                            message,
                            (unsigned long)HAL_GetTick());
+    }
 
     if ((written < 0) || ((size_t)written >= sizeof(payload)))
     {
@@ -2769,23 +2947,55 @@ static int mqtt_publish_command_result(const char *command_id,
         return -1;
     }
 
-    result = mqtt_publish_json(MqttTopics_Get()->command_result, payload);
-    if (result == 0)
+    if (remember && (strcmp(command_id, "unknown") != 0))
     {
-        (void)snprintf(mqtt_last_command_id,
-                       sizeof(mqtt_last_command_id),
+        (void)snprintf(cached_result.command_id,
+                       sizeof(cached_result.command_id),
                        "%s",
                        command_id);
-        (void)snprintf(mqtt_last_command_status,
-                       sizeof(mqtt_last_command_status),
+        (void)snprintf(cached_result.status,
+                       sizeof(cached_result.status),
                        "%s",
                        status);
-        (void)snprintf(mqtt_last_command_message,
-                       sizeof(mqtt_last_command_message),
+        (void)snprintf(cached_result.message,
+                       sizeof(cached_result.message),
                        "%s",
                        message);
+        cached_result.executed_uptime_ms = HAL_GetTick();
+        cached_result.executed_unix_seconds = executed_unix_seconds;
+        persistence_result = IotEvents_RememberCommandResult(&cached_result);
+        if (persistence_result != 0)
+        {
+            tls_log("MQTT CMD: result idempotency journal write failed");
+            (void)IotEvents_QueueAlert(
+                IOT_ALERT_CRITICAL,
+                "COMMAND_JOURNAL_FAILED",
+                "Command result could not be persisted for replay protection");
+        }
     }
-    return result;
+
+    (void)snprintf(mqtt_last_command_id,
+                   sizeof(mqtt_last_command_id),
+                   "%s",
+                   command_id);
+    (void)snprintf(mqtt_last_command_status,
+                   sizeof(mqtt_last_command_status),
+                   "%s",
+                   status);
+    (void)snprintf(mqtt_last_command_message,
+                   sizeof(mqtt_last_command_message),
+                   "%s",
+                   message);
+
+    result = mqtt_publish_json(MqttTopics_Get()->command_result, payload);
+    return (result != 0) ? result : persistence_result;
+}
+
+static int mqtt_publish_command_result(const char *command_id,
+                                       const char *status,
+                                       const char *message)
+{
+    return mqtt_send_command_result(command_id, status, message, 1);
 }
 
 static void mqtt_format_ipv4(const uint8_t address[4],
@@ -3262,6 +3472,7 @@ static int mqtt_privileged_command_is_fresh(const char *payload)
 
 static int mqtt_handle_command(const char *payload)
 {
+    IotCommandResult persisted_result;
     char command_id[96];
     char command_type[48];
     char activation_id[64];
@@ -3278,14 +3489,25 @@ static int mqtt_handle_command(const char *payload)
         return mqtt_publish_command_result("unknown", "FAILED", "Invalid commandId");
     }
 
+    if (IotEvents_FindCommandResult(command_id, &persisted_result))
+    {
+        tls_logf("MQTT CMD: persistent duplicate commandId=%s, replaying result",
+                 command_id);
+        return mqtt_send_command_result(command_id,
+                                        persisted_result.status,
+                                        persisted_result.message,
+                                        0);
+    }
+
     if ((mqtt_last_command_id[0] != '\0') &&
         (strcmp(command_id, mqtt_last_command_id) == 0))
     {
         tls_logf("MQTT CMD: duplicate commandId=%s, replaying result",
                  command_id);
-        return mqtt_publish_command_result(command_id,
-                                           mqtt_last_command_status,
-                                           mqtt_last_command_message);
+        return mqtt_send_command_result(command_id,
+                                        mqtt_last_command_status,
+                                        mqtt_last_command_message,
+                                        0);
     }
 
     if (json_get_string(payload, "type", command_type, sizeof(command_type)) != 0)
@@ -4281,6 +4503,15 @@ int TlsClient_MqttProcess(void)
         return -1;
     }
 
+    /* Replay at most one stored sample per service step. QoS 1 plus the
+     * stable sampleId makes a lost PUBACK safe: the backend deduplicates a
+     * possible retransmission before the Flash ACK is appended. */
+    if (mqtt_flush_queued_telemetry() != 0)
+    {
+        mqtt_ready = 0;
+        return -1;
+    }
+
     if (mqtt_flush_queued_events() != 0)
     {
         mqtt_ready = 0;
@@ -4324,6 +4555,48 @@ int TlsClient_MqttProcess(void)
     }
 
     return 0;
+}
+
+void TlsClient_OfflineTelemetryProcess(uint32_t now_ms)
+{
+    const DeviceConfig *config;
+    uint32_t interval_ms;
+    IotTelemetrySample sample;
+
+    if (mqtt_ready || (MqttTopics_Get() == NULL))
+    {
+        return;
+    }
+
+    config = DeviceConfig_Get();
+    interval_ms = config->telemetry_frequency_seconds * 1000U;
+    /* Preserve high resolution for a short outage, then coalesce samples to
+     * protect internal-Flash endurance during a long disconnection. */
+    if ((IotEvents_TelemetryPendingCount() >=
+         OFFLINE_TELEMETRY_BACKOFF_THRESHOLD) &&
+        (interval_ms < OFFLINE_TELEMETRY_MIN_INTERVAL_MS))
+    {
+        interval_ms = OFFLINE_TELEMETRY_MIN_INTERVAL_MS;
+    }
+    if ((now_ms - mqtt_last_telemetry_ms) < interval_ms)
+    {
+        return;
+    }
+    mqtt_last_telemetry_ms = now_ms;
+
+    if (mqtt_capture_telemetry(&sample) != 0)
+    {
+        return;
+    }
+    if (IotEvents_QueueTelemetry(&sample) != 0)
+    {
+        tls_log("MQTT: offline telemetry queue write failed");
+        return;
+    }
+    tls_logf("MQTT: telemetry stored offline sample=%s pending=%lu dropped=%lu",
+             sample.sample_id,
+             (unsigned long)IotEvents_TelemetryPendingCount(),
+             (unsigned long)IotEvents_TelemetryDroppedCount());
 }
 
 int TlsClient_MqttIsReady(void)

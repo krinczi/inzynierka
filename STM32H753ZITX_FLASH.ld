@@ -75,9 +75,9 @@ __iot_event_journal_end__ = ORIGIN(FLASH_EVENT_JOURNAL) + LENGTH(FLASH_EVENT_JOU
 ASSERT(ORIGIN(FLASH_APP_HEADER) + LENGTH(FLASH_APP_HEADER) == ORIGIN(FLASH),
        "OTA image header must end at the application vector")
 ASSERT(ORIGIN(FLASH) + LENGTH(FLASH) <= ORIGIN(FLASH_EVENT_JOURNAL),
-       "Application overlaps persistent event journal")
+       "Application overlaps persistent operational outbox")
 ASSERT(ORIGIN(FLASH_EVENT_JOURNAL) + LENGTH(FLASH_EVENT_JOURNAL) <= ORIGIN(FLASH_CREDENTIALS_A),
-       "Persistent event journal overlaps credential slot A")
+       "Persistent operational outbox overlaps credential slot A")
 ASSERT(ORIGIN(FLASH) + LENGTH(FLASH) <= ORIGIN(FLASH_CREDENTIALS_A),
        "Application overlaps credential slot A")
 ASSERT(ORIGIN(FLASH_CREDENTIALS_A) + LENGTH(FLASH_CREDENTIALS_A) <= ORIGIN(FLASH_CREDENTIALS_B),

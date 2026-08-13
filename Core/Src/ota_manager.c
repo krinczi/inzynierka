@@ -195,6 +195,18 @@ int OtaManager_GetReadyInstallJob(OtaPendingJob *job)
     return 1;
 }
 
+uint32_t OtaManager_GetInstalledImageVersion(void)
+{
+    OtaControlRecord record;
+
+    if ((OtaControl_LoadLatest(&record) == OTA_CONTROL_OK) &&
+        OtaControl_ImageDescriptorIsValid(&record.primary))
+    {
+        return record.primary.image_version;
+    }
+    return 0U;
+}
+
 int OtaManager_UpdateJobExecutionVersion(uint32_t execution_version)
 {
     OtaControlRecord record;

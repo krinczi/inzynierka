@@ -10,6 +10,12 @@
 #define IOT_EVENT_CODE_CAPACITY        40U
 #define IOT_EVENT_SOURCE_CAPACITY      24U
 #define IOT_EVENT_MESSAGE_CAPACITY     385U
+#define IOT_TELEMETRY_QUEUE_CAPACITY    16U
+#define IOT_TELEMETRY_MAX_MEASUREMENTS  32U
+#define IOT_COMMAND_HISTORY_CAPACITY      8U
+#define IOT_COMMAND_ID_CAPACITY          96U
+#define IOT_COMMAND_STATUS_CAPACITY      16U
+#define IOT_COMMAND_MESSAGE_CAPACITY    128U
 
 #define IOT_EVENT_FLAG_DURABLE         0x01U
 
@@ -60,6 +66,43 @@ typedef struct
     char message[IOT_EVENT_MESSAGE_CAPACITY];
 } IotEventMessage;
 
+/*
+ * Compact, topic-independent representation used by the persistent outbox.
+ * Metric ids and units are resolved from the stable sensor slot registry when
+ * a stored sample is replayed. This keeps a complete 32-metric sample below a
+ * single 1024-byte Flash journal record.
+ */
+typedef struct __attribute__((packed))
+{
+    uint8_t slot;
+    int8_t scale10;
+    uint8_t quality;
+    uint8_t reserved;
+    int64_t value;
+} IotTelemetryMeasurement;
+
+typedef struct
+{
+    char sample_id[IOT_EVENT_ID_CAPACITY];
+    uint32_t sampled_uptime_ms;
+    uint32_t sampled_unix_seconds;
+    uint32_t config_version;
+    uint32_t enabled_metrics;
+    uint8_t measurement_count;
+    uint8_t interaction_mode;
+    uint16_t reserved;
+    IotTelemetryMeasurement measurements[IOT_TELEMETRY_MAX_MEASUREMENTS];
+} IotTelemetrySample;
+
+typedef struct
+{
+    char command_id[IOT_COMMAND_ID_CAPACITY];
+    char status[IOT_COMMAND_STATUS_CAPACITY];
+    char message[IOT_COMMAND_MESSAGE_CAPACITY];
+    uint32_t executed_uptime_ms;
+    uint32_t executed_unix_seconds;
+} IotCommandResult;
+
 void IotEvents_Init(void);
 /* Service lifecycle operation. Erases the durable local event journal. */
 int IotEvents_FactoryReset(void);
@@ -84,6 +127,21 @@ int IotEvents_PeekCopy(IotEventMessage *event);
  * Returns 0 when removed or not matched, -1 on persistent journal failure.
  */
 int IotEvents_PopIfMatch(const char *message_id);
+
+/* Persistent bounded telemetry store-and-forward queue. */
+int IotEvents_AssignTelemetryId(IotTelemetrySample *sample);
+int IotEvents_QueueTelemetry(const IotTelemetrySample *sample);
+int IotEvents_PeekTelemetry(IotTelemetrySample *sample);
+int IotEvents_PopTelemetryIfMatch(const char *sample_id);
+size_t IotEvents_TelemetryPendingCount(void);
+uint32_t IotEvents_TelemetryDroppedCount(void);
+
+/* Persistent replay cache protecting command execution across resets. */
+int IotEvents_RememberCommandResult(const IotCommandResult *result);
+int IotEvents_FindCommandResult(const char *command_id,
+                                IotCommandResult *result);
+size_t IotEvents_CommandHistoryCount(void);
+
 size_t IotEvents_PendingCount(void);
 size_t IotEvents_DurablePendingCount(void);
 uint32_t IotEvents_DroppedCount(void);

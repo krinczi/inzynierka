@@ -42,7 +42,7 @@ w repozytorium aplikacji w `infra/aws/fleet-provisioning/`.
 | AWS → STM | `$aws/provisioning-templates/stm32h753-fleet-template/provision/json/rejected` |
 
 Odpowiedzi są subskrybowane przed wysłaniem żądania. Po zakończeniu provisioning
-firmware wraca do tematów `iot/dev/devices/{deviceId}/...` i AWS Jobs.
+firmware wraca do wersjonowanych tematów `iot/v1/dev/devices/{deviceId}/...` i AWS Jobs.
 
 ## Maszyna stanów i odporność
 
@@ -73,7 +73,7 @@ chwilowe błędy nie tworzą nieograniczonej pętli wywołań AWS.
 | --- | ---: | ---: | --- |
 | Bootloader | `0x08000000` | 128 KiB | weryfikacja, instalacja i rollback OTA |
 | Primary firmware slot | `0x08020000` | 512 KiB | aktywny podpisany obraz |
-| Event journal | `0x080A0000` | 128 KiB | trwałe alarmy i zdarzenia krytyczne |
+| Durable outbox | `0x080A0000` | 128 KiB | alarmy, diagnostyka, telemetria offline i historia komend |
 | Credential slot A | `0x080C0000` | 128 KiB | aktywny lub zapasowy rekord |
 | Credential slot B | `0x080E0000` | 128 KiB | aktywny lub zapasowy rekord |
 | OTA control journal | `0x08100000` | 128 KiB | stan instalacji i anti-rollback |

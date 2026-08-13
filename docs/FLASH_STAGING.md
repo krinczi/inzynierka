@@ -13,7 +13,7 @@ STM32H753ZI provides 2 MiB of internal Flash split into two 1 MiB banks with
 | --- | ---: | --- |
 | `0x08000000-0x0801FFFF` | 128 KiB | Bootloader (Bank 1) |
 | `0x08020000-0x0809FFFF` | 512 KiB | Primary signed-image slot |
-| `0x080A0000-0x080BFFFF` | 128 KiB | Durable critical-event journal |
+| `0x080A0000-0x080BFFFF` | 128 KiB | Durable outbox: events, offline telemetry, command history |
 | `0x080C0000-0x080DFFFF` | 128 KiB | Credential log A (Bank 1) |
 | `0x080E0000-0x080FFFFF` | 128 KiB | Credential log B (Bank 1) |
 | `0x08100000-0x0811FFFF` | 128 KiB | OTA control journal (Bank 2) |

@@ -1022,6 +1022,10 @@ static void StartMqttServiceTask(void *argument)
         uint32_t now = HAL_GetTick();
         SystemWatchdog_Heartbeat(SYSTEM_WATCHDOG_MQTT);
         OtaManager_Process(now);
+        if (tls_initialized != 0U)
+        {
+            TlsClient_OfflineTelemetryProcess(now);
+        }
 
         if (TlsClient_LifecycleResetIsDue())
         {

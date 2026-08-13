@@ -43,7 +43,7 @@ STM32H753ZI has two 1 MiB Flash banks with 128 KiB sectors.
 | --- | ---: | --- |
 | `0x08000000-0x0801FFFF` | 128 KiB | Bootloader |
 | `0x08020000-0x0809FFFF` | 512 KiB | Primary signed-image slot |
-| `0x080A0000-0x080BFFFF` | 128 KiB | Durable critical-event journal |
+| `0x080A0000-0x080BFFFF` | 128 KiB | Durable outbox: events, offline telemetry, command history |
 | `0x080C0000-0x080DFFFF` | 128 KiB | Credential slot A |
 | `0x080E0000-0x080FFFFF` | 128 KiB | Credential slot B |
 | `0x08100000-0x0811FFFF` | 128 KiB | Append-only OTA control journal |

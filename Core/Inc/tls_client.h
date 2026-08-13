@@ -17,6 +17,8 @@ int TlsClient_Write(const uint8_t *data, size_t len);
 int TlsClient_Read(uint8_t *data, size_t len, uint32_t timeout_ms);
 int TlsClient_MqttTest(void);
 int TlsClient_MqttProcess(void);
+/* Captures bounded telemetry while MQTT is unavailable. */
+void TlsClient_OfflineTelemetryProcess(uint32_t now_ms);
 int TlsClient_MqttIsReady(void);
 int TlsClient_PublishStatus(void);
 int TlsClient_LifecycleResetIsDue(void);

@@ -7,6 +7,10 @@
 #define MQTT_ENV "dev"
 #endif
 
+#ifndef MQTT_TOPIC_CONTRACT_VERSION
+#define MQTT_TOPIC_CONTRACT_VERSION "v1"
+#endif
+
 #define MQTT_TOPICS_MAX_LENGTH 256U
 
 typedef struct

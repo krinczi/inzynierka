@@ -33,6 +33,8 @@ void OtaManager_Process(uint32_t now_ms);
 
 int OtaManager_GetPendingJob(OtaPendingJob *job);
 int OtaManager_GetReadyInstallJob(OtaPendingJob *job);
+/* Returns the authenticated image version currently installed in primary. */
+uint32_t OtaManager_GetInstalledImageVersion(void);
 /*
  * Persists the execution version returned by AWS for the accepted REBOOTING
  * update. The terminal report after reset must use this newer version.

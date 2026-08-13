@@ -14,7 +14,8 @@ static int MqttTopics_Build(char *output,
 {
     int written = snprintf(output,
                            output_size,
-                           "iot/%s/devices/%s/%s",
+                           "iot/%s/%s/devices/%s/%s",
+                           MQTT_TOPIC_CONTRACT_VERSION,
                            environment,
                            device_id,
                            suffix);

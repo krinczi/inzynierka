@@ -22,9 +22,13 @@
 #define IOT_EVENT_JOURNAL_SECTOR       FLASH_SECTOR_5
 #define IOT_EVENT_JOURNAL_RECORD_SIZE           1024U
 #define IOT_EVENT_JOURNAL_MAGIC          0x45564A31UL
-#define IOT_EVENT_JOURNAL_VERSION                 1U
+#define IOT_EVENT_JOURNAL_LEGACY_VERSION          1U
+#define IOT_EVENT_JOURNAL_VERSION                 2U
 #define IOT_EVENT_JOURNAL_KIND_PUT                1U
 #define IOT_EVENT_JOURNAL_KIND_ACK                2U
+#define IOT_EVENT_JOURNAL_KIND_TELEMETRY_PUT      3U
+#define IOT_EVENT_JOURNAL_KIND_TELEMETRY_ACK      4U
+#define IOT_EVENT_JOURNAL_KIND_COMMAND_PUT        5U
 #define IOT_EVENT_JOURNAL_RECORD_COUNT \
     (IOT_EVENT_JOURNAL_SIZE / IOT_EVENT_JOURNAL_RECORD_SIZE)
 #define IOT_EVENT_FLASHWORD_SIZE                  32U
@@ -50,21 +54,48 @@ typedef struct
                      (sizeof(uint32_t) + sizeof(uint16_t) +
                       sizeof(uint16_t) + sizeof(uint32_t) +
                       sizeof(IotEventMessage) + sizeof(uint32_t))];
-} IotEventJournalRecord;
+} IotEventLegacyJournalRecord;
 
-_Static_assert(sizeof(IotEventJournalRecord) == IOT_EVENT_JOURNAL_RECORD_SIZE,
-               "Persistent event journal record must be exactly 1024 bytes");
+typedef struct
+{
+    uint32_t magic;
+    uint16_t version;
+    uint16_t kind;
+    uint32_t sequence;
+    uint16_t payload_length;
+    uint16_t reserved_header;
+    uint8_t payload[IOT_EVENT_JOURNAL_RECORD_SIZE - 20U];
+    uint32_t crc32;
+} IotOutboxJournalRecord;
+
+_Static_assert(sizeof(IotEventLegacyJournalRecord) == IOT_EVENT_JOURNAL_RECORD_SIZE,
+               "Legacy event journal record must remain exactly 1024 bytes");
+_Static_assert(sizeof(IotOutboxJournalRecord) == IOT_EVENT_JOURNAL_RECORD_SIZE,
+               "Persistent outbox journal record must be exactly 1024 bytes");
 _Static_assert(sizeof(IotEventMessage) == 496U,
                "Changing the event layout requires a journal migration");
 _Static_assert(offsetof(IotEventMessage, flags) == 2U,
                "Durability flags must remain in the former v1 padding byte");
 _Static_assert(offsetof(IotEventMessage, uptime_ms) == 4U,
                "Journal v1 event offsets must remain backward compatible");
+_Static_assert(sizeof(IotTelemetryMeasurement) == 12U,
+               "Persistent telemetry measurement must remain compact");
+_Static_assert(sizeof(IotTelemetrySample) <=
+                   sizeof(((IotOutboxJournalRecord *)0)->payload),
+               "Telemetry sample exceeds one outbox record");
+_Static_assert(sizeof(IotCommandResult) <=
+                   sizeof(((IotOutboxJournalRecord *)0)->payload),
+               "Command result exceeds one outbox record");
 
 static IotEventMessage event_queue[IOT_EVENT_QUEUE_CAPACITY];
+static IotTelemetrySample telemetry_queue[IOT_TELEMETRY_QUEUE_CAPACITY];
+static IotCommandResult command_history[IOT_COMMAND_HISTORY_CAPACITY];
 static IotThrottleEntry throttle_entries[IOT_THROTTLE_CAPACITY];
 static size_t queue_count = 0U;
+static size_t telemetry_count = 0U;
+static size_t command_history_count = 0U;
 static uint32_t dropped_count = 0U;
+static uint32_t telemetry_dropped_count = 0U;
 static uint32_t persistence_failure_count = 0U;
 static uint32_t message_sequence = 0U;
 static uint32_t boot_nonce = 0U;
@@ -161,11 +192,11 @@ static int IotEvents_JournalRecordIsErased(uint32_t address)
     return 1;
 }
 
-static int IotEvents_JournalRecordIsValid(
-    const IotEventJournalRecord *record)
+static int IotEvents_LegacyJournalRecordIsValid(
+    const IotEventLegacyJournalRecord *record)
 {
     if ((record->magic != IOT_EVENT_JOURNAL_MAGIC) ||
-        (record->version != IOT_EVENT_JOURNAL_VERSION) ||
+        (record->version != IOT_EVENT_JOURNAL_LEGACY_VERSION) ||
         ((record->kind != IOT_EVENT_JOURNAL_KIND_PUT) &&
          (record->kind != IOT_EVENT_JOURNAL_KIND_ACK)))
     {
@@ -174,11 +205,27 @@ static int IotEvents_JournalRecordIsValid(
 
     return record->crc32 ==
            IotEvents_Crc32((const uint8_t *)record,
-                           offsetof(IotEventJournalRecord, crc32));
+                           offsetof(IotEventLegacyJournalRecord, crc32));
 }
 
-static int IotEvents_JournalProgramRaw(
-    const IotEventJournalRecord *record)
+static int IotEvents_OutboxJournalRecordIsValid(
+    const IotOutboxJournalRecord *record)
+{
+    if ((record->magic != IOT_EVENT_JOURNAL_MAGIC) ||
+        (record->version != IOT_EVENT_JOURNAL_VERSION) ||
+        (record->payload_length > sizeof(record->payload)) ||
+        (record->kind < IOT_EVENT_JOURNAL_KIND_PUT) ||
+        (record->kind > IOT_EVENT_JOURNAL_KIND_COMMAND_PUT))
+    {
+        return 0;
+    }
+
+    return record->crc32 ==
+           IotEvents_Crc32((const uint8_t *)record,
+                           offsetof(IotOutboxJournalRecord, crc32));
+}
+
+static int IotEvents_JournalProgramRaw(const void *record)
 {
     uint32_t address;
     uint32_t offset;
@@ -200,7 +247,7 @@ static int IotEvents_JournalProgramRaw(
 
     __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS_BANK1);
     for (offset = 0U;
-         (offset < sizeof(*record)) && (status == HAL_OK);
+         (offset < IOT_EVENT_JOURNAL_RECORD_SIZE) && (status == HAL_OK);
          offset += IOT_EVENT_FLASHWORD_SIZE)
     {
         status = HAL_FLASH_Program(
@@ -217,7 +264,7 @@ static int IotEvents_JournalProgramRaw(
     IotEvents_InvalidateJournalCache();
     if (memcmp((const void *)(uintptr_t)address,
                record,
-               sizeof(*record)) != 0)
+               IOT_EVENT_JOURNAL_RECORD_SIZE) != 0)
     {
         return -1;
     }
@@ -226,24 +273,34 @@ static int IotEvents_JournalProgramRaw(
     return 0;
 }
 
-static void IotEvents_PrepareJournalRecord(
-    IotEventJournalRecord *record,
+static int IotEvents_PrepareJournalRecord(
+    IotOutboxJournalRecord *record,
     uint16_t kind,
-    const IotEventMessage *event)
+    const void *payload,
+    size_t payload_length)
 {
+    if ((record == NULL) ||
+        ((payload_length > 0U) && (payload == NULL)) ||
+        (payload_length > sizeof(record->payload)))
+    {
+        return -1;
+    }
+
     memset(record, 0xFF, sizeof(*record));
     record->magic = IOT_EVENT_JOURNAL_MAGIC;
     record->version = IOT_EVENT_JOURNAL_VERSION;
     record->kind = kind;
     record->sequence = ++journal_sequence;
-    memset(&record->event, 0, sizeof(record->event));
-    if (event != NULL)
+    record->payload_length = (uint16_t)payload_length;
+    record->reserved_header = 0U;
+    if (payload_length > 0U)
     {
-        record->event = *event;
+        memcpy(record->payload, payload, payload_length);
     }
     record->crc32 =
         IotEvents_Crc32((const uint8_t *)record,
-                        offsetof(IotEventJournalRecord, crc32));
+                        offsetof(IotOutboxJournalRecord, crc32));
+    return 0;
 }
 
 static int IotEvents_JournalErase(void)
@@ -286,17 +343,50 @@ static int IotEvents_JournalCompact(void)
 
     for (index = 0U; index < queue_count; index++)
     {
-        IotEventJournalRecord record
+        IotOutboxJournalRecord record
             __attribute__((aligned(IOT_EVENT_FLASHWORD_SIZE)));
 
         if (!IotEvents_IsDurable(&event_queue[index]))
         {
             continue;
         }
-        IotEvents_PrepareJournalRecord(&record,
-                                       IOT_EVENT_JOURNAL_KIND_PUT,
-                                       &event_queue[index]);
-        if (IotEvents_JournalProgramRaw(&record) != 0)
+        if ((IotEvents_PrepareJournalRecord(&record,
+                                            IOT_EVENT_JOURNAL_KIND_PUT,
+                                            &event_queue[index],
+                                            sizeof(event_queue[index])) != 0) ||
+            (IotEvents_JournalProgramRaw(&record) != 0))
+        {
+            return -1;
+        }
+    }
+
+    for (index = 0U; index < telemetry_count; index++)
+    {
+        IotOutboxJournalRecord record
+            __attribute__((aligned(IOT_EVENT_FLASHWORD_SIZE)));
+
+        if ((IotEvents_PrepareJournalRecord(
+                 &record,
+                 IOT_EVENT_JOURNAL_KIND_TELEMETRY_PUT,
+                 &telemetry_queue[index],
+                 sizeof(telemetry_queue[index])) != 0) ||
+            (IotEvents_JournalProgramRaw(&record) != 0))
+        {
+            return -1;
+        }
+    }
+
+    for (index = 0U; index < command_history_count; index++)
+    {
+        IotOutboxJournalRecord record
+            __attribute__((aligned(IOT_EVENT_FLASHWORD_SIZE)));
+
+        if ((IotEvents_PrepareJournalRecord(
+                 &record,
+                 IOT_EVENT_JOURNAL_KIND_COMMAND_PUT,
+                 &command_history[index],
+                 sizeof(command_history[index])) != 0) ||
+            (IotEvents_JournalProgramRaw(&record) != 0))
         {
             return -1;
         }
@@ -305,9 +395,10 @@ static int IotEvents_JournalCompact(void)
 }
 
 static int IotEvents_JournalAppend(uint16_t kind,
-                                   const IotEventMessage *event)
+                                   const void *payload,
+                                   size_t payload_length)
 {
-    IotEventJournalRecord record
+    IotOutboxJournalRecord record
         __attribute__((aligned(IOT_EVENT_FLASHWORD_SIZE)));
 
     if (journal_next_index >= IOT_EVENT_JOURNAL_RECORD_COUNT)
@@ -318,7 +409,13 @@ static int IotEvents_JournalAppend(uint16_t kind,
         }
     }
 
-    IotEvents_PrepareJournalRecord(&record, kind, event);
+    if (IotEvents_PrepareJournalRecord(&record,
+                                       kind,
+                                       payload,
+                                       payload_length) != 0)
+    {
+        return -1;
+    }
     return IotEvents_JournalProgramRaw(&record);
 }
 
@@ -466,6 +563,142 @@ static void IotEvents_RemoveAt(size_t index)
     memset(&event_queue[queue_count], 0, sizeof(event_queue[queue_count]));
 }
 
+static void IotEvents_RemoveTelemetryAt(size_t index)
+{
+    if (index >= telemetry_count)
+    {
+        return;
+    }
+
+    if ((index + 1U) < telemetry_count)
+    {
+        memmove(&telemetry_queue[index],
+                &telemetry_queue[index + 1U],
+                (telemetry_count - index - 1U) * sizeof(telemetry_queue[0]));
+    }
+    telemetry_count--;
+    memset(&telemetry_queue[telemetry_count],
+           0,
+           sizeof(telemetry_queue[telemetry_count]));
+}
+
+static void IotEvents_RemoveCommandAt(size_t index)
+{
+    if (index >= command_history_count)
+    {
+        return;
+    }
+
+    if ((index + 1U) < command_history_count)
+    {
+        memmove(&command_history[index],
+                &command_history[index + 1U],
+                (command_history_count - index - 1U) *
+                    sizeof(command_history[0]));
+    }
+    command_history_count--;
+    memset(&command_history[command_history_count],
+           0,
+           sizeof(command_history[command_history_count]));
+}
+
+static void IotEvents_ApplyEventRecord(uint16_t kind,
+                                       const IotEventMessage *event)
+{
+    size_t index;
+
+    if ((event == NULL) || !IotEvents_IsDurable(event))
+    {
+        return;
+    }
+
+    for (index = 0U; index < queue_count; index++)
+    {
+        if (strncmp(event_queue[index].message_id,
+                    event->message_id,
+                    IOT_EVENT_ID_CAPACITY) == 0)
+        {
+            if (kind == IOT_EVENT_JOURNAL_KIND_ACK)
+            {
+                IotEvents_RemoveAt(index);
+            }
+            return;
+        }
+    }
+
+    if ((kind == IOT_EVENT_JOURNAL_KIND_PUT) &&
+        (queue_count < IOT_EVENT_QUEUE_CAPACITY))
+    {
+        event_queue[queue_count++] = *event;
+    }
+}
+
+static void IotEvents_ApplyTelemetryRecord(uint16_t kind,
+                                           const IotTelemetrySample *sample)
+{
+    size_t index;
+
+    if ((sample == NULL) || (sample->sample_id[0] == '\0') ||
+        (sample->measurement_count == 0U) ||
+        (sample->measurement_count > IOT_TELEMETRY_MAX_MEASUREMENTS))
+    {
+        return;
+    }
+
+    for (index = 0U; index < telemetry_count; index++)
+    {
+        if (strncmp(telemetry_queue[index].sample_id,
+                    sample->sample_id,
+                    IOT_EVENT_ID_CAPACITY) == 0)
+        {
+            if (kind == IOT_EVENT_JOURNAL_KIND_TELEMETRY_ACK)
+            {
+                IotEvents_RemoveTelemetryAt(index);
+            }
+            return;
+        }
+    }
+
+    if (kind != IOT_EVENT_JOURNAL_KIND_TELEMETRY_PUT)
+    {
+        return;
+    }
+    if (telemetry_count >= IOT_TELEMETRY_QUEUE_CAPACITY)
+    {
+        IotEvents_RemoveTelemetryAt(0U);
+        telemetry_dropped_count++;
+    }
+    telemetry_queue[telemetry_count++] = *sample;
+}
+
+static void IotEvents_ApplyCommandRecord(const IotCommandResult *result)
+{
+    size_t index;
+
+    if ((result == NULL) || (result->command_id[0] == '\0') ||
+        (result->status[0] == '\0'))
+    {
+        return;
+    }
+
+    for (index = 0U; index < command_history_count; index++)
+    {
+        if (strncmp(command_history[index].command_id,
+                    result->command_id,
+                    IOT_COMMAND_ID_CAPACITY) == 0)
+        {
+            command_history[index] = *result;
+            return;
+        }
+    }
+
+    if (command_history_count >= IOT_COMMAND_HISTORY_CAPACITY)
+    {
+        IotEvents_RemoveCommandAt(0U);
+    }
+    command_history[command_history_count++] = *result;
+}
+
 static int IotEvents_MakeRoom(IotMessageType type,
                               uint8_t level,
                               uint8_t flags)
@@ -590,7 +823,8 @@ static IotEventResult IotEvents_Queue(IotMessageType type,
 
     if (IotEvents_IsDurable(entry) &&
         (IotEvents_JournalAppend(IOT_EVENT_JOURNAL_KIND_PUT,
-                                 entry) != 0))
+                                 entry,
+                                 sizeof(*entry)) != 0))
     {
         /*
          * Keep the event in RAM so it can still be delivered. The explicit
@@ -620,9 +854,14 @@ void IotEvents_Init(void)
 
     event_mutex = xSemaphoreCreateMutexStatic(&event_mutex_storage);
     memset(event_queue, 0, sizeof(event_queue));
+    memset(telemetry_queue, 0, sizeof(telemetry_queue));
+    memset(command_history, 0, sizeof(command_history));
     memset(throttle_entries, 0, sizeof(throttle_entries));
     queue_count = 0U;
+    telemetry_count = 0U;
+    command_history_count = 0U;
     dropped_count = 0U;
+    telemetry_dropped_count = 0U;
     persistence_failure_count = 0U;
     message_sequence = 0U;
     journal_next_index = 0U;
@@ -634,9 +873,8 @@ void IotEvents_Init(void)
         uint32_t address =
             IOT_EVENT_JOURNAL_ADDRESS +
             (index * IOT_EVENT_JOURNAL_RECORD_SIZE);
-        const IotEventJournalRecord *record =
-            (const IotEventJournalRecord *)(uintptr_t)address;
-        size_t queue_index;
+        const IotOutboxJournalRecord *record =
+            (const IotOutboxJournalRecord *)(uintptr_t)address;
 
         if (IotEvents_JournalRecordIsErased(address))
         {
@@ -645,51 +883,68 @@ void IotEvents_Init(void)
         }
 
         journal_next_index = index + 1U;
-        if (!IotEvents_JournalRecordIsValid(record))
+        if (record->version == IOT_EVENT_JOURNAL_LEGACY_VERSION)
+        {
+            const IotEventLegacyJournalRecord *legacy =
+                (const IotEventLegacyJournalRecord *)(uintptr_t)address;
+
+            if (!IotEvents_LegacyJournalRecordIsValid(legacy))
+            {
+                persistence_failure_count++;
+                continue;
+            }
+            if (legacy->sequence > journal_sequence)
+            {
+                journal_sequence = legacy->sequence;
+            }
+            IotEvents_ApplyEventRecord(legacy->kind, &legacy->event);
+            continue;
+        }
+
+        if (!IotEvents_OutboxJournalRecordIsValid(record))
         {
             persistence_failure_count++;
             continue;
         }
-
         if (record->sequence > journal_sequence)
         {
             journal_sequence = record->sequence;
         }
 
-        if (record->kind == IOT_EVENT_JOURNAL_KIND_PUT)
+        if (((record->kind == IOT_EVENT_JOURNAL_KIND_PUT) ||
+             (record->kind == IOT_EVENT_JOURNAL_KIND_ACK)) &&
+            (record->payload_length == sizeof(IotEventMessage)))
         {
-            int duplicate = 0;
-            if (!IotEvents_IsDurable(&record->event))
-            {
-                continue;
-            }
-            for (queue_index = 0U; queue_index < queue_count; queue_index++)
-            {
-                if (strncmp(event_queue[queue_index].message_id,
-                            record->event.message_id,
-                            IOT_EVENT_ID_CAPACITY) == 0)
-                {
-                    duplicate = 1;
-                    break;
-                }
-            }
-            if (!duplicate && (queue_count < IOT_EVENT_QUEUE_CAPACITY))
-            {
-                event_queue[queue_count++] = record->event;
-            }
+            IotEventMessage event;
+            memcpy(&event, record->payload, sizeof(event));
+            event.message_id[sizeof(event.message_id) - 1U] = '\0';
+            event.code[sizeof(event.code) - 1U] = '\0';
+            event.source[sizeof(event.source) - 1U] = '\0';
+            event.message[sizeof(event.message) - 1U] = '\0';
+            IotEvents_ApplyEventRecord(record->kind, &event);
+        }
+        else if (((record->kind == IOT_EVENT_JOURNAL_KIND_TELEMETRY_PUT) ||
+                  (record->kind == IOT_EVENT_JOURNAL_KIND_TELEMETRY_ACK)) &&
+                 (record->payload_length == sizeof(IotTelemetrySample)))
+        {
+            IotTelemetrySample sample;
+            memcpy(&sample, record->payload, sizeof(sample));
+            sample.sample_id[sizeof(sample.sample_id) - 1U] = '\0';
+            IotEvents_ApplyTelemetryRecord(record->kind, &sample);
+        }
+        else if ((record->kind == IOT_EVENT_JOURNAL_KIND_COMMAND_PUT) &&
+                 (record->payload_length == sizeof(IotCommandResult)))
+        {
+            IotCommandResult result;
+            memcpy(&result, record->payload, sizeof(result));
+            result.command_id[sizeof(result.command_id) - 1U] = '\0';
+            result.status[sizeof(result.status) - 1U] = '\0';
+            result.message[sizeof(result.message) - 1U] = '\0';
+            IotEvents_ApplyCommandRecord(&result);
         }
         else
         {
-            for (queue_index = 0U; queue_index < queue_count; queue_index++)
-            {
-                if (strncmp(event_queue[queue_index].message_id,
-                            record->event.message_id,
-                            IOT_EVENT_ID_CAPACITY) == 0)
-                {
-                    IotEvents_RemoveAt(queue_index);
-                    break;
-                }
-            }
+            persistence_failure_count++;
         }
     }
 
@@ -713,9 +968,14 @@ int IotEvents_FactoryReset(void)
     }
 
     memset(event_queue, 0, sizeof(event_queue));
+    memset(telemetry_queue, 0, sizeof(telemetry_queue));
+    memset(command_history, 0, sizeof(command_history));
     memset(throttle_entries, 0, sizeof(throttle_entries));
     queue_count = 0U;
+    telemetry_count = 0U;
+    command_history_count = 0U;
     dropped_count = 0U;
+    telemetry_dropped_count = 0U;
     persistence_failure_count = 0U;
     message_sequence = 0U;
     journal_sequence = 0U;
@@ -794,7 +1054,8 @@ int IotEvents_PopIfMatch(const char *message_id)
     {
         if (IotEvents_IsDurable(&event_queue[0]) &&
             (IotEvents_JournalAppend(IOT_EVENT_JOURNAL_KIND_ACK,
-                                     &event_queue[0]) != 0))
+                                     &event_queue[0],
+                                     sizeof(event_queue[0])) != 0))
         {
             persistence_failure_count++;
             IotEvents_Unlock();
@@ -804,6 +1065,200 @@ int IotEvents_PopIfMatch(const char *message_id)
     }
     IotEvents_Unlock();
     return 0;
+}
+
+int IotEvents_AssignTelemetryId(IotTelemetrySample *sample)
+{
+    if (sample == NULL)
+    {
+        return -1;
+    }
+
+    IotEvents_Lock();
+    message_sequence++;
+    (void)snprintf(sample->sample_id,
+                   sizeof(sample->sample_id),
+                   "tlm-%08lx-%08lx",
+                   (unsigned long)boot_nonce,
+                   (unsigned long)message_sequence);
+    sample->sample_id[sizeof(sample->sample_id) - 1U] = '\0';
+    IotEvents_Unlock();
+    return 0;
+}
+
+int IotEvents_QueueTelemetry(const IotTelemetrySample *sample)
+{
+    size_t index;
+
+    if ((sample == NULL) || (sample->sample_id[0] == '\0') ||
+        (strnlen(sample->sample_id, sizeof(sample->sample_id)) >=
+         sizeof(sample->sample_id)) ||
+        (sample->measurement_count == 0U) ||
+        (sample->measurement_count > IOT_TELEMETRY_MAX_MEASUREMENTS))
+    {
+        return -1;
+    }
+
+    IotEvents_Lock();
+    for (index = 0U; index < telemetry_count; index++)
+    {
+        if (strncmp(telemetry_queue[index].sample_id,
+                    sample->sample_id,
+                    IOT_EVENT_ID_CAPACITY) == 0)
+        {
+            IotEvents_Unlock();
+            return 0;
+        }
+    }
+
+    /* Append the replacement first. During recovery, applying a PUT to a full
+     * bounded queue deterministically evicts the oldest sample. This ordering
+     * means a power loss can leave the old sample or the new sample, but never
+     * erase the old one before the replacement is durable. */
+    if (IotEvents_JournalAppend(IOT_EVENT_JOURNAL_KIND_TELEMETRY_PUT,
+                                sample,
+                                sizeof(*sample)) != 0)
+    {
+        persistence_failure_count++;
+        IotEvents_Unlock();
+        return -1;
+    }
+    if (telemetry_count >= IOT_TELEMETRY_QUEUE_CAPACITY)
+    {
+        IotEvents_RemoveTelemetryAt(0U);
+        telemetry_dropped_count++;
+    }
+    telemetry_queue[telemetry_count++] = *sample;
+    IotEvents_Unlock();
+    return 0;
+}
+
+int IotEvents_PeekTelemetry(IotTelemetrySample *sample)
+{
+    int available = 0;
+
+    if (sample == NULL)
+    {
+        return 0;
+    }
+
+    IotEvents_Lock();
+    if (telemetry_count > 0U)
+    {
+        *sample = telemetry_queue[0];
+        available = 1;
+    }
+    IotEvents_Unlock();
+    return available;
+}
+
+int IotEvents_PopTelemetryIfMatch(const char *sample_id)
+{
+    if (sample_id == NULL)
+    {
+        return -1;
+    }
+
+    IotEvents_Lock();
+    if ((telemetry_count > 0U) &&
+        (strncmp(telemetry_queue[0].sample_id,
+                 sample_id,
+                 sizeof(telemetry_queue[0].sample_id)) == 0))
+    {
+        if (IotEvents_JournalAppend(
+                IOT_EVENT_JOURNAL_KIND_TELEMETRY_ACK,
+                &telemetry_queue[0],
+                sizeof(telemetry_queue[0])) != 0)
+        {
+            persistence_failure_count++;
+            IotEvents_Unlock();
+            return -1;
+        }
+        IotEvents_RemoveTelemetryAt(0U);
+    }
+    IotEvents_Unlock();
+    return 0;
+}
+
+size_t IotEvents_TelemetryPendingCount(void)
+{
+    size_t count;
+    IotEvents_Lock();
+    count = telemetry_count;
+    IotEvents_Unlock();
+    return count;
+}
+
+uint32_t IotEvents_TelemetryDroppedCount(void)
+{
+    uint32_t count;
+    IotEvents_Lock();
+    count = telemetry_dropped_count;
+    IotEvents_Unlock();
+    return count;
+}
+
+int IotEvents_RememberCommandResult(const IotCommandResult *result)
+{
+    if ((result == NULL) || (result->command_id[0] == '\0') ||
+        (result->status[0] == '\0') ||
+        (strnlen(result->command_id, sizeof(result->command_id)) >=
+         sizeof(result->command_id)) ||
+        (strnlen(result->status, sizeof(result->status)) >=
+         sizeof(result->status)) ||
+        (strnlen(result->message, sizeof(result->message)) >=
+         sizeof(result->message)))
+    {
+        return -1;
+    }
+
+    IotEvents_Lock();
+    if (IotEvents_JournalAppend(IOT_EVENT_JOURNAL_KIND_COMMAND_PUT,
+                                result,
+                                sizeof(*result)) != 0)
+    {
+        persistence_failure_count++;
+        IotEvents_Unlock();
+        return -1;
+    }
+    IotEvents_ApplyCommandRecord(result);
+    IotEvents_Unlock();
+    return 0;
+}
+
+int IotEvents_FindCommandResult(const char *command_id,
+                                IotCommandResult *result)
+{
+    size_t index;
+
+    if ((command_id == NULL) || (result == NULL))
+    {
+        return 0;
+    }
+
+    IotEvents_Lock();
+    for (index = command_history_count; index > 0U; index--)
+    {
+        if (strncmp(command_history[index - 1U].command_id,
+                    command_id,
+                    IOT_COMMAND_ID_CAPACITY) == 0)
+        {
+            *result = command_history[index - 1U];
+            IotEvents_Unlock();
+            return 1;
+        }
+    }
+    IotEvents_Unlock();
+    return 0;
+}
+
+size_t IotEvents_CommandHistoryCount(void)
+{
+    size_t count;
+    IotEvents_Lock();
+    count = command_history_count;
+    IotEvents_Unlock();
+    return count;
 }
 
 size_t IotEvents_PendingCount(void)

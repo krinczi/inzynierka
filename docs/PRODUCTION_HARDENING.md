@@ -46,7 +46,7 @@ Board integrations override:
 - IWDG has an approximately 32 second hardware timeout.
 - The supervisor refreshes IWDG only while both the network supervisor and the
   MQTT service publish fresh heartbeats.
-- An MPU marks credential Flash, event journal Flash, and Bank 2
+- An MPU marks credential Flash, durable outbox Flash, and Bank 2
   staging/configuration Flash privileged-writable, unprivileged-read-only,
   execute-never, and non-cacheable. The non-cacheable normal-memory mapping
   makes runtime Flash programming synchronous while permitting the dedicated
@@ -58,9 +58,9 @@ The current Cube package contains only the non-MPU FreeRTOS port. The hardware
 MPU therefore protects memory attributes, but tasks remain privileged. Full
 per-task isolation requires a FreeRTOS MPU-port migration.
 
-### Durable operational events
+### Durable operational outbox
 
-- Bank 1 sector 5 is reserved as a 128 KiB append-only event journal.
+- Bank 1 sector 5 is reserved as a 128 KiB versioned append-only outbox.
 - `WARNING`, `ALARM`, and `CRITICAL` alerts plus `ERROR`/`WARN`
   diagnostics are restored after reset.
 - Low-volume service audit transitions (`MODE_STARTED`, `MODE_STOPPED`, and
@@ -76,6 +76,14 @@ per-task isolation requires a FreeRTOS MPU-port migration.
 - Journal records use a versioned header, sequence number, CRC32, read-back
   verification, and compaction.
 - MQTT `eventId` remains stable across retries, allowing backend deduplication.
+- Up to 16 telemetry samples are retained while MQTT is unavailable and are
+  replayed oldest-first with QoS 1. A stable `sampleId` lets the backend
+  deduplicate retransmission after a lost PUBACK.
+- The first four offline samples use the configured interval. A five-minute
+  minimum interval is then applied to limit Flash wear during a long outage.
+- Results of the eight most recent commands are restored after reset. A
+  repeated `commandId` republishes the stored result without executing the
+  command again.
 - A live connection loss queues a durable warning. The first successful MQTT
   reconnect queues a durable recovery diagnostic containing the outage
   duration, so an offline interval is visible after connectivity returns.

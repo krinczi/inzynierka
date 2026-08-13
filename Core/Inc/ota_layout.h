@@ -9,7 +9,7 @@
  * Bank 1:
  *   sector 0       immutable bootloader
  *   sectors 1..4   primary application slot
- *   sector 5       persistent event journal
+ *   sector 5       persistent operational outbox
  *   sectors 6..7   credential store
  *
  * Bank 2:
