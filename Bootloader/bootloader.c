@@ -684,9 +684,15 @@ static int Boot_PerformSwap(OtaControlRecord *record)
                 record->state = OTA_CONTROL_STATE_CONFIRMED;
                 record->confirmed_version =
                     record->primary.image_version;
-                record->flags |=
-                    OTA_CONTROL_FLAG_JOB_REPORT_PENDING |
-                    OTA_CONTROL_FLAG_ROLLBACK_PERFORMED;
+                record->flags |= OTA_CONTROL_FLAG_ROLLBACK_PERFORMED;
+                if (record->job_id[0] != '\0')
+                {
+                    record->flags |= OTA_CONTROL_FLAG_JOB_REPORT_PENDING;
+                }
+                else
+                {
+                    record->flags &= ~OTA_CONTROL_FLAG_JOB_REPORT_PENDING;
+                }
             }
             return Boot_ControlAppend(record);
         }
@@ -761,7 +767,9 @@ void Boot_Main(void)
             (memcmp(&secondary,
                     &record.secondary,
                     sizeof(secondary)) != 0) ||
-            (secondary.image_version <= record.confirmed_version))
+            (secondary.image_version == record.confirmed_version) ||
+            ((secondary.image_version < record.confirmed_version) &&
+             ((record.flags & OTA_CONTROL_FLAG_AUTHORIZED_DOWNGRADE) == 0U)))
         {
             record.state = OTA_CONTROL_STATE_REJECTED;
             record.flags |=

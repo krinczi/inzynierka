@@ -20,6 +20,8 @@ typedef struct
     uint32_t file_size_bytes;
     uint8_t expected_sha256[FLASH_STAGING_SHA256_SIZE];
     uint32_t expected_image_version;
+    uint32_t rollback_from_version;
+    uint8_t allow_downgrade;
     char job_id[OTA_CONTROL_JOB_ID_SIZE];
     uint32_t job_execution_version;
 } FlashStagingRequest;

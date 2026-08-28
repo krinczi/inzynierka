@@ -91,6 +91,7 @@
 #define INTERACTION_DURATION_MAX_SECONDS      1800U
 #define INTERACTION_TELEMETRY_INTERVAL_MS     5000U
 #define INTERACTION_DIAGNOSTIC_INTERVAL_MS    10000U
+#define MQTT_STATUS_HEARTBEAT_INTERVAL_MS     60000U
 #define OFFLINE_TELEMETRY_BACKOFF_THRESHOLD      4U
 #define OFFLINE_TELEMETRY_MIN_INTERVAL_MS    300000U
 #define PROVISIONING_MAX_FAILED_ATTEMPTS          5U
@@ -146,6 +147,7 @@ static char tls_dns_hostname[256];
 static int mqtt_ready = 0;
 static uint32_t mqtt_last_telemetry_ms = 0U;
 static uint32_t mqtt_last_ping_ms = 0U;
+static uint32_t mqtt_last_status_ms = 0U;
 static uint16_t mqtt_negotiated_keep_alive_seconds = 60U;
 static uint8_t mqtt_interaction_active = 0U;
 static uint8_t mqtt_interaction_expiry_pending = 0U;
@@ -3476,6 +3478,7 @@ static int mqtt_handle_command(const char *payload)
     char command_id[96];
     char command_type[48];
     char activation_id[64];
+    char job_id[OTA_CONTROL_JOB_ID_SIZE];
     char requested_hardware_uid[DEVICE_HARDWARE_UID_HEX_LENGTH + 1U];
     char actual_hardware_uid[DEVICE_HARDWARE_UID_HEX_LENGTH + 1U];
     uint32_t now;
@@ -3592,6 +3595,96 @@ static int mqtt_handle_command(const char *payload)
         }
         (void)mqtt_publish_status();
         return 0;
+    }
+
+    if (strcmp(command_type, "jobs.cancel") == 0)
+    {
+        int cancel_result;
+
+        if (json_get_string(payload, "jobId", job_id, sizeof(job_id)) != 0)
+        {
+            return mqtt_publish_command_result(command_id,
+                                               "FAILED",
+                                               "jobs.cancel requires a valid jobId");
+        }
+        cancel_result = AwsJobs_CancelActive(job_id);
+        if (cancel_result < 0)
+        {
+            return mqtt_publish_command_result(command_id,
+                                               "FAILED",
+                                               "Invalid job cancellation request");
+        }
+        if (cancel_result == 0)
+        {
+            return mqtt_publish_command_result(command_id,
+                                               "ACKED",
+                                               "Job was not active on this device");
+        }
+
+        HttpsDownloader_Abort();
+        (void)IotEvents_QueueDiagnosticDurable(
+            IOT_DIAGNOSTIC_INFO,
+            "JOBS",
+            "JOB_CANCELLED",
+            "Active job transfer was cancelled by command");
+        return mqtt_publish_command_result(command_id,
+                                           "ACKED",
+                                           "Active job transfer cancelled");
+    }
+
+    if (strcmp(command_type, "firmware.rollback") == 0)
+    {
+        uint32_t target_version = 0U;
+        char result_message[96];
+
+        if ((json_get_bool(payload, "confirm", &confirmed) != 0) ||
+            !confirmed ||
+            (json_get_string(payload,
+                             "hardwareUid",
+                             requested_hardware_uid,
+                             sizeof(requested_hardware_uid)) != 0) ||
+            !mqtt_privileged_command_is_fresh(payload))
+        {
+            return mqtt_publish_command_result(
+                command_id,
+                "FAILED",
+                "Rollback requires confirm, hardwareUid and a fresh timestamp");
+        }
+        DeviceConfig_GetHardwareUid(actual_hardware_uid,
+                                    sizeof(actual_hardware_uid));
+        if (strcmp(requested_hardware_uid, actual_hardware_uid) != 0)
+        {
+            return mqtt_publish_command_result(command_id,
+                                               "FAILED",
+                                               "Rollback hardwareUid mismatch");
+        }
+        if (DeviceConfig_Get()->allow_rollback == 0U)
+        {
+            return mqtt_publish_command_result(command_id,
+                                               "FAILED",
+                                               "Manual rollback is disabled by configuration");
+        }
+        if (OtaManager_PrepareManualRollback(&target_version) != 0)
+        {
+            return mqtt_publish_command_result(command_id,
+                                               "FAILED",
+                                               "No authenticated previous firmware is available");
+        }
+
+        (void)snprintf(result_message,
+                       sizeof(result_message),
+                       "Rollback to image version %lu scheduled",
+                       (unsigned long)target_version);
+        (void)IotEvents_QueueDiagnosticDurable(
+            IOT_DIAGNOSTIC_WARN,
+            "OTA",
+            "MANUAL_ROLLBACK_REQUESTED",
+            result_message);
+        mqtt_lifecycle_reset_deadline_ms =
+            HAL_GetTick() + LIFECYCLE_RESET_DELAY_MS;
+        return mqtt_publish_command_result(command_id,
+                                           "ACKED",
+                                           result_message);
     }
 
     if (strcmp(command_type, "credentials.rotate") == 0)
@@ -3738,6 +3831,51 @@ static int mqtt_handle_command(const char *payload)
         return mqtt_publish_command_result(command_id,
                                            "ACKED",
                                            "Provisioning applied and persisted");
+    }
+
+    if (strcmp(command_type, "provisioning.cancel") == 0)
+    {
+        if ((json_get_bool(payload, "confirm", &confirmed) != 0) ||
+            !confirmed ||
+            (json_get_string(payload,
+                             "activationId",
+                             activation_id,
+                             sizeof(activation_id)) != 0) ||
+            (json_get_string(payload,
+                             "hardwareUid",
+                             requested_hardware_uid,
+                             sizeof(requested_hardware_uid)) != 0) ||
+            !mqtt_privileged_command_is_fresh(payload))
+        {
+            return mqtt_publish_command_result(
+                command_id,
+                "FAILED",
+                "Provisioning cancel requires confirmation, identity and a fresh timestamp");
+        }
+        DeviceConfig_GetHardwareUid(actual_hardware_uid,
+                                    sizeof(actual_hardware_uid));
+        if (strcmp(requested_hardware_uid, actual_hardware_uid) != 0)
+        {
+            return mqtt_publish_command_result(command_id,
+                                               "FAILED",
+                                               "Provisioning cancel hardwareUid mismatch");
+        }
+        if (DeviceConfig_RequestFactoryReset() != 0)
+        {
+            return mqtt_publish_command_result(command_id,
+                                               "FAILED",
+                                               "Provisioning cancel could not persist credential wipe");
+        }
+        (void)IotEvents_QueueDiagnosticDurable(
+            IOT_DIAGNOSTIC_WARN,
+            "PROVISIONING",
+            "PROVISIONING_CANCELLED",
+            "Emergency provisioning revocation persisted; credential wipe scheduled");
+        mqtt_lifecycle_reset_deadline_ms =
+            HAL_GetTick() + LIFECYCLE_RESET_DELAY_MS;
+        return mqtt_publish_command_result(command_id,
+                                           "ACKED",
+                                           "Provisioning revoked; secure credential wipe scheduled");
     }
 
     if (strcmp(command_type, "interaction.start") == 0)
@@ -4419,7 +4557,8 @@ int TlsClient_MqttTest(void)
 
     mqtt_ready = 1;
     mqtt_last_telemetry_ms = HAL_GetTick();
-    mqtt_last_ping_ms = HAL_GetTick();
+    mqtt_last_ping_ms = mqtt_last_telemetry_ms;
+    mqtt_last_status_ms = mqtt_last_telemetry_ms;
     HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
 
     tls_log("MQTT: test OK");
@@ -4526,6 +4665,19 @@ int TlsClient_MqttProcess(void)
         telemetry_interval_ms = INTERACTION_TELEMETRY_INTERVAL_MS;
     }
     ping_interval_ms = (uint32_t)mqtt_negotiated_keep_alive_seconds * 500U;
+
+    /* A live MQTT socket is not enough to prove application health. Publish a
+     * compact status heartbeat so the backend can expire ONLINE state when the
+     * task, broker session or physical network stops making progress. */
+    if ((now - mqtt_last_status_ms) >= MQTT_STATUS_HEARTBEAT_INTERVAL_MS)
+    {
+        mqtt_last_status_ms = now;
+        if (mqtt_publish_status() != 0)
+        {
+            mqtt_ready = 0;
+            return -1;
+        }
+    }
 
     if ((now - mqtt_last_telemetry_ms) >= telemetry_interval_ms)
     {

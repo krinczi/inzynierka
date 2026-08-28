@@ -3,6 +3,7 @@
   "operation": "stage-file",
   "mode": "download",
   "artifact": {
+    "artifactType": "service-file",
     "url": "https://replace-with-an-unexpired-presigned-s3-url.example.invalid/artifact.bin",
     "size": 21,
     "sha256": "0b3ebe7968f366ae0a7e257a483dc6c27e7f19776c775c3aa1af6ac82f35dab4"

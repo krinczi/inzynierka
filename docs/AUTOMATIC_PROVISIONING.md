@@ -1,5 +1,8 @@
 # Automatyczny provisioning AWS IoT dla STM32H753
 
+Stan implementacji: **Fleet Provisioning, rotacja poświadczeń i awaryjne
+anulowanie aktywacji aktywne; zweryfikowano 2026-08-24**.
+
 ## Cel i model
 
 Firmware realizuje **AWS IoT Fleet Provisioning by claim**. Urządzenie nie wymaga
@@ -15,19 +18,21 @@ w repozytorium aplikacji w `infra/aws/fleet-provisioning/`.
 ## Flow first boot
 
 1. `CredentialStore_Init()` wybiera najnowszy poprawny rekord z dwóch slotów.
-2. Dla stanu `EMPTY` klient TLS używa wbudowanego certyfikatu bootstrap/claim.
-3. Po połączeniu MQTT firmware subskrybuje odpowiedzi usług provisioningowych.
-4. Publikuje pusty dokument do `$aws/certificates/create/json`.
-5. Z odpowiedzi `accepted` pobiera certyfikat, klucz prywatny, identyfikator oraz
+2. Urządzenie pozyskuje wiarygodny czas z RTC/SNTP; pierwsze TLS jest blokowane,
+   jeżeli czas jest nieważny.
+3. Dla stanu `EMPTY` klient TLS używa wbudowanego certyfikatu bootstrap/claim.
+4. Po połączeniu MQTT firmware subskrybuje odpowiedzi usług provisioningowych.
+5. Publikuje pusty dokument do `$aws/certificates/create/json`.
+6. Z odpowiedzi `accepted` pobiera certyfikat, klucz prywatny, identyfikator oraz
    `certificateOwnershipToken`.
-6. mbedTLS sprawdza format certyfikatu i zgodność pary certyfikat–klucz.
-7. Dane są atomowo zapisywane jako `PENDING_REGISTRATION`.
-8. Firmware publikuje `RegisterThing` z `ThingName`, 96-bitowym UID sprzętowym i
+7. Mbed TLS sprawdza format certyfikatu i zgodność pary certyfikat–klucz.
+8. Dane są transakcyjnie zapisywane jako `PENDING_REGISTRATION`.
+9. Firmware publikuje `RegisterThing` z `ThingName`, 96-bitowym UID sprzętowym i
    numerem seryjnym do szablonu Fleet Provisioning.
-9. Pre-provisioning hook AWS sprawdza UID, nazwę Thing i allowlistę.
-10. Po odpowiedzi `accepted` rekord zostaje atomowo zatwierdzony jako
+10. Pre-provisioning hook AWS sprawdza UID, nazwę Thing i allowlistę.
+11. Po odpowiedzi `accepted` rekord zostaje transakcyjnie zatwierdzony jako
     `PROVISIONED`, a urządzenie rozłącza sesję bootstrap.
-11. Kolejne połączenie TLS używa wyłącznie unikalnego certyfikatu i uruchamia
+12. Kolejne połączenie TLS używa wyłącznie unikalnego certyfikatu i uruchamia
     standardowe tematy telemetrii, konfiguracji, komend i AWS Jobs.
 
 ## Tematy MQTT
@@ -43,6 +48,11 @@ w repozytorium aplikacji w `infra/aws/fleet-provisioning/`.
 
 Odpowiedzi są subskrybowane przed wysłaniem żądania. Po zakończeniu provisioning
 firmware wraca do wersjonowanych tematów `iot/v1/dev/devices/{deviceId}/...` i AWS Jobs.
+
+Claim certificate nie jest certyfikatem urządzenia. Jest wspólną, ograniczoną
+tożsamością bootstrap i nie może mieć dostępu do telemetrii, komend, Jobs ani
+Device Shadow. Unikalny certyfikat utworzony przez AWS otrzymuje osobną politykę
+urządzenia.
 
 ## Maszyna stanów i odporność
 
@@ -66,6 +76,11 @@ nowego certyfikatu.
 Każde żądanie ma timeout 30 s. Obowiązuje maksymalnie pięć prób na cykl pracy z
 backoff 4, 8, 16 i 32 s. Licznik nie zeruje się przy reconnect MQTT, dzięki czemu
 chwilowe błędy nie tworzą nieograniczonej pętli wywołań AWS.
+
+Odpowiedź `rejected` jest walidowana jako ograniczony JSON. Firmware nie zapisuje
+klucza, jeżeli brakuje ownership tokenu, certyfikat nie pasuje do klucza, nazwa
+Thing jest niewłaściwa albo odpowiedź przekracza bufor. Bufory tymczasowe klucza
+i ownership tokenu są zerowane po użyciu.
 
 ## Pamięć Flash
 
@@ -91,6 +106,11 @@ Linker ogranicza obraz aplikacji do `512 KiB - 1024 B` i zawiera asercje
 wykrywające nakładanie się bootloadera, slotów OTA, dziennika zdarzeń,
 credential store i konfiguracji. Szczegóły znajdują się w `docs/FULL_OTA.md`.
 
+„Atomowy” w tym dokumencie oznacza wybór kompletnego rekordu z prawidłowym CRC i
+znacznikiem commit. Przy rotacji sektorów poprzednia zweryfikowana generacja
+pozostaje w drugim sektorze do czasu zapisania nowej. Nie oznacza to szyfrowania
+klucza prywatnego przed fizycznym odczytem.
+
 ## Interfejsy firmware’u
 
 `credential_store.h`:
@@ -113,6 +133,28 @@ credential store i konfiguracji. Szczegóły znajdują się w `docs/FULL_OTA.md`
 - `FleetProvisioning_Process()` — timeouty, backoff i retry,
 - `FleetProvisioning_ReconnectRequired()` — przełączenie z claim na unique cert.
 - `FleetProvisioning_RequestRotation()` — rozpoczęcie kontrolowanej rotacji.
+
+## Awaryjne anulowanie i recommission
+
+Backend może unieważnić token/aktywację administracyjną przed zakończeniem
+provisioningu. Jeżeli urządzenie jest osiągalne, wysyła komendę
+`provisioning.cancel` zawierającą `confirm=true`, identyfikator aktywacji,
+96-bitowy `hardwareUid` i świeży timestamp. Firmware:
+
+1. odrzuca niepełną, przeterminowaną lub skierowaną do innego UID komendę;
+2. zapisuje żądanie resetu poświadczeń przed ACK;
+3. publikuje wynik komendy;
+4. po restarcie usuwa niedokończone poświadczenia i wraca do kontrolowanego
+   stanu fabrycznego.
+
+Jeżeli urządzenie jest offline, revocation pozostaje stanem oczekującym w
+backendzie. Samo unieważnienie rekordu chmurowego nie dowodzi fizycznego
+wyczyszczenia Flash — wymagane jest późniejsze potwierdzenie urządzenia.
+
+Ponowne dopuszczenie urządzenia po decommissioningu nie jest zwykłym retry.
+Operacja recommission w aplikacji wymaga jednorazowego, wygasającego challenge,
+uprawnień właściciela i ponownego wpisu UID do allowlisty. Lokalny stan
+`DECOMMISSIONED` musi zostać usunięty w kontrolowanej procedurze serwisowej.
 
 ## Rotacja unikalnego certyfikatu urządzenia
 
@@ -181,7 +223,7 @@ telemetrii, diagnostyce ani logach UART.
 ## Test akceptacyjny
 
 1. Wdrożyć stos CloudFormation i dodać UID płytki do allowlisty.
-2. Wgrać firmware z markerem `credential_rotation_v1`.
+2. Wgrać firmware i potwierdzić marker `fleet_auto_v3 credential_rotation_v2`.
 3. Potwierdzić sekwencję `EMPTY → PENDING_REGISTRATION → PROVISIONED`.
 4. Potwierdzić reconnect z logiem `credential source=unique fleet certificate`.
 5. Sprawdzić telemetrię i status `AUTO_FLEET` w aplikacji.
@@ -190,12 +232,23 @@ telemetrii, diagnostyce ani logach UART.
 7. W osobnym teście przerwać zasilanie po zapisie pending i potwierdzić wznowienie.
 8. Usunąć UID z allowlisty lub użyć nieznanego UID i potwierdzić odrzucenie.
 9. Odłączyć Ethernet podczas procesu i potwierdzić reconnect bez utraty stanu.
+10. Unieważnić aktywację w trakcie procesu, potwierdzić ACK
+    `provisioning.cancel`, restart i brak użycia niedokończonej pary.
+11. Wykonać rotację, przerwać trzy walidacje nowej pary i potwierdzić powrót do
+    poprzedniego certyfikatu.
+12. Sprawdzić, że UART, status i diagnostyka nie zawierają PEM, ownership tokenu
+    ani presigned URL.
 
 ## Ograniczenia i dalsze utwardzenie
 
 Klucz urządzenia jest chroniony integralnością, dual-slotem i granicami linkera,
-ale nie jest szyfrowany sprzętowo. W produkcie należy włączyć RDP/PCROP lub secure
-element. Wspólny claim certificate powinien mieć wyłącznie minimalną claim policy;
+ale nie jest szyfrowany sprzętowo. W produkcie należy zastosować profil RDP/WRP
+z `PRODUCTION_OPTION_BYTES.md` lub secure element. PCROP nie może być włączany
+na cały sektor bez wydzielenia sekcji execute-only. Wspólny claim certificate powinien mieć wyłącznie minimalną claim policy;
 po testach trzeba odłączyć od niego dawne szerokie polityki developerskie. Dla
 większej floty zalecana jest rotacja claim certificate i alarmowanie AWS IoT Device
 Defender o nietypowej liczbie prób provisioningowych.
+
+Kod nie może samodzielnie unieważnić wspólnego claim certificate w AWS. Jest to
+operacja incydentowa po stronie chmury, która musi mieć udokumentowany wpływ na
+wszystkie jeszcze niezarejestrowane urządzenia.

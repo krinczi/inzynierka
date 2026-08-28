@@ -2,7 +2,8 @@
 
 Status: MQTT Jobs discovery, document validation, bounded HTTPS download,
 service-file staging, signed firmware installation, retry, and durable terminal
-status reporting implemented.
+status reporting implemented. Job cancellation and authenticated rollback jobs
+are included. Reviewed against the firmware on **2026-08-24**.
 
 ## Device workflow
 
@@ -24,6 +25,12 @@ status reporting implemented.
 10. Publish firmware `SUCCEEDED` only after the trial image confirms healthy.
     Candidate rejection or automatic rollback is reported after MQTT reconnect.
 11. Wait for `update/accepted`; then request the next execution.
+
+An owner-requested cancellation is sent through the normal device command topic
+as `jobs.cancel`. STM accepts it only for the matching active job, aborts HTTPS
+and Flash staging, clears the local execution and replies on `cmd/result`. The
+backend keeps `CANCEL_REQUESTED` until this acknowledgement arrives; requesting
+cancellation is not reported as completed merely because MQTT publish returned.
 
 After a disconnect, local state is cleared. On reconnect, `start-next` asks AWS
 for the current in-progress execution first, making recovery deterministic.
@@ -105,20 +112,54 @@ For a signed executable package:
 ```
 
 `version` must match the signed version in the embedded `OTA3` header and must
-be greater than the confirmed anti-rollback floor. The `sha256` in the Job
+be different from the currently confirmed version. During an ordinary update
+it must be greater than the confirmed baseline. The `sha256` in the Job
 protects transport of the whole package; the package also contains a signed
 payload digest verified independently by the application and bootloader. See
 `docs/FULL_OTA.md`.
+
+### Authorized rollback to an older signed release
+
+Rollback to an arbitrary older release uses the same signed package and the
+full trial-boot path; it is not a raw bootloader jump. The backend adds two
+fields inside `artifact`:
+
+```json
+{
+  "artifactType": "firmware",
+  "version": 7,
+  "rollbackAuthorized": 1,
+  "rollbackFromVersion": 12,
+  "url": "https://presigned-s3-url",
+  "size": 329980,
+  "sha256": "<sha256-of-complete-ota-package>"
+}
+```
+
+The device accepts the downgrade only when all conditions hold:
+
+1. both rollback fields occur together and `rollbackAuthorized` equals `1`;
+2. local Device Shadow configuration has `allowRollback=true`;
+3. `rollbackFromVersion` equals the currently confirmed version;
+4. target version differs from the current version;
+5. the package target, vector table, payload digest and ECDSA P-256 signature
+   are valid, and its embedded version equals `version`.
+
+The authorization flag is persisted in the OTA control record and rechecked by
+the bootloader. After a healthy trial, the older image becomes the new
+confirmed baseline. Later ordinary updates must again be newer than that
+baseline. This enables explicit recovery without permitting silent replay of
+an old signed image.
 
 ## Validation and safety limits
 
 - No dynamic allocation is used.
 - Waiting for a subscription acknowledgement does not assume that `SUBACK`
   is the next MQTT packet. Interleaved retained `PUBLISH` packets (for example
-  `config/desired`) are processed and acknowledged before the matching
-  packet identifier is accepted.
-- Incoming MQTT packet limit: 4096 bytes.
-- Parsed Jobs payload limit: 3839 bytes plus terminator.
+  a named Shadow `config` delta/update) are processed and acknowledged before
+  the matching packet identifier is accepted.
+- Shared MQTT RX buffer: 8192 bytes.
+- Decoded incoming payload limit: 7679 bytes plus terminator.
 - Maximum JSON nesting depth: 8.
 - Maximum job ID: 64 characters, restricted to letters, numbers, `_`, and `-`.
 - Only schema version 1 and operation `stage-file` are accepted.
@@ -127,14 +168,19 @@ payload digest verified independently by the application and bootloader. See
   (including the query string of a presigned S3 URL).
 - Printable ASCII `\\uXXXX` escapes emitted by a JSON serializer are decoded
   before URL validation; control characters and non-ASCII escapes are rejected.
-- The MQTT receive path accepts a bounded packet of 4096 bytes and a maximum
-  decoded payload of 3839 bytes. This accommodates the AWS execution envelope
+- The MQTT receive path accepts a bounded packet of 8192 bytes and a maximum
+  decoded payload of 7679 bytes. This accommodates the AWS execution envelope
   plus the supported 2048-character URL while still rejecting oversized job
   responses before copying them to the parser stack.
 - Artifact size must be from 1 byte through the secondary-slot capacity.
 - `artifactType` may be `service-file` or `firmware`. An omitted type is
   treated as a service file for compatibility with existing Jobs.
-- A firmware artifact requires a nonzero monotonic `version`.
+- A firmware artifact requires a nonzero `version`. Release numbering remains
+  monotonic, but an explicitly authorized rollback may select an older signed
+  release as described above.
+- `rollbackAuthorized` and `rollbackFromVersion` are rejected when only one is
+  present, rollback is disabled locally, or the declared source version is
+  stale.
 - Firmware package size includes the fixed 1024-byte signed header and cannot
   exceed the 512 KiB secondary slot.
 - SHA-256 must contain exactly 64 hexadecimal characters and is decoded into
@@ -177,6 +223,12 @@ payload digest verified independently by the application and bootloader. See
 - A missing `start-next` or `update` response times out after 15 seconds and
   enters the same bounded retry path. Repeating `start-next` is safe because
   AWS returns an existing `IN_PROGRESS` execution before queued executions.
+- `jobs.cancel` is idempotent at the command layer. A repeated `commandId`
+  returns the persisted result; canceling a job that is no longer locally
+  active returns an acknowledged no-op.
+- Cancellation is cooperative. If the board is offline, the backend can record
+  `CANCEL_REQUESTED`, but local HTTPS/Flash activity can stop only after the
+  device receives the command or AWS reports a terminal state.
 
 ## STM32Cube integration invariant
 
@@ -241,6 +293,17 @@ If the candidate is invalid, the terminal detail is `candidate_rejected`. If
 the trial never becomes healthy and the previous image is restored, it is
 `trial_health_failed`.
 
+For cancellation of an active transfer, the important sequence is:
+
+```text
+JOBS: local execution cancelled job=<jobId>
+MQTT: PUBLISH iot/v1/dev/devices/<thingName>/cmd/result
+```
+
+The management application changes `CANCEL_REQUESTED` to `CANCELED` only after
+that command result or an equivalent terminal AWS state. A successful command
+publish alone is not final confirmation.
+
 For `validate-only`, Flash staging and device configuration remain unchanged.
 For a service-file download, staging changes to `READY` only after exact size
 and SHA-256 verification. For firmware, AWS should show `SUCCEEDED` only after
@@ -287,6 +350,7 @@ DOCUMENT=$(jq -nc --arg url "$URL" '{
   operation: "stage-file",
   mode: "download",
   artifact: {
+    artifactType: "service-file",
     url: $url,
     size: 21,
     sha256: "0b3ebe7968f366ae0a7e257a483dc6c27e7f19776c775c3aa1af6ac82f35dab4"
@@ -321,11 +385,20 @@ Then restart the board and confirm that boot reports
 aws s3 rm "s3://$BUCKET/tests/stm32-job-test.bin" --region "$REGION"
 ```
 
-## Remaining OTA stage
+## Implemented OTA continuation
 
-A successfully downloaded file remains in `FLASH_STAGING_STATE_READY`. This
-module does not execute or install it. Firmware image signing, bootloader swap,
-rollback, and post-boot confirmation remain separate future OTA work.
+For `service-file`, a successful download remains in
+`FLASH_STAGING_STATE_READY` and is never executable. For `firmware`, staging
+validates the OTA3 package, persists the AWS Job identity, marks
+`CANDIDATE_READY` and hands control to the bootloader. The bootloader performs a
+power-loss-resumable swap; the application then confirms a healthy trial or
+the previous image is restored. Details and remaining manufacturing controls
+are in `FULL_OTA.md`.
+
+The implemented software path does not replace release operations. The private
+signing key must remain in HSM/protected CI, the bootloader sector must be
+write-protected for production, and repeated power-cut qualification is still
+required.
 
 AWS protocol references:
 

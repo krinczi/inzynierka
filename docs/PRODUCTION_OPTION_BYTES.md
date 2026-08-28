@@ -1,14 +1,23 @@
 # STM32H753 production option-byte profile
 
+Document status: **approved profile, not an unattended programming procedure;
+reviewed 2026-08-24**.
+
 ## Current development profile
 
-The connected NUCLEO-H753ZI was audited read-only with STM32CubeProgrammer
-2.17.0. Its current profile is intentionally suitable for development:
+The development NUCLEO-H753ZI used during the recorded audit was inspected
+read-only with STM32CubeProgrammer 2.17.0. That evidence applies only to the
+recorded board and audit time; every physical unit must be read back again
+before classification. The development profile is:
 
 - RDP level 0 (`RDP=0xAA`);
 - all sectors writable (`nWRP0..nWRP15=1`);
 - PCROP disabled in both banks;
 - SWD remains available.
+
+Firmware startup also reports the observed RDP level, debugger attachment and
+MPU state. This diagnostic is evidence, not enforcement: the application never
+programs option bytes.
 
 Reproduce the audit without changing the target:
 
@@ -31,6 +40,11 @@ For this memory layout the baseline production profile is:
   event journal and configuration legitimately update them;
 - PCROP disabled until executable-only sections have been separated from
   constants read as data.
+
+RDP1 reduces straightforward debug/readout access but does not encrypt Flash
+and is not equivalent to a secure element. Its use must be combined with
+bootloader signature verification, protected release keys and an incident
+procedure for device certificates.
 
 PCROP is not a generic stronger RDP switch. On STM32H7 it makes the protected
 range execute-only. Applying it to the complete bootloader sector can break
@@ -55,3 +69,19 @@ normal development setting.
 After production programming, run the audit with
 `-ExpectedProfile Production`. The audit is read-only; this repository
 intentionally contains no unattended command that writes option bytes.
+
+## Post-programming acceptance
+
+For each locked unit record:
+
+1. MCU UID, board serial and ST-LINK serial used during manufacturing;
+2. full option-byte readback and CubeProgrammer version;
+3. bootloader and application hashes plus signed image version;
+4. successful boot with SWD behavior matching the approved profile;
+5. TLS/MQTT connection using the unique device certificate;
+6. signed OTA install, healthy confirmation and rollback recovery;
+7. power-cycle recovery and absence of the production self-test trigger.
+
+Failure at any step quarantines the unit. Do not attempt ad-hoc option-byte
+changes on a provisioned production device, because an RDP transition can mass
+erase credentials and recovery images.

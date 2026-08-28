@@ -1,5 +1,9 @@
 # Middleware security baseline
 
+Implementation status: **migration completed and compiled, reviewed
+2026-08-24**. This document replaces every older statement that the project
+still uses Mbed TLS 2.16.2 or FreeRTOS 10.3.1.
+
 ## Locked versions
 
 | Component | Version | Official release | Source archive SHA-256 |
@@ -10,6 +14,15 @@
 The hashes above apply to the release archives downloaded from the official
 release pages. They are provenance records, not hashes of the modified vendor
 trees committed to this repository.
+
+The versions compiled by the current tree are also visible in:
+
+- `Middlewares/Third_Party/mbedTLS/include/mbedtls/build_info.h` —
+  `MBEDTLS_VERSION_STRING` equals `3.6.7`;
+- `Middlewares/Third_Party/FreeRTOS/Source/include/task.h` —
+  `tskKERNEL_VERSION_NUMBER` equals `V11.3.0`;
+- UART startup diagnostics emitted by `tls_client.c` and
+  `security_posture.c`.
 
 ## Imported scope
 
@@ -22,6 +35,8 @@ trees committed to this repository.
   for this CubeIDE project and is not supplied by the kernel release archive.
 - The bootloader links only the Mbed TLS modules needed for ECDSA P-256 and
   SHA-256 verification.
+- LwIP remains the Cube-integrated network stack; its version and ST adapter
+  must be audited independently from the two components listed above.
 
 ## Compatibility changes
 
@@ -55,6 +70,11 @@ passes TLS, MQTT, Fleet Provisioning, Device Shadow, Jobs HTTPS and OTA boot
 confirmation. A successful host build alone does not authorize flashing an
 unsigned application into a secure-boot layout.
 
+The audit script checks the locked versions and expected source inventory. It
+does not prove absence of a CVE, ABI mismatch in an unexecuted code path, or
+correct behavior under network and power faults. Those properties belong to
+the release regression and vulnerability-management process.
+
 ## Update procedure
 
 For each later security update:
@@ -67,3 +87,6 @@ For each later security update:
 6. publish a signed OTA image through the protected release process;
 7. retain the previous confirmed image until the new image reports healthy.
 
+For every released build, archive an SBOM or at minimum an immutable component
+manifest containing version, upstream URL, archive digest, import date,
+security advisories reviewed and the source commit that produced the image.

@@ -486,7 +486,10 @@ static FlashStagingResult FlashStaging_CommitReady(void)
         {
             confirmed_version = current.image_version;
         }
-        if (candidate.image_version <= confirmed_version)
+        if ((candidate.image_version == confirmed_version) ||
+            ((candidate.image_version < confirmed_version) &&
+             (!staging_request.allow_downgrade ||
+              (staging_request.rollback_from_version != confirmed_version))))
         {
             return FLASH_STAGING_INTEGRITY_ERROR;
         }
@@ -499,7 +502,10 @@ static FlashStagingResult FlashStaging_CommitReady(void)
         record.confirmed_version = confirmed_version;
         record.primary = current;
         record.secondary = candidate;
-        record.flags = OTA_CONTROL_FLAG_FIRMWARE;
+        record.flags = OTA_CONTROL_FLAG_FIRMWARE |
+            (staging_request.allow_downgrade
+                 ? OTA_CONTROL_FLAG_AUTHORIZED_DOWNGRADE
+                 : 0U);
         staging_info.image_version = candidate.image_version;
     }
     else

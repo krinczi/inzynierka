@@ -1,6 +1,7 @@
 # Signed dual-slot OTA
 
-Status: implemented and verified on STM32H753 hardware.
+Status: implemented and verified on STM32H753 hardware; authenticated downgrade
+and command-driven cancellation documented as of **2026-08-24**.
 
 The OTA chain downloads a signed package through AWS IoT Jobs and HTTPS,
 validates it in the application, installs it through a separate bootloader,
@@ -11,15 +12,17 @@ hash is correct.
 ## Trust and update flow
 
 1. AWS IoT Jobs supplies an HTTPS URL, the complete package size, package
-   SHA-256, artifact type `firmware`, and a monotonically increasing version.
+   SHA-256, artifact type `firmware`, and a signed release version.
 2. The application downloads the package into the secondary slot. HTTPS uses
    TLS 1.2 with hostname and server-certificate verification.
 3. The application checks the transport size and SHA-256, then validates the
    embedded OTA header, target, vector table, payload SHA-256, and ECDSA-P256
    signature.
 4. The application records `CANDIDATE_READY` and resets the MCU.
-5. The bootloader verifies the candidate again and rejects versions not greater
-   than the confirmed anti-rollback floor.
+5. The bootloader verifies the candidate again. An ordinary update must be
+   newer than the confirmed baseline. An older version additionally requires a
+   persisted, source-version-bound authorization created by an owner rollback
+   Job and local `allowRollback=true`.
 6. The bootloader swaps four sectors using a dedicated scratch sector. Every
    completed sub-step is appended to the control journal, so an interrupted
    swap resumes instead of guessing the Flash state.
@@ -28,12 +31,32 @@ hash is correct.
    and after the MQTT session has remained healthy for at least 30 seconds.
    A trial that cannot establish stable cloud communication is not promoted to
    the confirmed anti-rollback baseline.
-8. A confirmed trial advances the monotonic version floor. If the application
-   fails to confirm in three boots, the bootloader swaps the previous image back
-   and records a rollback result for later AWS Jobs reporting.
+8. A confirmed trial establishes the new confirmed baseline. Ordinary updates
+   advance it; an explicitly authorized downgrade may lower it. If the
+   application fails to confirm in three boots, the bootloader swaps the
+   previous image back and records a rollback result for later AWS Jobs
+   reporting.
 
-Invalid signatures, hashes, vector tables, target identifiers, and downgrade
-attempts fail closed. The known-good primary image remains bootable.
+Invalid signatures, hashes, vector tables, target identifiers, equal-version
+installs, and unauthorized downgrade attempts fail closed. The known-good
+primary image remains bootable.
+
+## OTA state model
+
+| State | Meaning | Allowed next outcome |
+| --- | --- | --- |
+| `CONFIRMED` | primary image is the accepted baseline | download candidate or local previous-slot rollback |
+| `DOWNLOAD_IN_PROGRESS` | secondary slot is being prepared | restart/abort or `CANDIDATE_READY` |
+| `CANDIDATE_READY` | complete package passed application verification | bootloader swap or rejection |
+| `SWAPPING` | sector exchange is in progress | resume after reset until `TRIAL` |
+| `TRIAL` | new primary is authenticated but not healthy-confirmed | `CONFIRMED` or automatic swap back |
+| `REJECTED` | candidate failed an installation gate | durable AWS failure report |
+| `SERVICE_FILE_READY` | non-executable artifact is staged | service consumer or replacement |
+
+The control journal stores sequence, CRC, commit marker, image descriptors,
+swap position, confirmed version, trial count, AWS Job identity and flags. AWS
+Job success is separate from transport success and is not emitted before trial
+confirmation.
 
 ## Flash layout
 
@@ -90,6 +113,11 @@ signing key must remain outside the repository and device, preferably in a CI
 secret store, KMS/HSM, or an offline release-signing environment. Changing the
 public key requires a deliberately signed trust-anchor migration strategy.
 
+Release identifiers remain globally unique and normally increase even though
+the deployment mechanism can explicitly select an older signed release for
+recovery. A signature proves publisher authenticity; it does not by itself
+authorize a downgrade on a particular device.
+
 ## Build and signing
 
 Example release flow from the repository root:
@@ -122,6 +150,11 @@ public key. `create-factory-image.mjs` pads the complete primary slot with
 `0xFF`, preventing stale bytes from a previous image from becoming part of a
 factory installation.
 
+The command above using a local private PEM is a development workflow. A
+production release uses the split request/sign/assemble flow in
+`RELEASE_SIGNING.md`; the signing credential must not exist on an operator
+workstation or in a normal CI artifact.
+
 ## AWS IoT Job document
 
 The `sha256` field below protects the complete `.ota.bin` package during
@@ -142,10 +175,27 @@ transport. The embedded header separately authenticates the firmware payload.
 }
 ```
 
-The document version and embedded signed version must match. A firmware
-candidate must also be newer than the last confirmed image. Ordinary
+The document version and embedded signed version must match. An ordinary
+firmware candidate must be newer than the last confirmed image. Ordinary
 `service-file` Jobs remain supported but are never installed as executable
 firmware.
+
+To deploy any older **signed and compatible** release, the owner-authorized
+backend creates a Job whose `artifact` additionally contains:
+
+```json
+{
+  "rollbackAuthorized": 1,
+  "rollbackFromVersion": 12
+}
+```
+
+`rollbackFromVersion` must equal the device's currently confirmed baseline,
+and Device Shadow configuration must enable `allowRollback`. Both the
+application and bootloader reject a lower version without the persisted
+authorization flag. This is distinct from `firmware.rollback`, which swaps
+only to the already authenticated image currently retained in the secondary
+slot.
 
 AWS Job success is intentionally deferred until the trial image is confirmed.
 After reconnect, the device reports one of:
@@ -169,6 +219,14 @@ After reconnect, the device reports one of:
 - The bootloader refreshes the independent watchdog during hashing and Flash
   operations.
 - The first signed factory image creates the initial confirmed version floor.
+- The authorized-downgrade flag is accepted only with a matching current
+  `rollbackFromVersion` and is carried through the control journal to the
+  bootloader; a network Job cannot bypass signature or target verification.
+- `jobs.cancel` aborts an active downloader and invalidates incomplete staging.
+  It does not erase a previously confirmed primary image.
+- `firmware.rollback` can select only the authenticated previous image already
+  present in the secondary slot. An arbitrary older release must be downloaded
+  as a signed, explicitly authorized rollback Job.
 
 ## Hardware verification performed
 
@@ -184,12 +242,15 @@ The implementation was verified on the target board without changing AWS:
 6. The bootloader automatically restored version 1 and retained version 2 in
    the secondary slot.
 7. The final board state was restored to a clean, signed, confirmed version 1
-   image with the anti-rollback floor set to 1.
+   image with confirmed baseline version 1.
 
 These tests cover installation, confirmation, rollback, slot exchange, and
 control-journal state transitions. Release qualification should additionally
 run repeated power-cut fault injection at every erase/program transition and a
-long-duration update campaign.
+long-duration update campaign. The authenticated-downgrade regression must use
+at least these negative cases: missing authorization fields, stale
+`rollbackFromVersion`, local `allowRollback=false`, equal target version,
+invalid signature and validly signed target for a different MCU.
 
 The repository includes a guarded reset-recovery harness:
 
@@ -216,6 +277,8 @@ The software boot chain is complete, but deployment security also requires:
 - enabling an appropriate RDP/PCROP/WRP policy after a tested recovery plan;
 - keeping the private signing key outside developer workstations in production;
 - issuing strictly increasing firmware versions;
+- allowing a downgrade only through an audited owner action bound to the
+  device's current confirmed version;
 - retaining and testing a signed recovery image;
 - monitoring rejected candidates and repeated rollbacks;
 - defining public-key rotation and signing-key revocation procedures.

@@ -1,6 +1,7 @@
 #include "aws_jobs.h"
 
 #include "debug_logger.h"
+#include "device_config.h"
 #include "flash_staging.h"
 #include "https_downloader.h"
 #include "main.h"
@@ -56,6 +57,8 @@ typedef struct
     uint32_t size_bytes;
     uint8_t sha256[FLASH_STAGING_SHA256_SIZE];
     uint32_t image_version;
+    uint32_t rollback_from_version;
+    uint8_t allow_downgrade;
     AwsJobsDocumentMode mode;
     AwsJobsArtifactType type;
 } AwsJobsArtifact;
@@ -607,6 +610,26 @@ static int Json_GetRequiredUInt32(JsonSlice object,
                : -1;
 }
 
+static int Json_GetOptionalUInt32(JsonSlice object,
+                                  const char *name,
+                                  uint32_t *output,
+                                  int *present)
+{
+    JsonSlice value;
+    int result = Json_ObjectFind(object, name, &value);
+
+    *present = result == JSON_MEMBER_FOUND;
+    if (result == JSON_MEMBER_NOT_FOUND)
+    {
+        *output = 0U;
+        return 0;
+    }
+    return (result == JSON_MEMBER_FOUND) &&
+           (Json_GetUInt32(value, output) == 0)
+               ? 0
+               : -1;
+}
+
 static int Jobs_GetAcceptedExecutionVersion(const char *payload,
                                              uint32_t *execution_version)
 {
@@ -917,6 +940,10 @@ static int Jobs_ValidateDocument(JsonSlice document,
 
             if (strcmp(artifact_type, "firmware") == 0)
             {
+                int rollback_authorized_present;
+                int rollback_from_present;
+                uint32_t rollback_authorized;
+
                 artifact->type = AWS_JOBS_ARTIFACT_FIRMWARE;
                 if ((Json_GetRequiredUInt32(artifact_object,
                                             "version",
@@ -924,6 +951,30 @@ static int Jobs_ValidateDocument(JsonSlice document,
                     (artifact->image_version == 0U))
                 {
                     *reason = "firmware_version_required";
+                    return -1;
+                }
+                if ((Json_GetOptionalUInt32(artifact_object,
+                                            "rollbackAuthorized",
+                                            &rollback_authorized,
+                                            &rollback_authorized_present) != 0) ||
+                    (Json_GetOptionalUInt32(artifact_object,
+                                            "rollbackFromVersion",
+                                            &artifact->rollback_from_version,
+                                            &rollback_from_present) != 0) ||
+                    (rollback_authorized_present != rollback_from_present) ||
+                    (rollback_authorized_present &&
+                     ((rollback_authorized != 1U) ||
+                      (artifact->rollback_from_version == 0U))))
+                {
+                    *reason = "invalid_rollback_authorization";
+                    return -1;
+                }
+                artifact->allow_downgrade =
+                    rollback_authorized_present ? 1U : 0U;
+                if (artifact->allow_downgrade &&
+                    (DeviceConfig_Get()->allow_rollback == 0U))
+                {
+                    *reason = "rollback_disabled";
                     return -1;
                 }
             }
@@ -1190,6 +1241,8 @@ static int Jobs_HandleStartNextAccepted(const char *payload)
            artifact.sha256,
            sizeof(download_request.expected_sha256));
     download_request.expected_image_version = artifact.image_version;
+    download_request.allow_downgrade = artifact.allow_downgrade;
+    download_request.rollback_from_version = artifact.rollback_from_version;
     (void)snprintf(download_request.job_id,
                    sizeof(download_request.job_id),
                    "%s",
@@ -1513,6 +1566,29 @@ int AwsJobs_OnDownloadComplete(int succeeded, const char *detail)
     return Jobs_PublishTerminalStatus(succeeded ? "SUCCEEDED" : "FAILED",
                                       succeeded ? "STAGED" : "DOWNLOAD_FAILED",
                                       succeeded ? "artifact_staged" : safe_detail);
+}
+
+int AwsJobs_CancelActive(const char *job_id)
+{
+    if ((job_id == NULL) || !Jobs_IsValidJobId(job_id))
+    {
+        return -1;
+    }
+    if ((jobs_context.active_job_id[0] == '\0') ||
+        (strcmp(jobs_context.active_job_id, job_id) != 0))
+    {
+        return 0;
+    }
+
+    Jobs_Logf("JOBS: local execution cancelled job=%s", job_id);
+    jobs_context.state = AWS_JOBS_STATE_IDLE;
+    jobs_context.retry_attempt = 0U;
+    jobs_context.retry_after_ms = 0U;
+    jobs_context.response_deadline_ms = 0U;
+    jobs_context.pending_install = 0U;
+    jobs_context.pending_ota_report = 0U;
+    Jobs_ClearActiveExecution();
+    return 1;
 }
 
 int AwsJobs_HandleMessage(const char *topic, const char *payload)

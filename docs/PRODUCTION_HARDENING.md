@@ -1,14 +1,18 @@
 # Production hardening status
 
+Assessment date: **2026-08-24**. Current middleware baseline: **Mbed TLS 3.6.7
+LTS and FreeRTOS Kernel 11.3.0**.
+
 This document separates mechanisms implemented in the application and
-bootloader from controls that require board hardware, AWS operations, or a
-middleware migration.
+bootloader from controls that require board hardware, AWS operations,
+manufacturing or release infrastructure.
 
 The exact option-byte baseline, read-only audit command and irreversible
 manufacturing gate are defined in `PRODUCTION_OPTION_BYTES.md`.
 
 The maintained Mbed TLS and FreeRTOS baseline, source provenance and regression
-gate are defined in `MIDDLEWARE_MIGRATION.md`.
+gate are defined in `MIDDLEWARE_MIGRATION.md`. Older references to Mbed TLS
+2.16.2 and FreeRTOS 10.3.1 are obsolete.
 
 ## Implemented in the application
 
@@ -54,9 +58,18 @@ Board integrations override:
   access.
 - The production boot-button Flash erase self-test remains disabled.
 
-The current Cube package contains only the non-MPU FreeRTOS port. The hardware
-MPU therefore protects memory attributes, but tasks remain privileged. Full
-per-task isolation requires a FreeRTOS MPU-port migration.
+The project currently builds the non-MPU ARM CM4F FreeRTOS port. The hardware
+MPU therefore enforces region memory attributes and execute-never behavior, but
+application tasks remain privileged and are not mutually isolated. Full
+per-task least privilege requires migration to a matching FreeRTOS MPU port,
+task-region definitions and regression of every HAL/LwIP callback; setting
+`configENABLE_MPU` alone is unsafe.
+
+The current Release map places approximately 0x5E7DC bytes of `.bss` in the
+512 KiB D1 RAM region, including the 192 KiB FreeRTOS heap. This leaves useful
+headroom but should be treated as a budget: every release must check linker
+usage, minimum free heap and task stack high-water marks. DTCM and other SRAM
+regions are not automatic substitutes for DMA-visible LwIP/Ethernet buffers.
 
 ### Durable operational outbox
 
@@ -96,6 +109,15 @@ The internal-Flash implementation is the board-compatible fallback. A high
 write-rate product should replace it with FRAM or another endurance-qualified
 store through the same queue semantics.
 
+Important boundary: the outbox uses one Flash sector. Individual appended
+records fail closed after an incomplete program, but compaction erases that
+sector before reconstructing live records from RAM. A power cut in this window
+can lose the operational queue. This implementation is therefore resilient and
+bounded, but not a fully atomic store across every power interruption. A strict
+store-and-forward requirement needs dual-sector copy-forward with a committed
+generation or external FRAM/MRAM. Flash endurance must be calculated from the
+real telemetry/event rate; throttling is not proof of lifetime by itself.
+
 ### Credentials and security posture
 
 - Fleet ownership tokens are removed after `RegisterThing` and migrated out of
@@ -113,7 +135,15 @@ store through the same queue semantics.
   environment explicitly enables its policy variables.
 - Runtime diagnostics report RDP, debugger, MPU, mbedTLS, and FreeRTOS state.
 - Production diagnostics warn when RDP is disabled, a debugger is attached, or
-  a legacy dependency baseline is detected.
+  a legacy dependency baseline is detected. The current 3.6.7/11.3.0 baseline
+  does not trigger the legacy-version warning.
+- Emergency provisioning revocation is persisted in the backend before a
+  best-effort `provisioning.cancel` command is sent. Online device erasure has
+  a distinct completion acknowledgement; an offline revoke is never presented
+  as proof that local Flash was cleared.
+- Recommissioning requires an owner-only, one-use, expiring challenge and a
+  controlled allow-list transition. It does not bypass local
+  `DECOMMISSIONED` quarantine.
 
 Option bytes are deliberately not programmed by the application. Before a
 production release, an authorized manufacturing step must:
@@ -179,7 +209,8 @@ procedure.
 
 ### Remote network configuration
 
-- Device Shadow schema version 2 adds DHCP/static selection, IPv4 address,
+- Named Device Shadow `config` schema version 3 includes DHCP/static selection,
+  IPv4 address,
   contiguous subnet mask, gateway, primary/secondary DNS and DHCP recovery.
 - API, web UI and firmware independently validate canonical IPv4 syntax,
   unicast host addressing and gateway membership in the configured subnet.
@@ -188,8 +219,11 @@ procedure.
 - After three failed AWS connection attempts with a static configuration, the
   optional recovery policy temporarily uses DHCP so the device can be repaired
   remotely. The desired static configuration remains persisted and visible.
-- Version 1 configuration records and reported states are migrated to safe DHCP
-  defaults, preserving compatibility with devices upgraded in the field.
+- Configuration storage formats 1 and 2 are migrated to format 3 with safe
+  DHCP defaults, preserving compatibility with devices upgraded in the field.
+- Shadow writes are versioned. The API uses optimistic locking and the device
+  applies only a newer `configVersion`, preventing an older retained/update
+  message from silently overwriting the active configuration.
 
 ### Complete signed OTA boot chain
 
@@ -204,9 +238,17 @@ procedure.
   operational and MQTT has remained healthy for at least 30 seconds.
 - Three unconfirmed trial boots trigger automatic restoration of the previous
   image.
-- The confirmed version is a monotonic anti-rollback floor.
+- Ordinary updates must be newer than the confirmed baseline. An owner may
+  select an older signed and compatible release only through an audited AWS Job
+  containing `rollbackAuthorized=1` and a matching `rollbackFromVersion`, and
+  only when local `allowRollback` is enabled.
+- `firmware.rollback` is a separate immediate recovery operation limited to the
+  authenticated previous image already retained in the secondary slot.
 - AWS Job completion is retained across reset and reported only after
   confirmation, rejection, or rollback.
+- `jobs.cancel` aborts only a matching active execution and reports completion
+  through `cmd/result`; the management application exposes an intermediate
+  `CANCEL_REQUESTED` state.
 
 Jobs remain compatible with non-executable `service-file` staging. The
 firmware signing private key is never stored in the repository or device; only
@@ -216,22 +258,22 @@ in `docs/FULL_OTA.md`.
 
 ## Remaining production deliverables
 
-### Middleware migration
+### Middleware lifecycle
 
-The generated project currently contains mbedTLS 2.16.2 and FreeRTOS 10.3.1.
-Replacing individual files is unsafe because the Cube integration, APIs,
-configuration, ports, and test matrix must move together. The release process
-must include:
+The security migration is complete: the committed tree builds Mbed TLS 3.6.7
+LTS and FreeRTOS Kernel 11.3.0. Remaining work is operational rather than a
+missing feature:
 
-1. migration to a maintained STM32Cube middleware baseline with mbedTLS 3.6
-   LTS and a supported FreeRTOS release;
-2. regeneration of integration code in a dedicated branch;
-3. TLS, Fleet Provisioning, Jobs, Shadow, reconnect, fault-injection, and
-   long-run regression tests;
-4. an SBOM and periodic CVE review with documented response deadlines.
+1. generate an SBOM/component manifest for every release;
+2. monitor upstream advisories and define CVE response deadlines;
+3. update only through a dedicated branch preserving the Cube/LwIP adapters;
+4. repeat TLS, Fleet Provisioning, Jobs, Shadow, reconnect, OTA, power-fault
+   and long-run regression after every middleware update;
+5. migrate to a supported FreeRTOS MPU port only if per-task isolation is a
+   product requirement.
 
-Until that migration is complete, the runtime emits an explicit legacy
-dependency warning and the image must not be classified as production-ready.
+Version audit and import provenance are documented in
+`MIDDLEWARE_MIGRATION.md`.
 
 ### Boot-chain deployment controls
 
@@ -241,6 +283,23 @@ policy, move release signing to an HSM or protected CI service, define signing
 key rotation/revocation, and execute repeated power-cut qualification at every
 Flash transition. These controls deliberately remain outside normal
 application firmware.
+
+### Storage, hardware and operations
+
+The following items cannot be closed by compiling the application alone:
+
+- choose dual-sector outbox or FRAM when loss of queued data during compaction
+  is unacceptable;
+- implement and calibrate real current, humidity, signal and product-specific
+  sensor drivers;
+- decide whether RDP1 is sufficient or a secure element is required for the
+  device private key;
+- qualify Flash endurance and power-cut recovery with production voltage,
+  temperature and update sizes;
+- configure AWS monitoring, log retention, database backup, cost alerts and an
+  on-call incident path;
+- record option bytes, firmware hash, certificate identity and manufacturing
+  serial for each released unit.
 
 ## Claim-certificate operations
 

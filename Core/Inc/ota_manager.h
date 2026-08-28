@@ -28,6 +28,13 @@ int OtaManager_ConfirmHealthy(void);
 /* Resets into the bootloader only when a verified candidate is READY. */
 int OtaManager_RequestInstall(void);
 
+/*
+ * Authenticates the previous image in the secondary slot and atomically
+ * prepares a reverse swap. The caller must acknowledge the command before
+ * rebooting into the bootloader.
+ */
+int OtaManager_PrepareManualRollback(uint32_t *target_version);
+
 /* Resets an unconfirmed trial when its health deadline expires. */
 void OtaManager_Process(uint32_t now_ms);
 

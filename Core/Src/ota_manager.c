@@ -124,7 +124,9 @@ int OtaManager_RequestInstall(void)
     if ((OtaControl_LoadLatest(&record) != OTA_CONTROL_OK) ||
         (record.state != OTA_CONTROL_STATE_CANDIDATE_READY) ||
         !OtaControl_ImageDescriptorIsValid(&record.secondary) ||
-        (record.secondary.image_version <= record.confirmed_version))
+        (record.secondary.image_version == record.confirmed_version) ||
+        ((record.secondary.image_version < record.confirmed_version) &&
+         ((record.flags & OTA_CONTROL_FLAG_AUTHORIZED_DOWNGRADE) == 0U)))
     {
         Debug_LogLine(DEBUG_SRC_SYSTEM,
                       "OTA: install request rejected, no valid candidate");
@@ -136,6 +138,64 @@ int OtaManager_RequestInstall(void)
     __DSB();
     NVIC_SystemReset();
     return -1;
+}
+
+int OtaManager_PrepareManualRollback(uint32_t *target_version)
+{
+    OtaControlRecord record;
+    OtaImageDescriptor verified_secondary;
+
+    if ((OtaControl_LoadLatest(&record) != OTA_CONTROL_OK) ||
+        (record.state != OTA_CONTROL_STATE_CONFIRMED) ||
+        !OtaControl_ImageDescriptorIsValid(&record.primary) ||
+        !OtaControl_ImageDescriptorIsValid(&record.secondary) ||
+        (record.secondary.image_version == record.primary.image_version))
+    {
+        Debug_LogLine(DEBUG_SRC_SYSTEM,
+                      "OTA: manual rollback rejected, no previous image");
+        return -1;
+    }
+    if ((OtaImage_VerifySlot(OTA_SECONDARY_SLOT_ADDRESS,
+                             &verified_secondary) != OTA_IMAGE_OK) ||
+        (memcmp(&verified_secondary,
+                &record.secondary,
+                sizeof(verified_secondary)) != 0))
+    {
+        Debug_LogLine(DEBUG_SRC_SYSTEM,
+                      "OTA: manual rollback rejected, secondary authentication failed");
+        return -1;
+    }
+    if (OtaControl_EnsureCapacity(OTA_CONTROL_REQUIRED_INSTALL_RECORDS) !=
+        OTA_CONTROL_OK)
+    {
+        Debug_LogLine(DEBUG_SRC_SYSTEM,
+                      "OTA: manual rollback control log capacity failed");
+        return -1;
+    }
+
+    record.state = OTA_CONTROL_STATE_SWAPPING;
+    record.swap_direction = OTA_SWAP_DIRECTION_ROLLBACK;
+    record.swap_sector = 0U;
+    record.swap_step = OTA_SWAP_STEP_PRIMARY_TO_SCRATCH;
+    record.trial_boot_count = 0U;
+    record.flags &= ~(OTA_CONTROL_FLAG_JOB_REPORT_PENDING |
+                      OTA_CONTROL_FLAG_ROLLBACK_PERFORMED |
+                      OTA_CONTROL_FLAG_INSTALL_REJECTED);
+    memset(record.job_id, 0, sizeof(record.job_id));
+    record.job_execution_version = 0U;
+    if (OtaControl_Append(&record) != OTA_CONTROL_OK)
+    {
+        Debug_LogLine(DEBUG_SRC_SYSTEM,
+                      "OTA: manual rollback request persistence failed");
+        return -1;
+    }
+
+    if (target_version != NULL)
+    {
+        *target_version = verified_secondary.image_version;
+    }
+    OtaManager_LogRecord("manual-rollback-ready", &record);
+    return 0;
 }
 
 void OtaManager_Process(uint32_t now_ms)

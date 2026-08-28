@@ -31,6 +31,13 @@ int AwsJobs_Process(void);
 int AwsJobs_OnDownloadComplete(int succeeded, const char *detail);
 
 /*
+ * Forgets a matching in-flight execution after its transfer has been aborted
+ * by the command layer. Returns 1 when an execution was cancelled, 0 when the
+ * requested job is not active and -1 for an invalid identifier.
+ */
+int AwsJobs_CancelActive(const char *job_id);
+
+/*
  * Returns 1 when the topic was handled, 0 when it is not a Jobs topic,
  * and -1 when handling required an MQTT publish that failed.
  */

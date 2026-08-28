@@ -2,7 +2,8 @@
 
 Status: bounded HTTPS artifact download, service-file staging, and signed
 dual-slot firmware OTA implemented. See `docs/FULL_OTA.md` for installation,
-trial boot, anti-rollback, and automatic rollback.
+trial boot, baseline enforcement, authorized downgrade and automatic rollback.
+Reviewed against the implementation on **2026-08-24**.
 
 ## Memory layout
 
@@ -49,7 +50,12 @@ primary payload area (`512 KiB - 1024 bytes`).
 - Application code executes from Bank 1 while download writes target Bank 2.
 - Firmware packages contain a signed `OTA3` header and are revalidated by the
   bootloader before installation.
+- An older signed firmware package is accepted only with a source-version-bound
+  authorization persisted in the control record and with local rollback policy
+  enabled. Transport metadata alone cannot authorize it.
 - Service files remain non-executable and are never selected by the bootloader.
+- Aborting a transfer invalidates incomplete metadata. It never promotes a
+  partial package to `READY` or modifies the confirmed primary image.
 
 ## API lifecycle
 
@@ -65,6 +71,12 @@ primary payload area (`512 KiB - 1024 bytes`).
 
 An interrupted download is deliberately restarted from byte zero.
 This provides deterministic retry without trusting partially written data.
+
+The staging transaction and OTA control journal must not be confused with the
+operational outbox. Staging uses the secondary Bank 2 slot and a commit-last
+record. The events/telemetry outbox uses a separate single Bank 1 sector whose
+compaction has the power-cut limitation documented in
+`DURABLE_OUTBOX_AND_TOPIC_CONTRACT.md`.
 
 ## Hardware self-test for this stage
 
@@ -101,6 +113,10 @@ Safety guard: the self-test refuses to erase staging when a different valid
 file is in state `READY`. It is disabled by the default production profile and
 can be enabled explicitly with `FLASH_STAGING_BUTTON_SELF_TEST_ENABLED=1`.
 
+Enabling this macro changes production behavior and must not be part of a
+release image. The USER button is a diagnostic trigger, not an authorization
+mechanism for installing firmware.
+
 Further fault-injection tests for the AWS Jobs integration should reset the
 device during transfer and use an incorrect digest. After restart, an
 interrupted or corrupted transfer must never be reported as `READY`.
@@ -108,3 +124,13 @@ interrupted or corrupted transfer must never be reported as `READY`.
 The AWS Jobs downloader serializes Flash staging operations in the existing
 MQTT service loop. It restarts an interrupted transfer from byte zero and
 reports terminal status through the reserved AWS Jobs update topic.
+
+## Result interpretation
+
+- `READY` for `service-file` means size and SHA-256 are valid; no code will run.
+- `CANDIDATE_READY` for firmware means transport and OTA3 verification passed;
+  it is still not a confirmed release.
+- `SUCCEEDED` from HTTPS means only that the transfer completed. Firmware Job
+  `SUCCEEDED` is deferred until the trial image becomes healthy.
+- A cancellation can leave erased or partially programmed bytes in the
+  secondary slot, but without committed metadata the bootloader ignores them.
