@@ -733,10 +733,7 @@ static int IotEvents_MakeRoom(IotMessageType type,
         }
     }
 
-    /*
-     * Never discard an event covered by the durability policy to make room
-     * for a newer one. The producer receives QUEUE_FULL and can retry later.
-     */
+    /* Durable events are never evicted; the producer retries on QUEUE_FULL. */
     dropped_count++;
     return -1;
 }
@@ -826,10 +823,7 @@ static IotEventResult IotEvents_Queue(IotMessageType type,
                                  entry,
                                  sizeof(*entry)) != 0))
     {
-        /*
-         * Keep the event in RAM so it can still be delivered. The explicit
-         * failure counter makes the degraded durability observable.
-         */
+        /* Preserve delivery in RAM and expose degraded durability via the counter. */
         persistence_failure_count++;
     }
     queue_count++;
@@ -1111,10 +1105,7 @@ int IotEvents_QueueTelemetry(const IotTelemetrySample *sample)
         }
     }
 
-    /* Append the replacement first. During recovery, applying a PUT to a full
-     * bounded queue deterministically evicts the oldest sample. This ordering
-     * means a power loss can leave the old sample or the new sample, but never
-     * erase the old one before the replacement is durable. */
+    /* Append before eviction so power loss leaves either the old or new sample. */
     if (IotEvents_JournalAppend(IOT_EVENT_JOURNAL_KIND_TELEMETRY_PUT,
                                 sample,
                                 sizeof(*sample)) != 0)

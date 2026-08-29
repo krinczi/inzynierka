@@ -7,15 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 
-/*
- * The final two 128 KiB sectors of Bank 2 are reserved for configuration.
- * Application code is restricted to Bank 1 and the preceding Bank 2 sectors
- * are reserved for download staging, so neither configuration slot can
- * overlap executable or staged data. Records are appended in alternating
- * sectors; normal configuration updates program one Flash word and do not
- * erase an entire sector. The previous valid generation remains available if
- * power is lost.
- */
+/* Bank 2 sectors 6/7 form an alternating, power-loss-safe config journal. */
 #define DEVICE_CONFIG_SLOT_A_ADDRESS       0x081C0000UL
 #define DEVICE_CONFIG_SLOT_B_ADDRESS       0x081E0000UL
 #define DEVICE_CONFIG_SLOT_A_SECTOR        FLASH_SECTOR_6

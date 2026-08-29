@@ -7,14 +7,7 @@
 #include <stdint.h>
 #include <string.h>
 
-/*
- * The last two sectors of Bank 1 are outside the executable linker region.
- * Records are appended in the active sector. When it is full, the other
- * sector is erased and becomes active while the last verified generation
- * remains intact in the old sector. This preserves a rollback record during
- * multi-step credential rotation and minimizes sector erases. Firmware
- * updates do not touch either credential sector.
- */
+/* Append-only dual-sector journal outside the executable linker region. */
 #define CREDENTIAL_SLOT_A_ADDRESS       0x080C0000UL
 #define CREDENTIAL_SLOT_B_ADDRESS       0x080E0000UL
 #define CREDENTIAL_SLOT_A_SECTOR        FLASH_SECTOR_6
@@ -349,10 +342,7 @@ static int CredentialStore_PrepareRecord(CredentialStoreState state,
         return -1;
     }
 
-    /*
-     * Keep the unused tail erased. The CRC still protects the complete record,
-     * but only the occupied Flash words have to be programmed.
-     */
+    /* CRC covers the erased tail; only occupied Flash words are programmed. */
     memset(record, 0xFF, sizeof(*record));
     record->header.magic = CREDENTIAL_FLASH_MAGIC;
     record->header.storage_format = CREDENTIAL_STORAGE_FORMAT;
@@ -710,10 +700,7 @@ int CredentialStore_CommitProvisioned(const char *thing_name)
                        : CREDENTIAL_STORE_PROVISIONED;
     data = current_data;
     strcpy(data.thing_name, thing_name);
-    /*
-     * The Fleet Provisioning ownership token is single-use and must not stay
-     * in the long-lived provisioned record.
-     */
+    /* Ownership tokens are single-use and excluded from provisioned records. */
     CredentialStore_SecureZero(data.ownership_token,
                                sizeof(data.ownership_token));
     current_rotation_validation_failures = 0U;

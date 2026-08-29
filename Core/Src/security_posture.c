@@ -25,19 +25,9 @@ void SecurityPosture_ConfigureMpu(void)
     region.BaseAddress = SECURITY_CREDENTIAL_FLASH_BASE;
     region.Size = MPU_REGION_SIZE_256KB;
     region.SubRegionDisable = 0x00U;
-    /*
-     * These Flash areas are programmed at runtime. Map them as normal,
-     * non-cacheable memory so HAL Flash stores reach the controller
-     * synchronously instead of becoming deferred AXI writes. A cacheable
-     * writable mapping can otherwise surface later as IMPRECISERR at a
-     * barrier or cache-maintenance instruction.
-     */
+    /* Non-cacheable mapping prevents deferred AXI writes to Flash journals. */
     region.TypeExtField = MPU_TEX_LEVEL1;
-    /*
-     * Flash managers execute in privileged mode and must be able to program
-     * their assigned regions. Unprivileged application code receives
-     * read-only access after the FreeRTOS MPU-port migration.
-     */
+    /* Flash managers remain privileged; application tasks receive read-only access. */
     region.AccessPermission = MPU_REGION_PRIV_RW_URO;
     region.DisableExec = MPU_INSTRUCTION_ACCESS_DISABLE;
     region.IsShareable = MPU_ACCESS_NOT_SHAREABLE;

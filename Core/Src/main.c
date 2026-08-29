@@ -1002,11 +1002,7 @@ static void Network_RecordCloudConnectionFailure(void)
     }
 }
 
-/*
- * This is the sole owner of all mbedTLS/MQTT contexts.  Bounded waits during
- * DNS, TCP, TLS, Fleet Provisioning and MQTT setup therefore cannot stop the
- * Ethernet link supervisor in defaultTask.
- */
+/* Sole owner of mbedTLS/MQTT state; link supervision stays in defaultTask. */
 static void StartMqttServiceTask(void *argument)
 {
     uint32_t retry_after_ms = 0U;

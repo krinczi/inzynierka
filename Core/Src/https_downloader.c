@@ -1112,12 +1112,7 @@ void HttpsDownloader_Init(mbedtls_x509_crt *root_ca,
         dns_generation = downloader.dns_generation;
     }
 
-    /*
-     * Do not clear the complete object here.  It embeds mbedTLS contexts and
-     * large I/O buffers; on reconnect only their ownership/state fields need
-     * to be reset.  Active resources are released above, and the static
-     * object is already zero-initialized on the first boot.
-     */
+    /* Preserve embedded mbedTLS contexts and buffers after releasing resources. */
     mbedtls_net_init(&downloader.net);
     downloader_initialized = 1;
     downloader.dns_generation = dns_generation;

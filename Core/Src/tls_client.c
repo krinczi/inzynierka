@@ -159,12 +159,9 @@ static uint32_t mqtt_provisioning_next_attempt_ms = 0U;
 static uint32_t mqtt_lifecycle_reset_deadline_ms = 0U;
 static uint8_t mqtt_shadow_get_pending = 0U;
 static uint8_t mqtt_rx_buffer[MQTT_RX_BUFFER_SIZE];
-/* The current packet is detached before dispatch so nested MQTT I/O cannot
- * process the same bytes recursively while a handler publishes a response. */
+/* Detached before dispatch to prevent recursive processing during replies. */
 static uint8_t mqtt_packet_buffer[MQTT_RX_BUFFER_SIZE];
-/* Shared by the single MQTT owner task to keep large capability messages off
- * its stack. Nested command replies occur only after the previous packet has
- * already been written to TLS, so reusing this buffer is safe. */
+/* Shared by the MQTT owner task to keep large payloads off its stack. */
 static uint8_t mqtt_tx_buffer[MQTT_TX_BUFFER_SIZE];
 static char mqtt_capabilities_payload[MQTT_CAPABILITIES_JSON_BUFFER_SIZE];
 static char mqtt_config_reported_payload[MQTT_JSON_BUFFER_SIZE];
@@ -180,13 +177,7 @@ static uint8_t mqtt_command_processing = 0U;
 static char mqtt_last_command_id[96];
 static char mqtt_last_command_status[16];
 static char mqtt_last_command_message[128];
-/*
- * Some deployed AWS IoT policies authorize the normal device topics but do
- * not authorize a retained Last Will during CONNECT.  AWS closes such a
- * connection before CONNACK.  Try the production LWT once, then remember the
- * broker capability for the rest of this boot and reconnect in compatibility
- * mode instead of entering an endless reconnect loop.
- */
+/* Retry without retained LWT when the broker rejects CONNECT before CONNACK. */
 static uint8_t mqtt_retained_status_enabled = 1U;
 
 static int mqtt_process_rx_buffer(void);
@@ -771,10 +762,7 @@ static int Tls_LwipConnectIp(mbedtls_net_context *ctx,
     ctx->fd = sock;
 
     struct timeval rcv_to;
-    /*
-     * Socket jest ustawiony jako nieblokujacy, ale krotki timeout jest
-     * dodatkowym zabezpieczeniem, gdyby LwIP zignorowal MSG_DONTWAIT.
-     */
+    /* Bound the socket in case LwIP ignores MSG_DONTWAIT. */
     rcv_to.tv_sec = 0;
     rcv_to.tv_usec = TLS_SOCKET_IO_TIMEOUT_US;
 
@@ -834,12 +822,7 @@ static int Tls_LwipRecv(void *ctx, unsigned char *buf, size_t len)
 
     tls_recv_calls++;
 
-    /*
-     * MSG_DONTWAIT jest obslugiwane bezposrednio przez lwIP jako
-     * NETCONN_DONTBLOCK (sys_arch_mbox_tryfetch). Nie uzywamy tu select(),
-     * poniewaz jego obsluga deskryptorow potrafila zatrzymac kolejne kroki
-     * handshake po pierwszym MBEDTLS_ERR_SSL_WANT_READ.
-     */
+    /* select() previously stalled TLS after WANT_READ; use NETCONN_DONTBLOCK. */
     if (to_recv > TLS_SOCKET_IO_MAX_CHUNK)
     {
         to_recv = TLS_SOCKET_IO_MAX_CHUNK;
@@ -890,11 +873,7 @@ int TlsClient_Connect(void)
     size_t client_private_key_length = sizeof(AWS_PRIVATE_KEY_PEM);
     uint32_t verify_flags = 0;
 
-    /*
-     * Fleet Provisioning may have committed a new Thing name since the
-     * previous session. Refresh identity and all derived topics before using
-     * the unique certificate for the reconnect.
-     */
+    /* Provisioning may change Thing name; refresh identity-derived topics. */
     if ((DeviceIdentity_Refresh() != 0) ||
         (MqttTopics_Init(MQTT_ENV, DeviceIdentity_GetThingName()) != 0))
     {
@@ -1086,10 +1065,7 @@ int TlsClient_Connect(void)
                                  MBEDTLS_SSL_MAJOR_VERSION_3,
                                  MBEDTLS_SSL_MINOR_VERSION_3);
 
-    /*
-     * Wymuszamy sprawdzony zestaw TLS 1.2 dla AWS IoT i certyfikatu RSA.
-     * Dzieki temu handshake nie wybiera przypadkowo innego cipher suite.
-     */
+    /* Restrict AWS IoT to the validated TLS 1.2 RSA suite. */
     mbedtls_ssl_conf_ciphersuites(&tls_conf, aws_ciphersuites);
 
     mbedtls_ssl_conf_authmode(&tls_conf, MBEDTLS_SSL_VERIFY_REQUIRED);
@@ -1252,9 +1228,7 @@ int TlsClient_Connect(void)
             {
                 hs_last_log = now;
 
-                /* Do not call synchronous getsockopt() here. If the tcpip
-                 * mailbox is busy, it can block this diagnostic path and
-                 * prevent the handshake timeout from being evaluated. */
+                /* Avoid synchronous getsockopt() while the tcpip mailbox is busy. */
                 tls_log_diagf("TLS WAIT: t=%lu tr=%d sc=%lu rc=%lu sr=%d se=%d rr=%d re=%d rx=%lu pb=%lu er=%lu al=%lu fr=%lu af=%lu",
                               (unsigned long)(now - hs_start),
                               hs_try,
@@ -1688,12 +1662,7 @@ static int mqtt_subscribe_topic(const char *topic, uint16_t packet_id)
             return -1;
         }
 
-        /*
-         * mqtt_read_available() may have completed this synchronous
-         * subscription.  Do not yield once more after the matching SUBACK:
-         * the caller can advance immediately to the next subscription and
-         * the normal MQTT service loop will yield between later operations.
-         */
+        /* Advance immediately when mqtt_read_available() receives the SUBACK. */
         if (mqtt_suback_result != 0)
         {
             break;
@@ -1967,11 +1936,7 @@ static int mqtt_publish_status(void)
                                                payload);
     }
 
-    /*
-     * Broker policy compatibility: keep status observable without RETAIN.
-     * QoS 0 also prevents an application command handler from synchronously
-     * waiting for a status PUBACK while it is already dispatching MQTT input.
-     */
+    /* Compatibility status uses QoS 0 to avoid nested PUBACK waits. */
     return mqtt_publish_json(MqttTopics_Get()->status, payload);
 }
 
@@ -4084,12 +4049,7 @@ static int mqtt_handle_publish_packet(const uint8_t *packet,
     payload[payload_length] = '\0';
     tls_logf("MQTT: received PUBLISH %s", topic);
 
-    /*
-     * MQTT QoS 1 acknowledges transport-level receipt, not completion of the
-     * application action.  Send PUBACK before a handler performs synchronous
-     * response publishes; otherwise the broker may retransmit while the
-     * original packet is still being handled.
-     */
+    /* PUBACK precedes handler replies to prevent broker retransmission. */
     if (qos == 1U)
     {
         uint8_t puback[4] = {
@@ -4112,7 +4072,7 @@ static int mqtt_handle_publish_packet(const uint8_t *packet,
     }
     if (fleet_result > 0)
     {
-        /* Handled by the automatic Fleet Provisioning state machine. */
+        /* Provisioning handled it. */
     }
     else
     {
@@ -4124,7 +4084,7 @@ static int mqtt_handle_publish_packet(const uint8_t *packet,
 
         if (jobs_result > 0)
         {
-            /* Handled by the AWS IoT Jobs state machine. */
+            /* Jobs handled it. */
         }
         else
         {
@@ -4136,7 +4096,7 @@ static int mqtt_handle_publish_packet(const uint8_t *packet,
 
             if (shadow_result > 0)
             {
-                /* Handled by the AWS IoT Device Shadow configuration flow. */
+                /* Shadow handled it. */
             }
             else if (strcmp(topic, MqttTopics_Get()->command) == 0)
             {
@@ -4281,11 +4241,7 @@ static int mqtt_process_rx_buffer(void)
             return 0;
         }
 
-        /*
-         * Detach the packet before dispatch.  Publish handlers are allowed to
-         * perform MQTT I/O; a nested read must see only subsequent packets,
-         * never the packet currently being handled.
-         */
+        /* Detach before handlers can perform nested MQTT I/O. */
         memcpy(mqtt_packet_buffer, mqtt_rx_buffer, packet_length);
         mqtt_rx_length -= packet_length;
         if (mqtt_rx_length > 0U)
@@ -4357,12 +4313,7 @@ static int mqtt_read_available(void)
                 return -1;
             }
 
-            /*
-             * A synchronous SUBSCRIBE waits only for its own SUBACK. Do not
-             * keep draining TLS data after that acknowledgement: retained
-             * publishes and later packets stay in the bounded MQTT buffer or
-             * socket and are handled by the next service step.
-             */
+            /* Stop draining after the matching SUBACK; later packets stay queued. */
             if ((mqtt_expected_suback_packet_id != 0U) &&
                 (mqtt_suback_result != 0))
             {
@@ -4535,9 +4486,7 @@ int TlsClient_MqttTest(void)
         return -1;
     }
 
-    /* Publish the registry before schema-v2 samples. An upgraded device may
-     * introduce new metric ids and the backend must validate them against the
-     * new registry rather than a catalog cached from the previous firmware. */
+    /* Publish the registry before schema-v2 samples introduce new metric ids. */
     if (mqtt_publish_telemetry() != 0)
     {
         tls_log("MQTT: initial telemetry failed");
@@ -4642,9 +4591,7 @@ int TlsClient_MqttProcess(void)
         return -1;
     }
 
-    /* Replay at most one stored sample per service step. QoS 1 plus the
-     * stable sampleId makes a lost PUBACK safe: the backend deduplicates a
-     * possible retransmission before the Flash ACK is appended. */
+    /* Replay one sample per step; sampleId makes lost-PUBACK retries idempotent. */
     if (mqtt_flush_queued_telemetry() != 0)
     {
         mqtt_ready = 0;
@@ -4666,9 +4613,7 @@ int TlsClient_MqttProcess(void)
     }
     ping_interval_ms = (uint32_t)mqtt_negotiated_keep_alive_seconds * 500U;
 
-    /* A live MQTT socket is not enough to prove application health. Publish a
-     * compact status heartbeat so the backend can expire ONLINE state when the
-     * task, broker session or physical network stops making progress. */
+    /* Heartbeat lets the backend expire stale ONLINE state. */
     if ((now - mqtt_last_status_ms) >= MQTT_STATUS_HEARTBEAT_INTERVAL_MS)
     {
         mqtt_last_status_ms = now;

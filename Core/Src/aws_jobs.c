@@ -1085,13 +1085,7 @@ static int Jobs_PublishTerminalStatus(const char *status,
                              jobs_context.active_job_id);
     if (jobs_context.pending_ota_report != 0U)
     {
-        /*
-         * A pre-fix image may have rebooted after AWS advanced the execution
-         * version but before that value was persisted. expectedVersion is
-         * optional; omit it only for the durable post-reset terminal report.
-         * The job id, device identity and pending marker still bind the update
-         * to the exact execution.
-         */
+        /* Post-reset reports may omit an unpersisted expectedVersion. */
         payload_written = snprintf(payload,
                                    sizeof(payload),
                                    "{\"status\":\"%s\",\"statusDetails\":{"
