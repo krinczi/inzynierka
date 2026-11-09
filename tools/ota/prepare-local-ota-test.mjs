@@ -18,7 +18,8 @@ function usage() {
     "Usage: node prepare-local-ota-test.mjs --primary <v1.ota.bin> " +
       "--candidate <v2.ota.bin> --slot-output <secondary-slot.bin> " +
       "--control-output <candidate-control.bin> " +
-      "--bank2-output <candidate-bank2.bin>",
+      "--bank2-output <candidate-bank2.bin> " +
+      "[--sequence <positive integer>]",
   );
   process.exit(2);
 }
@@ -26,6 +27,17 @@ function usage() {
 function argument(name) {
   const index = process.argv.indexOf(name);
   if (index === -1 || index + 1 >= process.argv.length) {
+    usage();
+  }
+  return process.argv[index + 1];
+}
+
+function optionalArgument(name, fallback) {
+  const index = process.argv.indexOf(name);
+  if (index === -1) {
+    return fallback;
+  }
+  if (index + 1 >= process.argv.length) {
     usage();
   }
   return process.argv[index + 1];
@@ -67,6 +79,14 @@ const candidate = await readFile(resolve(argument("--candidate")));
 const slotOutput = resolve(argument("--slot-output"));
 const controlOutput = resolve(argument("--control-output"));
 const bank2Output = resolve(argument("--bank2-output"));
+const sequence = Number(optionalArgument("--sequence", "1"));
+if (
+  !Number.isSafeInteger(sequence) ||
+  sequence <= 0 ||
+  sequence > 0xffffffff
+) {
+  throw new Error("Control sequence must be an integer from 1 to 4294967295.");
+}
 assertPackage(primary, "Primary image");
 assertPackage(candidate, "Candidate image");
 
@@ -83,7 +103,7 @@ const control = Buffer.alloc(CONTROL_RECORD_SIZE, 0);
 control.writeUInt32LE(CONTROL_MAGIC, 0);
 control.writeUInt16LE(CONTROL_FORMAT, 4);
 control.writeUInt16LE(CONTROL_RECORD_SIZE, 6);
-control.writeUInt32LE(1, 8);
+control.writeUInt32LE(sequence, 8);
 control.writeUInt32LE(STATE_CANDIDATE_READY, 12);
 control.writeUInt32LE(SWAP_DIRECTION_FORWARD, 16);
 control.writeUInt32LE(0, 20);

@@ -269,6 +269,35 @@ candidate matching the current source is active. A hardware reset verifies
 reset recovery; qualification against an actual loss of power additionally
 requires a controllable power supply or USB relay.
 
+### Safe local control-journal preparation
+
+On STM32H7, do not append OTA control records to internal Flash with debugger
+word-write commands such as `-w32`. The Flash controller programs complete
+Flash words together with ECC; a partial debugger write can leave an
+unreadable record and make journal scanning fault before the application
+starts.
+
+For a local hardware test:
+
+1. upload and archive the complete 128 KiB control-log sector;
+2. prepare a validated 512-byte record with the next sequence number;
+3. create a complete updated sector image without changing prior bytes:
+
+```powershell
+node tools/ota/append-control-record.mjs `
+  --input control-log-before-test.bin `
+  --record candidate-control.bin `
+  --output control-log-with-candidate.bin
+```
+
+4. inspect the resulting image with `inspect-control-log.mjs`;
+5. program the complete sector under reset and enable programmer verification;
+6. read the sector back before relying on the candidate state.
+
+This procedure is for controlled local verification. Normal field updates must
+create journal records through the running firmware after authenticated AWS IoT
+Jobs validation, not through ST-LINK.
+
 ## Manufacturing and operations
 
 The software boot chain is complete, but deployment security also requires:

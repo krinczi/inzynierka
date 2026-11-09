@@ -3,9 +3,12 @@
 #include "debug_logger.h"
 #include "main.h"
 
+#include "cmsis_os.h"
+#include "lwip/dns.h"
 #include "lwip/inet.h"
-#include "lwip/netdb.h"
+#include "lwip/ip_addr.h"
 #include "lwip/sockets.h"
+#include "lwip/tcpip.h"
 
 #include "stm32h7xx_hal_rtc.h"
 #include "stm32h7xx_hal_rtc_ex.h"
@@ -21,18 +24,158 @@
 #define SYSTEM_TIME_MAX_UNIX                4102444799UL /* 2099-12-31 */
 #define SYSTEM_TIME_NTP_PORT                123U
 #define SYSTEM_TIME_NTP_TIMEOUT_MS          3000U
+#define SYSTEM_TIME_DNS_START_TIMEOUT_MS    2000U
+#define SYSTEM_TIME_DNS_TIMEOUT_MS          8000U
 #define SYSTEM_TIME_REBASE_INTERVAL_MS      43200000U
 
 static RTC_HandleTypeDef system_rtc;
 static SystemTimeState system_time_state = SYSTEM_TIME_INVALID;
 static uint32_t system_time_base_unix;
 static uint32_t system_time_base_tick;
+static volatile uint8_t system_time_dns_done;
+static volatile uint8_t system_time_dns_start_done;
+static volatile err_t system_time_dns_error;
+static volatile err_t system_time_dns_start_error;
+static ip_addr_t system_time_dns_address;
+static char system_time_dns_hostname[256];
 
 static const char *const system_time_servers[] = {
     "time.cloudflare.com",
     "time.google.com",
     "pool.ntp.org"
 };
+
+static void SystemTime_DnsFound(const char *name,
+                                const ip_addr_t *address,
+                                void *argument)
+{
+    (void)name;
+    (void)argument;
+
+    if ((address != NULL) && IP_IS_V4(address))
+    {
+        system_time_dns_address = *address;
+        system_time_dns_error = ERR_OK;
+    }
+    else
+    {
+        system_time_dns_error = ERR_VAL;
+    }
+    system_time_dns_done = 1U;
+}
+
+static void SystemTime_DnsStartOnTcpipThread(void *argument)
+{
+    ip_addr_t address;
+    err_t result;
+
+    (void)argument;
+    result = dns_gethostbyname(system_time_dns_hostname,
+                               &address,
+                               SystemTime_DnsFound,
+                               NULL);
+    system_time_dns_start_error = result;
+    if (result == ERR_OK)
+    {
+        if (IP_IS_V4(&address))
+        {
+            system_time_dns_address = address;
+            system_time_dns_error = ERR_OK;
+        }
+        else
+        {
+            system_time_dns_error = ERR_VAL;
+        }
+        system_time_dns_done = 1U;
+    }
+    else if (result != ERR_INPROGRESS)
+    {
+        system_time_dns_error = result;
+        system_time_dns_done = 1U;
+    }
+    system_time_dns_start_done = 1U;
+}
+
+static int SystemTime_ResolveIpv4(const char *hostname,
+                                  ip_addr_t *address)
+{
+    uint32_t started_at;
+    err_t result;
+
+    if ((hostname == NULL) || (address == NULL))
+    {
+        return -1;
+    }
+
+    system_time_dns_done = 0U;
+    system_time_dns_start_done = 0U;
+    system_time_dns_error = ERR_INPROGRESS;
+    system_time_dns_start_error = ERR_INPROGRESS;
+    memset(&system_time_dns_address, 0, sizeof(system_time_dns_address));
+    strncpy(system_time_dns_hostname,
+            hostname,
+            sizeof(system_time_dns_hostname) - 1U);
+    system_time_dns_hostname[sizeof(system_time_dns_hostname) - 1U] = '\0';
+
+    started_at = HAL_GetTick();
+    result = tcpip_callback(SystemTime_DnsStartOnTcpipThread, NULL);
+    if (result != ERR_OK)
+    {
+        Debug_Logf(DEBUG_SRC_NET,
+                   "TIME: DNS dispatch failed server=%s err=%d",
+                   hostname,
+                   (int)result);
+        return -1;
+    }
+
+    while (system_time_dns_start_done == 0U)
+    {
+        if ((HAL_GetTick() - started_at) >=
+            SYSTEM_TIME_DNS_START_TIMEOUT_MS)
+        {
+            Debug_Logf(DEBUG_SRC_NET,
+                       "TIME: DNS start timeout server=%s",
+                       hostname);
+            return -1;
+        }
+        osDelay(10U);
+    }
+
+    if ((system_time_dns_start_error != ERR_OK) &&
+        (system_time_dns_start_error != ERR_INPROGRESS))
+    {
+        Debug_Logf(DEBUG_SRC_NET,
+                   "TIME: DNS start failed server=%s err=%d",
+                   hostname,
+                   (int)system_time_dns_start_error);
+        return -1;
+    }
+
+    while (system_time_dns_done == 0U)
+    {
+        if ((HAL_GetTick() - started_at) >= SYSTEM_TIME_DNS_TIMEOUT_MS)
+        {
+            Debug_Logf(DEBUG_SRC_NET,
+                       "TIME: DNS timeout server=%s",
+                       hostname);
+            return -1;
+        }
+        osDelay(50U);
+    }
+
+    if ((system_time_dns_error != ERR_OK) ||
+        !IP_IS_V4(&system_time_dns_address))
+    {
+        Debug_Logf(DEBUG_SRC_NET,
+                   "TIME: DNS failed server=%s err=%d",
+                   hostname,
+                   (int)system_time_dns_error);
+        return -1;
+    }
+
+    *address = system_time_dns_address;
+    return 0;
+}
 
 static int SystemTime_IsLeapYear(uint32_t year)
 {
@@ -308,23 +451,34 @@ int SystemTime_Init(void)
 
 static int SystemTime_QueryServer(const char *hostname, uint32_t *unix_time)
 {
-    struct addrinfo hints;
-    struct addrinfo *addresses = NULL;
-    struct addrinfo *address;
+    ip_addr_t resolved_address;
+    struct sockaddr_in server_address;
     uint8_t request[SYSTEM_TIME_NTP_PACKET_SIZE] = { 0 };
     uint8_t response[SYSTEM_TIME_NTP_PACKET_SIZE];
     uint32_t nonce = HAL_GetTick() ^ HAL_GetUIDw0() ^ HAL_GetUIDw2();
     int socket_fd = -1;
-    int result = -1;
+    fd_set read_set;
+    struct timeval timeout;
+    int selected;
+    int received;
+    uint32_t ntp_seconds;
+    uint8_t mode;
+    uint8_t stratum;
+    char address_text[IPADDR_STRLEN_MAX];
 
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_DGRAM;
-
-    if (lwip_getaddrinfo(hostname, "123", &hints, &addresses) != 0)
+    if ((unix_time == NULL) ||
+        (SystemTime_ResolveIpv4(hostname, &resolved_address) != 0))
     {
         return -1;
     }
+
+    ipaddr_ntoa_r(&resolved_address,
+                  address_text,
+                  sizeof(address_text));
+    Debug_Logf(DEBUG_SRC_NET,
+               "TIME: NTP resolved server=%s address=%s",
+               hostname,
+               address_text);
 
     request[0] = 0x23U; /* LI=0, NTPv4, client mode. */
     request[40] = (uint8_t)(nonce >> 24U);
@@ -336,93 +490,108 @@ static int SystemTime_QueryServer(const char *hostname, uint32_t *unix_time)
     request[46] = 0x4DU;
     request[47] = 0x33U;
 
-    for (address = addresses; address != NULL; address = address->ai_next)
+    socket_fd = lwip_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (socket_fd < 0)
     {
-        fd_set read_set;
-        struct timeval timeout;
-        int selected;
-        int received;
-        uint32_t ntp_seconds;
-        uint8_t mode;
-        uint8_t stratum;
-
-        socket_fd = lwip_socket(address->ai_family, SOCK_DGRAM, IPPROTO_UDP);
-        if (socket_fd < 0)
-        {
-            continue;
-        }
-
-        if (lwip_sendto(socket_fd,
-                        request,
-                        sizeof(request),
-                        0,
-                        address->ai_addr,
-                        address->ai_addrlen) != (int)sizeof(request))
-        {
-            (void)lwip_close(socket_fd);
-            socket_fd = -1;
-            continue;
-        }
-
-        FD_ZERO(&read_set);
-        FD_SET(socket_fd, &read_set);
-        timeout.tv_sec = SYSTEM_TIME_NTP_TIMEOUT_MS / 1000U;
-        timeout.tv_usec =
-            (SYSTEM_TIME_NTP_TIMEOUT_MS % 1000U) * 1000U;
-        selected = lwip_select(socket_fd + 1,
-                               &read_set,
-                               NULL,
-                               NULL,
-                               &timeout);
-        if ((selected <= 0) || !FD_ISSET(socket_fd, &read_set))
-        {
-            (void)lwip_close(socket_fd);
-            socket_fd = -1;
-            continue;
-        }
-
-        received = lwip_recv(socket_fd, response, sizeof(response), 0);
-        (void)lwip_close(socket_fd);
-        socket_fd = -1;
-        if (received < (int)sizeof(response))
-        {
-            continue;
-        }
-
-        mode = response[0] & 0x07U;
-        stratum = response[1];
-        if (((response[0] >> 6U) == 3U) ||
-            ((mode != 4U) && (mode != 5U)) ||
-            (stratum == 0U) || (stratum > 15U) ||
-            (memcmp(&response[24], &request[40], 8U) != 0))
-        {
-            continue;
-        }
-
-        ntp_seconds = ((uint32_t)response[40] << 24U) |
-                      ((uint32_t)response[41] << 16U) |
-                      ((uint32_t)response[42] << 8U) |
-                      response[43];
-        if (ntp_seconds <= SYSTEM_TIME_NTP_UNIX_OFFSET)
-        {
-            continue;
-        }
-
-        *unix_time = ntp_seconds - SYSTEM_TIME_NTP_UNIX_OFFSET;
-        if ((*unix_time >= SYSTEM_TIME_MIN_UNIX) &&
-            (*unix_time <= SYSTEM_TIME_MAX_UNIX))
-        {
-            result = 0;
-            break;
-        }
+        Debug_Logf(DEBUG_SRC_NET,
+                   "TIME: NTP socket failed server=%s errno=%d",
+                   hostname,
+                   errno);
+        return -1;
     }
 
-    if (socket_fd >= 0)
+    memset(&server_address, 0, sizeof(server_address));
+    server_address.sin_family = AF_INET;
+    server_address.sin_port = lwip_htons(SYSTEM_TIME_NTP_PORT);
+    server_address.sin_addr.s_addr =
+        ip4_addr_get_u32(ip_2_ip4(&resolved_address));
+    if (lwip_connect(socket_fd,
+                     (const struct sockaddr *)&server_address,
+                     sizeof(server_address)) != 0)
     {
+        Debug_Logf(DEBUG_SRC_NET,
+                   "TIME: NTP connect failed server=%s errno=%d",
+                   hostname,
+                   errno);
         (void)lwip_close(socket_fd);
+        return -1;
     }
-    lwip_freeaddrinfo(addresses);
-    return result;
+
+    if (lwip_send(socket_fd,
+                  request,
+                  sizeof(request),
+                  0) != (int)sizeof(request))
+    {
+        Debug_Logf(DEBUG_SRC_NET,
+                   "TIME: NTP send failed server=%s errno=%d",
+                   hostname,
+                   errno);
+        (void)lwip_close(socket_fd);
+        return -1;
+    }
+
+    FD_ZERO(&read_set);
+    FD_SET(socket_fd, &read_set);
+    timeout.tv_sec = SYSTEM_TIME_NTP_TIMEOUT_MS / 1000U;
+    timeout.tv_usec =
+        (SYSTEM_TIME_NTP_TIMEOUT_MS % 1000U) * 1000U;
+    selected = lwip_select(socket_fd + 1,
+                           &read_set,
+                           NULL,
+                           NULL,
+                           &timeout);
+    if ((selected <= 0) || !FD_ISSET(socket_fd, &read_set))
+    {
+        Debug_Logf(DEBUG_SRC_NET,
+                   "TIME: NTP response timeout server=%s errno=%d",
+                   hostname,
+                   errno);
+        (void)lwip_close(socket_fd);
+        return -1;
+    }
+
+    received = lwip_recv(socket_fd, response, sizeof(response), 0);
+    (void)lwip_close(socket_fd);
+    mode = received > 0 ? response[0] & 0x07U : 0U;
+    stratum = received > 1 ? response[1] : 0U;
+    if ((received < (int)sizeof(response)) ||
+        ((response[0] >> 6U) == 3U) ||
+        ((mode != 4U) && (mode != 5U)) ||
+        (stratum == 0U) || (stratum > 15U) ||
+        (memcmp(&response[24], &request[40], 8U) != 0))
+    {
+        Debug_Logf(DEBUG_SRC_NET,
+                   "TIME: NTP invalid response server=%s bytes=%d mode=%u stratum=%u",
+                   hostname,
+                   received,
+                   (unsigned int)mode,
+                   (unsigned int)stratum);
+        return -1;
+    }
+
+    ntp_seconds = ((uint32_t)response[40] << 24U) |
+                  ((uint32_t)response[41] << 16U) |
+                  ((uint32_t)response[42] << 8U) |
+                  response[43];
+    if (ntp_seconds <= SYSTEM_TIME_NTP_UNIX_OFFSET)
+    {
+        Debug_Logf(DEBUG_SRC_NET,
+                   "TIME: NTP invalid timestamp server=%s",
+                   hostname);
+        return -1;
+    }
+
+    *unix_time = ntp_seconds - SYSTEM_TIME_NTP_UNIX_OFFSET;
+    if ((*unix_time < SYSTEM_TIME_MIN_UNIX) ||
+        (*unix_time > SYSTEM_TIME_MAX_UNIX))
+    {
+        Debug_Logf(DEBUG_SRC_NET,
+                   "TIME: NTP timestamp outside policy server=%s unix=%lu",
+                   hostname,
+                   (unsigned long)*unix_time);
+        return -1;
+    }
+    return 0;
 }
 
 int SystemTime_SyncNetwork(void)
